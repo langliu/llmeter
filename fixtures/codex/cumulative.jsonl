@@ -1,0 +1,4 @@
+{"type":"event_msg","timestamp":"2026-08-14T00:00:00Z","payload":{"cwd":"/tmp/llmeter-demo","model":"gpt-5.4","info":{"total_token_usage":{"input_tokens":100,"total_tokens":100},"event_id":"codex-cum-1"}}}
+{"type":"event_msg","timestamp":"2026-08-14T00:01:00Z","payload":{"cwd":"/tmp/llmeter-demo","model":"gpt-5.4","info":{"total_token_usage":{"input_tokens":150,"total_tokens":150},"event_id":"codex-cum-2"}}}
+{"type":"event_msg","timestamp":"2026-08-14T00:02:00Z","payload":{"cwd":"/tmp/llmeter-demo","model":"gpt-5.4","info":{"total_token_usage":{"input_tokens":180,"total_tokens":180},"event_id":"codex-cum-3"}}}
+

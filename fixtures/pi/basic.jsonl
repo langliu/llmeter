@@ -1,0 +1,2 @@
+{"type":"message_end","sessionId":"pi-session","timestamp":"2026-08-14T00:00:00Z","cwd":"/tmp/llmeter-demo","model":"gpt-5.4","usage":{"input_tokens":40,"output_tokens":8,"total_tokens":48},"message_id":"pi-1"}
+

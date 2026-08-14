@@ -1,0 +1,4 @@
+{"type":"event_msg","timestamp":"2026-08-14T00:00:00Z","payload":{"model":"gpt-5.4","info":{"total_token_usage":{"input_tokens":100,"total_tokens":100}}}}
+{"type":"event_msg","timestamp":"2026-08-14T00:01:00Z","payload":{"model":"gpt-5.4","info":{"total_token_usage":{"input_tokens":150,"total_tokens":150}}}}
+{"type":"event_msg","timestamp":"2026-08-14T00:02:00Z","payload":{"model":"gpt-5.4","info":{"total_token_usage":{"input_tokens":20,"total_tokens":20}}}}
+

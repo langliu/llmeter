@@ -1,0 +1,2 @@
+{"type":"event_msg","timestamp":"2026-08-14T00:00:00Z","payload":{"cwd":"/tmp/llmeter-demo","model":"gpt-5.4","event_id":"codex-basic-1","info":{"last_token_usage":{"input_tokens":120,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":160}}}}
+
