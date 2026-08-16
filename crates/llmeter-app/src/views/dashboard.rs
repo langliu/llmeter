@@ -1,11 +1,16 @@
-use chrono::Local;
-use gpui::{Context, FontWeight, IntoElement, Render, Rgba, div, prelude::*, px, relative, rgb};
+use std::collections::HashMap;
+
+use chrono::{Datelike, Duration, Local, NaiveDate};
+use gpui::{
+    Context, FontWeight, IntoElement, Render, Rgba, SharedString, div, prelude::*, px, relative,
+    rgb,
+};
 use gpui_component::{
     ActiveTheme, Selectable,
     button::{Button, ButtonCustomVariant, ButtonVariants},
 };
 use llmeter_core::{Provider, ProviderDetection, ProviderStatus};
-use llmeter_storage::{ModelUsage, ProjectUsage, ProviderUsage, RecentActivity};
+use llmeter_storage::{DailyModelUsage, ModelUsage, ProjectUsage, ProviderUsage, RecentActivity};
 use rust_i18n::t;
 
 use crate::{
@@ -117,6 +122,11 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
                         p,
                     )),
             )
+            .child(div().px_4().pt_4().child(heatmap(
+                &snapshot.heatmap_daily,
+                &snapshot.heatmap_models,
+                p,
+            )))
             .child(
                 div()
                     .flex()
@@ -742,6 +752,230 @@ fn provider_color(provider: Provider) -> Rgba {
     }
 }
 
+const HEATMAP_WEEKS: i64 = 26;
+
+fn heatmap(
+    daily: &[llmeter_storage::DailyUsage],
+    model_usage: &[DailyModelUsage],
+    p: Palette,
+) -> gpui::AnyElement {
+    let cell_size = px(24.0);
+    let gap = px(6.0);
+    let label_width = px(28.0);
+    let today = Local::now().date_naive();
+    let end = today + Duration::days(6 - i64::from(today.weekday().num_days_from_sunday()));
+    let start = end - Duration::days((HEATMAP_WEEKS - 1) * 7);
+
+    let totals = daily
+        .iter()
+        .filter_map(|day| {
+            NaiveDate::parse_from_str(&day.day, "%Y-%m-%d")
+                .ok()
+                .map(|date| (date, day.total_tokens))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut models_by_day = HashMap::<NaiveDate, Vec<(String, u64)>>::new();
+    for usage in model_usage {
+        if let Ok(date) = NaiveDate::parse_from_str(&usage.day, "%Y-%m-%d") {
+            models_by_day
+                .entry(date)
+                .or_default()
+                .push((usage.model.clone(), usage.total_tokens));
+        }
+    }
+
+    let mut values = Vec::with_capacity((HEATMAP_WEEKS * 7) as usize);
+    for week in 0..HEATMAP_WEEKS {
+        for weekday in 0..7 {
+            let date = start + Duration::days(week * 7 + weekday);
+            values.push((date, totals.get(&date).copied().unwrap_or_default()));
+        }
+    }
+    let max_value = values.iter().map(|(_, value)| *value).max().unwrap_or(0);
+
+    let mut month_grid = div().flex().gap(gap).flex_shrink_0();
+    let mut columns = div().flex().gap(gap).flex_shrink_0();
+    for week in 0..HEATMAP_WEEKS {
+        let week_start = start + Duration::days(week * 7);
+        let previous_week = week_start - Duration::days(7);
+        let month_label = if week == 0 || week_start.month() != previous_week.month() {
+            t!("overview.heatmap_month", month = week_start.month()).to_string()
+        } else {
+            String::new()
+        };
+        month_grid = month_grid.child(
+            div()
+                .w(cell_size)
+                .h(px(22.0))
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(p.muted_foreground)
+                .child(month_label),
+        );
+
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .gap(gap)
+            .w(cell_size)
+            .flex_shrink_0();
+        for weekday in 0..7 {
+            let index = (week * 7 + weekday) as usize;
+            let (date, value) = values[index];
+            let models = models_by_day.get(&date).cloned().unwrap_or_default();
+            column = column.child(heatmap_cell(date, value, max_value, models, cell_size, p));
+        }
+        columns = columns.child(column);
+    }
+
+    let weekday_labels = [
+        t!("overview.heatmap_sun").to_string(),
+        t!("overview.heatmap_mon").to_string(),
+        t!("overview.heatmap_tue").to_string(),
+        t!("overview.heatmap_wed").to_string(),
+        t!("overview.heatmap_thu").to_string(),
+        t!("overview.heatmap_fri").to_string(),
+        t!("overview.heatmap_sat").to_string(),
+    ];
+    let mut weekday_column = div()
+        .flex()
+        .flex_col()
+        .gap(gap)
+        .w(label_width)
+        .flex_shrink_0();
+    for label in weekday_labels {
+        weekday_column = weekday_column.child(
+            div()
+                .w(label_width)
+                .h(cell_size)
+                .flex()
+                .items_center()
+                .text_xs()
+                .text_color(p.muted_foreground)
+                .child(label),
+        );
+    }
+
+    let month_row = div()
+        .flex()
+        .gap(gap)
+        .items_end()
+        .child(div().w(label_width).h(px(22.0)).flex_shrink_0())
+        .child(month_grid);
+    let grid = div().flex().gap(gap).child(weekday_column).child(columns);
+
+    let legend_colors = [
+        heatmap_level_color(0, p),
+        heatmap_level_color(1, p),
+        heatmap_level_color(2, p),
+        heatmap_level_color(3, p),
+        heatmap_level_color(4, p),
+    ];
+    let mut legend = div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(6.0))
+        .pt_5()
+        .text_xs()
+        .text_color(p.muted_foreground)
+        .child(t!("overview.heatmap_less").to_string());
+    for color in legend_colors {
+        legend = legend.child(div().size(px(16.0)).rounded_sm().bg(color));
+    }
+    legend = legend.child(t!("overview.heatmap_more").to_string());
+
+    div()
+        .w_full()
+        .min_h(px(320.0))
+        .p_5()
+        .rounded_xl()
+        .bg(p.tiles)
+        .border_1()
+        .border_color(p.border)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(p.foreground)
+                        .child(t!("overview.heatmap").to_string()),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(p.muted_foreground)
+                        .child(t!("overview.heatmap_timezone").to_string()),
+                ),
+        )
+        .child(
+            div()
+                .pt_5()
+                .child(month_row)
+                .child(div().pt_2().child(grid)),
+        )
+        .child(legend)
+        .into_any_element()
+}
+
+fn heatmap_cell(
+    date: NaiveDate,
+    value: u64,
+    max_value: u64,
+    models: Vec<(String, u64)>,
+    cell_size: gpui::Pixels,
+    p: Palette,
+) -> impl IntoElement {
+    let date_text = date.format("%Y-%m-%d").to_string();
+    let level = heatmap_level(value, max_value);
+    div()
+        .id(SharedString::from(format!("heatmap-cell-{date_text}")))
+        .size(cell_size)
+        .rounded_sm()
+        .bg(heatmap_level_color(level, p))
+        .hover(|style| style.opacity(0.78))
+        .tooltip(move |_, cx| {
+            cx.new(|_| HeatmapTooltip {
+                date: date_text.clone(),
+                level,
+                total_tokens: value,
+                models: models.clone(),
+            })
+            .into()
+        })
+}
+
+fn heatmap_level(value: u64, max_value: u64) -> usize {
+    if value == 0 {
+        return 0;
+    }
+    let ratio = value as f64 / max_value.max(1) as f64;
+    if ratio <= 0.05 {
+        1
+    } else if ratio <= 0.2 {
+        2
+    } else if ratio <= 0.5 {
+        3
+    } else {
+        4
+    }
+}
+
+fn heatmap_level_color(level: usize, p: Palette) -> gpui::Hsla {
+    match level {
+        0 => p.muted,
+        1 => p.success.opacity(0.22),
+        2 => p.success.opacity(0.42),
+        3 => p.success.opacity(0.68),
+        _ => p.success,
+    }
+}
+
 fn trend(daily: &[llmeter_storage::DailyUsage], p: Palette) -> gpui::AnyElement {
     if daily.is_empty() {
         return div()
@@ -824,6 +1058,156 @@ impl Render for TrendTooltip {
     }
 }
 
+struct HeatmapTooltip {
+    date: String,
+    level: usize,
+    total_tokens: u64,
+    models: Vec<(String, u64)>,
+}
+
+impl Render for HeatmapTooltip {
+    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let total_tokens = self.total_tokens.max(1);
+        let mut model_rows = div().flex().flex_col().gap_4();
+        for (model, tokens) in self.models.iter().take(5) {
+            let ratio = (*tokens as f32 / total_tokens as f32).min(1.0);
+            let percentage = (*tokens as f64 / total_tokens as f64 * 100.0).round() as u64;
+            let bar_width = ratio;
+            model_rows = model_rows.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_base()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(model.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .w(px(76.0))
+                                    .text_right()
+                                    .text_base()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(format_heatmap_tokens(*tokens)),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .w(px(38.0))
+                                    .text_right()
+                                    .text_base()
+                                    .child(format!("{percentage}%")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .h(px(8.0))
+                            .w_full()
+                            .overflow_hidden()
+                            .rounded_full()
+                            .bg(theme.muted)
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(relative(bar_width))
+                                    .rounded_full()
+                                    .bg(theme.success),
+                            ),
+                    ),
+            );
+        }
+        if self.models.is_empty() {
+            model_rows = model_rows.child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(t!("overview.heatmap_no_models").to_string()),
+            );
+        }
+
+        div()
+            .w(px(420.0))
+            .rounded_xl()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.popover)
+            .text_color(theme.popover_foreground)
+            .p_5()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.muted_foreground)
+                            .child(self.date.clone()),
+                    )
+                    .child(
+                        div()
+                            .rounded_full()
+                            .border_1()
+                            .border_color(theme.success.opacity(0.3))
+                            .bg(theme.success.opacity(0.1))
+                            .px_3()
+                            .py_1()
+                            .text_sm()
+                            .text_color(theme.success)
+                            .child(t!("overview.heatmap_level", level = self.level).to_string()),
+                    ),
+            )
+            .child(
+                div()
+                    .pt_4()
+                    .flex()
+                    .items_baseline()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_3xl()
+                            .font_weight(FontWeight::BOLD)
+                            .child(format_heatmap_tokens(self.total_tokens)),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.muted_foreground)
+                            .child(t!("overview.heatmap_token_unit").to_string()),
+                    ),
+            )
+            .child(
+                div()
+                    .mt_4()
+                    .pt_4()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .pb_4()
+                            .text_base()
+                            .text_color(theme.muted_foreground)
+                            .child(t!("overview.heatmap_models").to_string()),
+                    )
+                    .child(model_rows),
+            )
+    }
+}
+
 fn empty_state(text: String, p: Palette) -> impl IntoElement {
     div().text_sm().text_color(p.muted_foreground).child(text)
 }
@@ -831,6 +1215,16 @@ fn empty_state(text: String, p: Palette) -> impl IntoElement {
 fn format_tokens(value: u64) -> String {
     if value >= 1_000_000 {
         format!("{:.2}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_heatmap_tokens(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
     } else if value >= 1_000 {
         format!("{:.1}K", value as f64 / 1_000.0)
     } else {

@@ -93,6 +93,8 @@ impl LLMeterView {
                 thirty_days: Default::default(),
                 all_time: Default::default(),
                 daily: Vec::new(),
+                heatmap_daily: Vec::new(),
+                heatmap_models: Vec::new(),
                 providers: Vec::new(),
                 models: Vec::new(),
                 projects: Vec::new(),

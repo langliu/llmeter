@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Utc};
 use llmeter_core::ProviderDetection;
 use llmeter_storage::{
-    DailyUsage, ModelUsage, Overview, ProjectUsage, ProviderUsage, RecentActivity, SessionSummary,
-    UsageRepository,
+    DailyModelUsage, DailyUsage, ModelUsage, Overview, ProjectUsage, ProviderUsage, RecentActivity,
+    SessionSummary, UsageRepository,
 };
 
 #[derive(Clone, Debug)]
@@ -14,6 +14,8 @@ pub struct UiSnapshot {
     pub thirty_days: Overview,
     pub all_time: Overview,
     pub daily: Vec<DailyUsage>,
+    pub heatmap_daily: Vec<DailyUsage>,
+    pub heatmap_models: Vec<DailyModelUsage>,
     pub providers: Vec<ProviderUsage>,
     pub models: Vec<ModelUsage>,
     pub projects: Vec<ProjectUsage>,
@@ -40,6 +42,12 @@ impl UiSnapshot {
                 now + Duration::seconds(1),
             )?,
             daily: repository.get_daily_usage(thirty_start, now + Duration::seconds(1))?,
+            // Keep enough history for the overview calendar while the trend remains a
+            // compact 30-day view.
+            heatmap_daily: repository
+                .get_daily_usage(now - Duration::days(184), now + Duration::seconds(1))?,
+            heatmap_models: repository
+                .get_daily_model_usage(now - Duration::days(184), now + Duration::seconds(1))?,
             providers: repository.get_provider_usage(thirty_start, now + Duration::seconds(1))?,
             models: repository.get_model_usage(thirty_start, now + Duration::seconds(1))?,
             projects: repository.get_project_usage(thirty_start, now + Duration::seconds(1))?,

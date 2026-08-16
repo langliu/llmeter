@@ -26,6 +26,13 @@ pub struct DailyUsage {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct DailyModelUsage {
+    pub day: String,
+    pub model: String,
+    pub total_tokens: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProviderUsage {
     pub provider: Provider,
     pub total_tokens: u64,
@@ -255,6 +262,29 @@ impl UsageRepository {
                 day: row.get(0)?,
                 total_tokens: from_sqlite_u64(row.get(1)?),
                 estimated_cost_usd: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    pub fn get_daily_model_usage(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<DailyModelUsage>, StorageError> {
+        let connection = self.database.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT strftime('%Y-%m-%d', timestamp, 'unixepoch', 'localtime') AS day,
+                    COALESCE(model, 'Unknown'), COALESCE(SUM(total_tokens), 0)
+             FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
+             GROUP BY day, model ORDER BY day, 3 DESC",
+        )?;
+        let rows = statement.query_map(params![start.timestamp(), end.timestamp()], |row| {
+            Ok(DailyModelUsage {
+                day: row.get(0)?,
+                model: row.get(1)?,
+                total_tokens: from_sqlite_u64(row.get(2)?),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()

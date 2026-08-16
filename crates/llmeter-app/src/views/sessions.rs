@@ -3,7 +3,7 @@ use std::rc::Rc;
 use chrono::{Datelike, Duration, Local, Timelike};
 use gpui::{
     AnyElement, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
-    div, prelude::*, px, rgb, size,
+    deferred, div, prelude::*, px, rgb, size,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Selectable, Sizable,
@@ -267,6 +267,10 @@ fn project_filter(
                 .max_h(px(280.0))
                 .id("session-project-menu")
                 .overflow_y_scroll()
+                // Keep wheel events inside the nested project picker. The session list is
+                // another scroll container underneath the popover and would otherwise also
+                // receive the bubbled event.
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                 .rounded_lg()
                 .border_1()
                 .border_color(p.border)
@@ -288,7 +292,9 @@ fn project_filter(
                     cx,
                 ));
             }
-            this.child(menu)
+            // This menu overlaps the virtualized session rows. Defer its paint so it is
+            // rendered above the rows instead of being covered by later siblings in the page.
+            this.child(deferred(menu).with_priority(1))
         })
 }
 
@@ -298,13 +304,16 @@ fn project_menu_item(
     value: Option<String>,
     cx: &mut Context<LLMeterView>,
 ) -> impl IntoElement {
+    let label = label.to_string();
     Button::new(SharedString::from(format!("session-project-item-{label}")))
         .ghost()
         .compact()
         .w_full()
         .justify_start()
-        .label(label.to_string())
         .selected(selected)
+        // Button centers its built-in label. Use a full-width child so the
+        // label itself can be aligned to the left inside the menu item.
+        .child(div().w_full().text_left().child(label))
         .on_click(cx.listener(move |view, _, _, cx| {
             view.set_session_project(value.clone(), cx);
         }))
