@@ -82,7 +82,7 @@ local:
   unknown_pricing: "Prices come from LiteLLM; unknown models stay unpriced"
 sessions:
   title: "Sessions"
-  subtitle: "Browse local Claude Code and Codex sessions and copy resume commands."
+  subtitle: "Browse local AI coding agent sessions and copy resume commands."
   all: "All"
   all_time: "All time"
   days_7: "7 days"

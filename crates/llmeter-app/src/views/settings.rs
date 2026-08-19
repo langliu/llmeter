@@ -108,12 +108,7 @@ fn section_nav(
                 .icon(item.icon())
                 .w_full()
                 .justify_start()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .child(item.label()),
-                )
+                .child(div().flex_1().min_w(px(0.0)).child(item.label()))
                 .on_click(cx.listener(move |view, _, _, cx| {
                     view.set_settings_section(item, cx);
                 })),

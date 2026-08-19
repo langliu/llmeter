@@ -82,7 +82,7 @@ local:
   unknown_pricing: "价格来自 LiteLLM，未知模型显示为未定价"
 sessions:
   title: "会话"
-  subtitle: "浏览本地的 Claude Code 与 Codex 会话，一键复制恢复命令。"
+  subtitle: "浏览本地 AI 编程代理会话，一键复制恢复命令。"
   all: "全部"
   all_time: "全部时间"
   days_7: "7 天"

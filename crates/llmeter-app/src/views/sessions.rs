@@ -3,10 +3,10 @@ use std::rc::Rc;
 use chrono::{Datelike, Duration, Local, Timelike};
 use gpui::{
     AnyElement, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
-    deferred, div, prelude::*, px, rgb, size,
+    deferred, div, prelude::*, px, size,
 };
 use gpui_component::{
-    Disableable, Icon, IconName, Selectable, Sizable,
+    ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable,
     button::{Button, ButtonGroup, ButtonVariants},
     h_flex,
     input::Input,
@@ -16,7 +16,10 @@ use llmeter_core::Provider;
 use llmeter_storage::SessionSummary;
 use rust_i18n::t;
 
-use crate::{app::LLMeterView, views::palette::Palette};
+use crate::{
+    app::LLMeterView,
+    views::{palette::Palette, provider_brand::provider_logo},
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SessionProviderFilter {
@@ -98,7 +101,7 @@ pub(crate) fn sessions_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
             .child(empty_state(t!("sessions.empty").to_string(), p))
             .into_any_element()
     } else {
-        let item_sizes = Rc::new(vec![size(px(1.0), px(76.0)); visible_count]);
+        let item_sizes = Rc::new(vec![size(px(1.0), px(78.0)); visible_count]);
         v_virtual_list(
             cx.entity().clone(),
             "session-items",
@@ -148,8 +151,9 @@ pub(crate) fn sessions_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
                 )
                 .child(
                     Button::new("refresh-sessions")
-                        .ghost()
+                        .outline()
                         .icon(IconName::Redo)
+                        .label(format!("{visible_count} / {total_count}"))
                         .tooltip(t!("sessions.refresh").to_string())
                         .on_click(cx.listener(|view, _, _, cx| view.refresh_sessions(cx))),
                 ),
@@ -158,7 +162,8 @@ pub(crate) fn sessions_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
             h_flex()
                 .w_full()
                 .pt_6()
-                .gap_3()
+                .gap_2()
+                .flex_wrap()
                 .items_center()
                 .child(provider_filter(view.session_provider, cx))
                 .child(range_filter(view.session_range, cx))
@@ -170,20 +175,13 @@ pub(crate) fn sessions_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
                     cx,
                 ))
                 .child(
-                    div().flex_1().min_w(px(220.0)).child(
+                    div().flex_1().min_w(px(180.0)).child(
                         Input::new(&view.session_search).cleanable(true).prefix(
                             Icon::new(IconName::Search)
                                 .text_color(p.muted_foreground)
                                 .with_size(px(14.)),
                         ),
                     ),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_sm()
-                        .text_color(p.muted_foreground)
-                        .child(format!("{visible_count} / {total_count}")),
                 ),
         )
         .child(
@@ -200,7 +198,9 @@ fn provider_filter(
     selected: SessionProviderFilter,
     cx: &mut Context<LLMeterView>,
 ) -> impl IntoElement {
-    let mut group = ButtonGroup::new("session-provider-filter").compact();
+    let mut group = ButtonGroup::new("session-provider-filter")
+        .compact()
+        .outline();
     for (index, filter) in SessionProviderFilter::ALL.into_iter().enumerate() {
         group = group.child(
             Button::new(("session-provider", index))
@@ -218,7 +218,7 @@ fn provider_filter(
 }
 
 fn range_filter(selected: SessionRangeFilter, cx: &mut Context<LLMeterView>) -> impl IntoElement {
-    let mut group = ButtonGroup::new("session-range-filter").compact();
+    let mut group = ButtonGroup::new("session-range-filter").compact().outline();
     for (index, filter) in SessionRangeFilter::ALL.into_iter().enumerate() {
         let button = Button::new(("session-range", index))
             .label(filter.label())
@@ -339,15 +339,23 @@ fn session_row(
     let total_tokens = session.total_tokens;
     let estimated_cost_usd = session.estimated_cost_usd;
     let turn_count = session.turn_count;
+    let mono_font = cx.theme().mono_font_family.clone();
     let owned = session;
 
     h_flex()
+        .id(SharedString::from(format!(
+            "session-row-{}",
+            crate::app::session_key(&owned)
+        )))
         .w_full()
         .items_center()
         .justify_between()
-        .h(px(76.0))
-        .gap_6()
+        .h(px(78.0))
+        .gap_4()
+        .px_2()
         .py_3()
+        .rounded_lg()
+        .hover(|style| style.bg(p.muted.opacity(0.42)))
         .when(!first, |this| this.border_t_1().border_color(p.border))
         .child(
             h_flex()
@@ -355,7 +363,7 @@ fn session_row(
                 .flex_1()
                 .items_start()
                 .gap_3()
-                .child(provider_mark(provider))
+                .child(provider_logo(provider, 28.0))
                 .child(
                     v_flex()
                         .min_w(px(0.0))
@@ -387,20 +395,26 @@ fn session_row(
             h_flex()
                 .flex_shrink_0()
                 .items_center()
-                .gap_8()
+                .gap_3()
                 .child(metric_cell(
                     format_tokens(total_tokens),
                     t!("sessions.tokens").to_string(),
+                    78.0,
+                    mono_font.clone(),
                     p,
                 ))
                 .child(metric_cell(
                     format_cost(estimated_cost_usd),
                     t!("sessions.cost").to_string(),
+                    72.0,
+                    mono_font.clone(),
                     p,
                 ))
                 .child(metric_cell(
                     turn_count.to_string(),
                     t!("sessions.turns").to_string(),
+                    50.0,
+                    mono_font,
                     p,
                 ))
                 .child(copy_button(command.is_some(), copied, owned, cx)),
@@ -419,36 +433,6 @@ fn session_meta(session: &SessionSummary, model: &str, project: Option<&str>) ->
     }
 }
 
-fn provider_mark(provider: Provider) -> impl IntoElement {
-    let (background, foreground) = match provider {
-        Provider::Codex => (rgb(0x6366f1), rgb(0xffffff)),
-        Provider::Claude => (rgb(0xd97706), rgb(0xffffff)),
-        Provider::Pi => (rgb(0x6b7280), rgb(0xffffff)),
-        Provider::OpenCode => (rgb(0x0891b2), rgb(0xffffff)),
-    };
-    div()
-        .size_8()
-        .rounded_full()
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(background)
-        .text_color(foreground)
-        .text_xs()
-        .font_weight(FontWeight::BOLD)
-        .child(provider_initial(provider))
-}
-
-fn provider_initial(provider: Provider) -> &'static str {
-    match provider {
-        Provider::Codex => "Cx",
-        Provider::Claude => "Cl",
-        Provider::Pi => "Pi",
-        Provider::OpenCode => "Oc",
-    }
-}
-
 fn one_shot_badge(p: Palette) -> impl IntoElement {
     div()
         .rounded_full()
@@ -461,13 +445,20 @@ fn one_shot_badge(p: Palette) -> impl IntoElement {
         .child(t!("sessions.one_shot").to_string())
 }
 
-fn metric_cell(value: String, label: String, p: Palette) -> impl IntoElement {
+fn metric_cell(
+    value: String,
+    label: String,
+    width: f32,
+    mono_font: SharedString,
+    p: Palette,
+) -> impl IntoElement {
     v_flex()
-        .min_w(px(64.0))
-        .items_end()
+        .w(px(width))
+        .items_center()
         .child(
             div()
                 .text_base()
+                .font_family(mono_font)
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(p.foreground)
                 .child(value),
@@ -500,6 +491,8 @@ fn copy_button(
     )))
     .ghost()
     .compact()
+    .w(px(110.0))
+    .justify_end()
     .icon(if copied {
         IconName::Check
     } else {

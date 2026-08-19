@@ -18,7 +18,10 @@ use rust_i18n::t;
 use crate::{
     app::LLMeterView,
     state::UiSnapshot,
-    views::{palette::Palette, sessions::sessions_page, settings::settings_page},
+    views::{
+        palette::Palette, provider_brand::provider_logo, sessions::sessions_page,
+        settings::settings_page,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -151,31 +154,26 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
             .into_any_element(),
     };
 
-    let main = div()
-        .flex()
-        .flex_1()
-        .min_w(px(0.0))
-        .p_3()
-        .child(
-            div()
-                .flex()
-                .size_full()
-                .rounded_3xl()
-                .bg(p.background.opacity(0.96))
-                .text_color(p.foreground)
-                .overflow_hidden()
-                .child(
-                    div()
-                        .id("main-scroll")
-                        .size_full()
-                        .overflow_y_scroll()
-                        .on_scroll_wheel(cx.listener(|view, _, _, cx| {
-                            view.heatmap
-                                .update(cx, |heatmap, cx| heatmap.clear_hover(cx));
-                        }))
-                        .child(content),
-                ),
-        );
+    let main = div().flex().flex_1().min_w(px(0.0)).p_3().child(
+        div()
+            .flex()
+            .size_full()
+            .rounded_3xl()
+            .bg(p.background.opacity(0.96))
+            .text_color(p.foreground)
+            .overflow_hidden()
+            .child(
+                div()
+                    .id("main-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .on_scroll_wheel(cx.listener(|view, _, _, cx| {
+                        view.heatmap
+                            .update(cx, |heatmap, cx| heatmap.clear_hover(cx));
+                    }))
+                    .child(content),
+            ),
+    );
 
     div()
         .flex()
@@ -341,6 +339,7 @@ fn overview_page(
         t!("overview.share_all").to_string(),
         100.0,
         snapshot.models.len(),
+        None,
         rgb(0x16a34a),
         p,
     ));
@@ -350,6 +349,7 @@ fn overview_page(
             provider.provider.to_string(),
             percent,
             model_counts.get(&provider.provider).copied().unwrap_or(0),
+            Some(provider.provider),
             provider_color(provider.provider),
             p,
         ));
@@ -471,9 +471,14 @@ fn share_card(
     title: String,
     percent: f64,
     models: usize,
+    provider: Option<Provider>,
     color: Rgba,
     p: Palette,
 ) -> impl IntoElement {
+    let marker = match provider {
+        Some(provider) => provider_logo(provider, 20.0),
+        None => div().size_2().rounded_full().bg(color).into_any_element(),
+    };
     div()
         .w(px(168.0))
         .rounded_2xl()
@@ -483,19 +488,14 @@ fn share_card(
         .px_3()
         .py_3()
         .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(div().size_2().rounded_full().bg(color))
-                .child(
-                    div()
-                        .min_w(px(0.0))
-                        .truncate()
-                        .text_xs()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(title),
-                ),
+            div().flex().items_center().gap_2().child(marker).child(
+                div()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(title),
+            ),
         )
         .child(
             div()
@@ -583,7 +583,7 @@ fn page_heading(title: String, subtitle: String, p: Palette) -> impl IntoElement
 fn provider_statuses(snapshot: &UiSnapshot, p: Palette) -> impl IntoElement {
     let mut statuses = div().flex().flex_col().gap_2();
     for detection in &snapshot.detections {
-        statuses = statuses.child(provider_status_row(detection));
+        statuses = statuses.child(provider_status_row(detection, p));
     }
     if snapshot.detections.is_empty() {
         statuses = statuses.child(empty_state(
@@ -594,7 +594,7 @@ fn provider_statuses(snapshot: &UiSnapshot, p: Palette) -> impl IntoElement {
     statuses
 }
 
-fn provider_status_row(detection: &ProviderDetection) -> impl IntoElement {
+fn provider_status_row(detection: &ProviderDetection, p: Palette) -> impl IntoElement {
     let (label, color) = match detection.status {
         ProviderStatus::DataFound => (t!("providers.data_found").to_string(), rgb(0x16a34a)),
         ProviderStatus::Installed => (t!("providers.installed").to_string(), rgb(0x2563eb)),
@@ -605,9 +605,22 @@ fn provider_status_row(detection: &ProviderDetection) -> impl IntoElement {
     };
     div()
         .flex()
+        .items_center()
         .justify_between()
+        .gap_4()
+        .rounded_lg()
+        .bg(p.muted.opacity(0.34))
+        .px_3()
+        .py_2()
         .text_xs()
-        .child(detection.provider.to_string())
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(provider_logo(detection.provider, 22.0))
+                .child(detection.provider.display_name()),
+        )
         .child(div().text_color(color).child(label))
 }
 
@@ -642,7 +655,6 @@ fn panel(title: String, content: impl IntoElement, p: Palette) -> impl IntoEleme
 }
 
 fn provider_row(provider: &ProviderUsage, p: Palette) -> impl IntoElement {
-    let color = provider_color(provider.provider);
     div()
         .flex()
         .flex_col()
@@ -661,13 +673,13 @@ fn provider_row(provider: &ProviderUsage, p: Palette) -> impl IntoElement {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(div().size_2().rounded_full().bg(color))
+                        .child(provider_logo(provider.provider, 24.0))
                         .child(
                             div()
                                 .text_sm()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(p.foreground)
-                                .child(provider.provider.to_string()),
+                                .child(provider.provider.display_name()),
                         ),
                 )
                 .child(
@@ -730,13 +742,7 @@ fn activity_row(activity: &RecentActivity, p: Palette) -> impl IntoElement {
                 .min_w(px(0.0))
                 .items_center()
                 .gap_3()
-                .child(
-                    div()
-                        .size_2()
-                        .flex_shrink_0()
-                        .rounded_full()
-                        .bg(provider_color(activity.provider)),
-                )
+                .child(provider_logo(activity.provider, 24.0))
                 .child(
                     div()
                         .flex()
@@ -757,7 +763,7 @@ fn activity_row(activity: &RecentActivity, p: Palette) -> impl IntoElement {
                                 .text_color(p.muted_foreground)
                                 .child(format!(
                                     "{} · {}",
-                                    activity.provider,
+                                    activity.provider.display_name(),
                                     activity.timestamp.with_timezone(&Local).format("%H:%M")
                                 )),
                         ),
@@ -811,13 +817,7 @@ fn model_row(model: &ModelUsage, p: Palette) -> impl IntoElement {
                 .min_w(px(0.0))
                 .items_center()
                 .gap_3()
-                .child(
-                    div()
-                        .size_2()
-                        .flex_shrink_0()
-                        .rounded_full()
-                        .bg(provider_color(model.provider)),
-                )
+                .child(provider_logo(model.provider, 24.0))
                 .child(
                     div()
                         .flex()
@@ -836,7 +836,7 @@ fn model_row(model: &ModelUsage, p: Palette) -> impl IntoElement {
                             div()
                                 .text_xs()
                                 .text_color(p.muted_foreground)
-                                .child(model.provider.to_string()),
+                                .child(model.provider.display_name()),
                         ),
                 ),
         )
@@ -1177,17 +1177,13 @@ fn heatmap(
             .map(|month| t!("overview.heatmap_month", month = month).to_string())
             .unwrap_or_default();
         month_grid = month_grid.child(
-            div()
-                .w(cell_size)
-                .h(px(18.0))
-                .flex_shrink_0()
-                .child(
-                    div()
-                        .whitespace_nowrap()
-                        .text_xs()
-                        .text_color(p.muted_foreground)
-                        .child(month_label),
-                ),
+            div().w(cell_size).h(px(18.0)).flex_shrink_0().child(
+                div()
+                    .whitespace_nowrap()
+                    .text_xs()
+                    .text_color(p.muted_foreground)
+                    .child(month_label),
+            ),
         );
     }
 
@@ -1267,12 +1263,7 @@ fn heatmap(
                 .text_color(p.foreground)
                 .child(t!("overview.heatmap").to_string()),
         )
-        .child(
-            div()
-                .pt_3()
-                .child(week_row)
-                .child(div().pt_2().child(grid)),
-        )
+        .child(div().pt_3().child(week_row).child(div().pt_2().child(grid)))
         .child(legend)
         .into_any_element()
 }

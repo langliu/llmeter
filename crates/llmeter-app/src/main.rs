@@ -1,4 +1,5 @@
 mod app;
+mod assets;
 mod i18n;
 mod state;
 mod views;
@@ -81,7 +82,7 @@ fn main() -> Result<()> {
     let collector = Collector::new(database);
     collector.start_background();
 
-    let application = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+    let application = gpui_platform::application().with_assets(assets::Assets);
     application.run(move |cx: &mut App| {
         gpui_component::init(cx);
 
@@ -98,9 +99,7 @@ fn main() -> Result<()> {
                     window.set_window_title("LLMeter");
                     window.set_background_appearance(WindowBackgroundAppearance::Blurred);
                     let view = cx.new(|cx| app::LLMeterView::new(collector.clone(), window, cx));
-                    cx.new(|cx| {
-                        Root::new(view, window, cx).bg(cx.theme().background.opacity(0.78))
-                    })
+                    cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background.opacity(0.78)))
                 },
             )?;
             Ok::<_, anyhow::Error>(())
