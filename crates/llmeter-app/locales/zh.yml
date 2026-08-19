@@ -50,6 +50,13 @@ overview:
   unpriced: "未定价"
   unknown_model: "未知模型"
   trend_peak: "峰值 %{value} / 天"
+  token_total: "TOKEN 总数"
+  average: "平均"
+  conversations: "对话"
+  started: "开始使用"
+  active_days: "活跃天数 %{days} 天"
+  model_count: "%{count} 个模型"
+  share_all: "全部"
 providers:
   title: "提供商"
   subtitle: "用量总计与检测到的本地编程代理"

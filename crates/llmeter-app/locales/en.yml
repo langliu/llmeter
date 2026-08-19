@@ -50,6 +50,13 @@ overview:
   unpriced: "Unpriced"
   unknown_model: "Unknown model"
   trend_peak: "peak %{value} / day"
+  token_total: "TOKEN total"
+  average: "Average"
+  conversations: "Sessions"
+  started: "Started"
+  active_days: "%{days} active days"
+  model_count: "%{count} models"
+  share_all: "All"
 providers:
   title: "Providers"
   subtitle: "Usage totals and detected local coding agents"

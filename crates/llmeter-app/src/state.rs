@@ -45,9 +45,9 @@ impl UiSnapshot {
             // Keep enough history for the overview calendar while the trend remains a
             // compact 30-day view.
             heatmap_daily: repository
-                .get_daily_usage(now - Duration::days(184), now + Duration::seconds(1))?,
+                .get_daily_usage(now - Duration::days(147), now + Duration::seconds(1))?,
             heatmap_models: repository
-                .get_daily_model_usage(now - Duration::days(184), now + Duration::seconds(1))?,
+                .get_daily_model_usage(now - Duration::days(147), now + Duration::seconds(1))?,
             providers: repository.get_provider_usage(thirty_start, now + Duration::seconds(1))?,
             models: repository.get_model_usage(thirty_start, now + Duration::seconds(1))?,
             projects: repository.get_project_usage(thirty_start, now + Duration::seconds(1))?,

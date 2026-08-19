@@ -6,8 +6,11 @@ mod views;
 rust_i18n::i18n!("locales", fallback = "en");
 
 use anyhow::{Context, Result};
-use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, px, size};
-use gpui_component::Root;
+use gpui::{
+    App, AppContext, Bounds, Styled, WindowBackgroundAppearance, WindowBounds, WindowOptions, px,
+    size,
+};
+use gpui_component::{ActiveTheme, Root, TitleBar};
 use llmeter_collector::{Collector, hooks};
 use llmeter_core::Provider;
 use llmeter_storage::Database;
@@ -87,11 +90,17 @@ fn main() -> Result<()> {
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitleBar::title_bar_options()),
+                    window_background: WindowBackgroundAppearance::Blurred,
                     ..Default::default()
                 },
                 |window, cx| {
+                    window.set_window_title("LLMeter");
+                    window.set_background_appearance(WindowBackgroundAppearance::Blurred);
                     let view = cx.new(|cx| app::LLMeterView::new(collector.clone(), window, cx));
-                    cx.new(|cx| Root::new(view, window, cx))
+                    cx.new(|cx| {
+                        Root::new(view, window, cx).bg(cx.theme().background.opacity(0.78))
+                    })
                 },
             )?;
             Ok::<_, anyhow::Error>(())
