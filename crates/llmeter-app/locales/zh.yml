@@ -72,7 +72,7 @@ local:
   pending: "待同步"
   incremental: "会话日志增量读取"
   privacy: "提示词与回复内容永远不会被存储"
-  unknown_pricing: "未知价格如实展示，不做猜测"
+  unknown_pricing: "价格来自 LiteLLM，未知模型显示为未定价"
 sessions:
   title: "会话"
   subtitle: "浏览本地的 Claude Code 与 Codex 会话，一键复制恢复命令。"

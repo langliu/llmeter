@@ -23,6 +23,7 @@ use crate::{
 #[derive(Clone, Debug)]
 pub enum CollectorEvent {
     UsageChanged(SyncResult),
+    PricingUpdated,
 }
 
 #[derive(Clone)]
@@ -35,6 +36,7 @@ pub struct Collector {
 
 impl Collector {
     pub fn new(database: Database) -> Self {
+        let _ = crate::pricing::load_cached_pricing(hooks::data_dir().join("cache"));
         let (event_sender, event_receiver) = mpsc::channel();
         Self {
             engine: SyncEngine::new(database),
@@ -95,6 +97,16 @@ impl Collector {
         thread::Builder::new()
             .name("llmeter-collector".into())
             .spawn(move || {
+                match crate::pricing::refresh_pricing(
+                    hooks::data_dir().join("cache"),
+                    Some(collector.engine.database()),
+                ) {
+                    Ok(result) if result.repriced > 0 => {
+                        let _ = collector.event_sender.send(CollectorEvent::PricingUpdated);
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(error = %error, "pricing refresh failed"),
+                }
                 let roots = watch_roots();
                 let Ok((_watcher, receiver)) = watcher::start(&roots) else {
                     warn!(

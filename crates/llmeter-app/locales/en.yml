@@ -72,7 +72,7 @@ local:
   pending: "pending"
   incremental: "Session logs are read incrementally"
   privacy: "Prompts and responses are never stored"
-  unknown_pricing: "Unknown pricing is shown instead of guessed"
+  unknown_pricing: "Prices come from LiteLLM; unknown models stay unpriced"
 sessions:
   title: "Sessions"
   subtitle: "Browse local Claude Code and Codex sessions and copy resume commands."

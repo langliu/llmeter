@@ -315,8 +315,14 @@ impl LLMeterView {
     fn refresh_from_events(&mut self) -> bool {
         let mut changed = false;
         while let Some(event) = self.collector.try_recv() {
-            let CollectorEvent::UsageChanged(result) = event;
-            self.reload_snapshot(Some((Utc::now(), result.warnings)));
+            match event {
+                CollectorEvent::UsageChanged(result) => {
+                    self.reload_snapshot(Some((Utc::now(), result.warnings)));
+                }
+                CollectorEvent::PricingUpdated => {
+                    self.reload_snapshot(None);
+                }
+            }
             changed = true;
         }
         changed

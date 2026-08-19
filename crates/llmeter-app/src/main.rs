@@ -22,6 +22,11 @@ fn main() -> Result<()> {
         CliCommand::FullRescan => {
             let data_dir = prepare_data_dir()?;
             let database = Database::open(data_dir.join("llmeter.db"))?;
+            if let Err(error) =
+                llmeter_collector::pricing::refresh_pricing(data_dir.join("cache"), None)
+            {
+                eprintln!("pricing refresh failed: {error}");
+            }
             let collector = Collector::new(database);
             let result = collector.full_rescan()?;
             println!(

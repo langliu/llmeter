@@ -1,6 +1,7 @@
 pub mod collector;
 pub mod hooks;
 pub mod parsers;
+pub mod pricing;
 pub mod providers;
 pub mod sync;
 pub mod watcher;

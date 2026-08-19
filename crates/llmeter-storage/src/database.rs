@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use llmeter_core::{FileCursor, Provider, UsageEvent};
+use llmeter_core::{FileCursor, Provider, TokenCounts, UsageEvent};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
@@ -351,6 +351,71 @@ impl Database {
         connection.execute_batch("DELETE FROM usage_events; DELETE FROM file_cursors;")?;
         Ok(())
     }
+
+    pub fn list_usage_for_pricing(&self) -> Result<Vec<UsagePricingInput>, StorageError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT id, provider, model, input_tokens, cached_input_tokens,
+                    cache_creation_input_tokens, output_tokens, reasoning_tokens,
+                    estimated_cost_usd
+             FROM usage_events",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let provider_text: String = row.get(1)?;
+            let provider = provider_text.parse::<Provider>().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                )
+            })?;
+            Ok(UsagePricingInput {
+                id: row.get(0)?,
+                provider,
+                model: row.get(2)?,
+                counts: TokenCounts {
+                    input_tokens: from_sqlite_u64(row.get(3)?),
+                    cached_input_tokens: from_sqlite_u64(row.get(4)?),
+                    cache_creation_input_tokens: from_sqlite_u64(row.get(5)?),
+                    output_tokens: from_sqlite_u64(row.get(6)?),
+                    reasoning_tokens: from_sqlite_u64(row.get(7)?),
+                    total_tokens: 0,
+                },
+                estimated_cost_usd: row.get(8)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    pub fn update_estimated_costs(
+        &self,
+        updates: &[(String, Option<f64>)],
+    ) -> Result<usize, StorageError> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        {
+            let mut statement = transaction
+                .prepare("UPDATE usage_events SET estimated_cost_usd = ?2 WHERE id = ?1")?;
+            for (id, cost) in updates {
+                statement.execute(params![id, cost])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(updates.len())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsagePricingInput {
+    pub id: String,
+    pub provider: Provider,
+    pub model: Option<String>,
+    pub counts: TokenCounts,
+    pub estimated_cost_usd: Option<f64>,
 }
 
 fn to_sqlite_i64(value: u64) -> Result<i64, StorageError> {
