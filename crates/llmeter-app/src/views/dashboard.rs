@@ -1,9 +1,11 @@
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use gpui::{
-    Context, FontWeight, IntoElement, Render, Rgba, SharedString, div, prelude::*, px, relative,
-    rgb,
+    Bounds, Context, FontWeight, Hsla, IntoElement, MouseMoveEvent, Render, Rgba, canvas, div,
+    fill, point, prelude::*, px, relative, rgb, size,
 };
 use gpui_component::{
     ActiveTheme, Selectable,
@@ -92,11 +94,12 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
         DashboardPage::Overview => div()
             .flex()
             .flex_col()
+            .gap_4()
+            .p_4()
             .child(
                 div()
                     .flex()
                     .gap_4()
-                    .p_4()
                     .child(summary_card(
                         t!("overview.today").to_string(),
                         &snapshot.today,
@@ -122,16 +125,17 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
                         p,
                     )),
             )
-            .child(div().px_4().pt_4().child(heatmap(
+            .child(heatmap(
+                view,
                 &snapshot.heatmap_daily,
                 &snapshot.heatmap_models,
                 p,
-            )))
+                cx,
+            ))
             .child(
                 div()
                     .flex()
                     .gap_4()
-                    .px_4()
                     .child(panel(
                         t!("overview.provider_usage").to_string(),
                         provider_rows,
@@ -147,8 +151,6 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
                 div()
                     .flex()
                     .gap_4()
-                    .px_4()
-                    .pt_4()
                     .child(panel(
                         t!("overview.token_trend").to_string(),
                         trend(&snapshot.daily, p),
@@ -160,8 +162,6 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
                 div()
                     .flex()
                     .gap_4()
-                    .px_4()
-                    .pt_4()
                     .child(panel(t!("overview.projects").to_string(), project_rows, p))
                     .child(panel(
                         t!("overview.local_setup").to_string(),
@@ -223,6 +223,12 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
                 .id("main-scroll")
                 .flex_1()
                 .overflow_y_scroll()
+                .on_scroll_wheel(cx.listener(|view, _, _, cx| {
+                    // Drop the heatmap hover overlay so scrolling does not keep
+                    // rebuilding tooltip state as cells move under the cursor.
+                    view.heatmap
+                        .update(cx, |heatmap, cx| heatmap.clear_hover(cx));
+                }))
                 .child(content),
         );
 
@@ -753,14 +759,187 @@ fn provider_color(provider: Provider) -> Rgba {
 }
 
 const HEATMAP_WEEKS: i64 = 26;
+const HEATMAP_CELL: f32 = 24.0;
+const HEATMAP_GAP: f32 = 6.0;
+
+#[derive(Clone, Debug, PartialEq)]
+struct HeatmapCell {
+    date_text: String,
+    value: u64,
+    level: usize,
+    models: Vec<(String, u64)>,
+}
+
+/// Paints the 26×7 calendar as a single canvas so scrolling the overview
+/// does not thrash 180+ stateful hover/tooltip elements.
+pub(crate) struct HeatmapView {
+    cells: Rc<Vec<HeatmapCell>>,
+    colors: [Hsla; 5],
+    hover: Option<usize>,
+}
+
+impl Default for HeatmapView {
+    fn default() -> Self {
+        Self {
+            cells: Rc::new(Vec::new()),
+            colors: [gpui::black(); 5],
+            hover: None,
+        }
+    }
+}
+
+impl HeatmapView {
+    fn sync(&mut self, cells: Rc<Vec<HeatmapCell>>, colors: [Hsla; 5], cx: &mut Context<Self>) {
+        if self.cells.as_ref() != cells.as_ref() || self.colors != colors {
+            self.cells = cells;
+            self.colors = colors;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn clear_hover(&mut self, cx: &mut Context<Self>) {
+        if self.hover.take().is_some() {
+            cx.notify();
+        }
+    }
+}
+
+impl Render for HeatmapView {
+    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let cell = HEATMAP_CELL;
+        let gap = HEATMAP_GAP;
+        let width = px(HEATMAP_WEEKS as f32 * cell + (HEATMAP_WEEKS - 1) as f32 * gap);
+        let height = px(7.0 * cell + 6.0 * gap);
+        let colors = self.colors;
+        let levels = self.cells.iter().map(|item| item.level).collect::<Vec<_>>();
+        let grid_bounds = Rc::new(Cell::new(Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(width, height),
+        }));
+
+        let mut grid = div()
+            .id("heatmap-grid")
+            .relative()
+            .w(width)
+            .h(height)
+            .flex_shrink_0()
+            .child(
+                canvas(
+                    {
+                        let grid_bounds = grid_bounds.clone();
+                        move |bounds, _, _| grid_bounds.set(bounds)
+                    },
+                    move |bounds, _, window, _| {
+                        let hovered = heatmap_hit_index(window.mouse_position(), bounds, cell, gap);
+                        for (index, level) in levels.iter().copied().enumerate() {
+                            let week = (index / 7) as f32;
+                            let weekday = (index % 7) as f32;
+                            let origin = point(
+                                bounds.origin.x + px(week * (cell + gap)),
+                                bounds.origin.y + px(weekday * (cell + gap)),
+                            );
+                            let mut color = colors[level.min(4)];
+                            if hovered == Some(index) {
+                                color = color.opacity(0.78);
+                            }
+                            window.paint_quad(
+                                fill(
+                                    Bounds {
+                                        origin,
+                                        size: size(px(cell), px(cell)),
+                                    },
+                                    color,
+                                )
+                                .corner_radii(px(4.0)),
+                            );
+                        }
+                    },
+                )
+                .size_full(),
+            )
+            .on_mouse_move(cx.listener({
+                let grid_bounds = grid_bounds.clone();
+                move |this, event: &MouseMoveEvent, _, cx| {
+                    let next = heatmap_hit_index(event.position, grid_bounds.get(), cell, gap);
+                    if this.hover != next {
+                        this.hover = next;
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !*hovered && this.hover.take().is_some() {
+                    cx.notify();
+                }
+            }));
+
+        if let Some(index) = self.hover
+            && let Some(item) = self.cells.get(index).cloned()
+        {
+            let week = (index / 7) as f32;
+            let weekday = (index % 7) as f32;
+            grid = grid.child(
+                div()
+                    .id(("heatmap-hover", index))
+                    .absolute()
+                    .left(px(week * (cell + gap)))
+                    .top(px(weekday * (cell + gap)))
+                    .size(px(cell))
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| HeatmapTooltip {
+                            date: item.date_text.clone(),
+                            level: item.level,
+                            total_tokens: item.value,
+                            models: item.models.clone(),
+                        })
+                        .into()
+                    }),
+            );
+        }
+
+        grid
+    }
+}
+
+fn heatmap_hit_index(
+    position: gpui::Point<gpui::Pixels>,
+    bounds: Bounds<gpui::Pixels>,
+    cell: f32,
+    gap: f32,
+) -> Option<usize> {
+    if !bounds.contains(&position) {
+        return None;
+    }
+    let local_x = (position.x - bounds.origin.x).as_f32();
+    let local_y = (position.y - bounds.origin.y).as_f32();
+    let stride = cell + gap;
+    let week = (local_x / stride).floor();
+    let weekday = (local_y / stride).floor();
+    if week < 0.0 || weekday < 0.0 {
+        return None;
+    }
+    let week = week as i64;
+    let weekday = weekday as i64;
+    if week >= HEATMAP_WEEKS || weekday >= 7 {
+        return None;
+    }
+    let x_in_cell = local_x - week as f32 * stride;
+    let y_in_cell = local_y - weekday as f32 * stride;
+    if x_in_cell > cell || y_in_cell > cell {
+        return None;
+    }
+    Some((week * 7 + weekday) as usize)
+}
 
 fn heatmap(
+    view: &LLMeterView,
     daily: &[llmeter_storage::DailyUsage],
     model_usage: &[DailyModelUsage],
     p: Palette,
+    cx: &mut Context<LLMeterView>,
 ) -> gpui::AnyElement {
-    let cell_size = px(24.0);
-    let gap = px(6.0);
+    let cell_size = px(HEATMAP_CELL);
+    let gap = px(HEATMAP_GAP);
     let label_width = px(28.0);
     let today = Local::now().date_naive();
     let end = today + Duration::days(6 - i64::from(today.weekday().num_days_from_sunday()));
@@ -792,9 +971,32 @@ fn heatmap(
         }
     }
     let max_value = values.iter().map(|(_, value)| *value).max().unwrap_or(0);
+    let cells = Rc::new(
+        values
+            .into_iter()
+            .map(|(date, value)| HeatmapCell {
+                date_text: date.format("%Y-%m-%d").to_string(),
+                value,
+                level: heatmap_level(value, max_value),
+                models: models_by_day.remove(&date).unwrap_or_default(),
+            })
+            .collect::<Vec<_>>(),
+    );
+    view.heatmap.update(cx, |heatmap, cx| {
+        heatmap.sync(
+            cells,
+            [
+                heatmap_level_color(0, p),
+                heatmap_level_color(1, p),
+                heatmap_level_color(2, p),
+                heatmap_level_color(3, p),
+                heatmap_level_color(4, p),
+            ],
+            cx,
+        );
+    });
 
     let mut month_grid = div().flex().gap(gap).flex_shrink_0();
-    let mut columns = div().flex().gap(gap).flex_shrink_0();
     for week in 0..HEATMAP_WEEKS {
         let week_start = start + Duration::days(week * 7);
         let previous_week = week_start - Duration::days(7);
@@ -812,20 +1014,6 @@ fn heatmap(
                 .text_color(p.muted_foreground)
                 .child(month_label),
         );
-
-        let mut column = div()
-            .flex()
-            .flex_col()
-            .gap(gap)
-            .w(cell_size)
-            .flex_shrink_0();
-        for weekday in 0..7 {
-            let index = (week * 7 + weekday) as usize;
-            let (date, value) = values[index];
-            let models = models_by_day.get(&date).cloned().unwrap_or_default();
-            column = column.child(heatmap_cell(date, value, max_value, models, cell_size, p));
-        }
-        columns = columns.child(column);
     }
 
     let weekday_labels = [
@@ -862,7 +1050,12 @@ fn heatmap(
         .items_end()
         .child(div().w(label_width).h(px(22.0)).flex_shrink_0())
         .child(month_grid);
-    let grid = div().flex().gap(gap).child(weekday_column).child(columns);
+    let grid = div()
+        .flex()
+        .items_start()
+        .gap(gap)
+        .child(weekday_column)
+        .child(view.heatmap.clone());
 
     let legend_colors = [
         heatmap_level_color(0, p),
@@ -876,7 +1069,7 @@ fn heatmap(
         .items_center()
         .justify_center()
         .gap(px(6.0))
-        .pt_5()
+        .pt_3()
         .text_xs()
         .text_color(p.muted_foreground)
         .child(t!("overview.heatmap_less").to_string());
@@ -887,7 +1080,6 @@ fn heatmap(
 
     div()
         .w_full()
-        .min_h(px(320.0))
         .p_5()
         .rounded_xl()
         .bg(p.tiles)
@@ -915,39 +1107,12 @@ fn heatmap(
         )
         .child(
             div()
-                .pt_5()
+                .pt_3()
                 .child(month_row)
                 .child(div().pt_2().child(grid)),
         )
         .child(legend)
         .into_any_element()
-}
-
-fn heatmap_cell(
-    date: NaiveDate,
-    value: u64,
-    max_value: u64,
-    models: Vec<(String, u64)>,
-    cell_size: gpui::Pixels,
-    p: Palette,
-) -> impl IntoElement {
-    let date_text = date.format("%Y-%m-%d").to_string();
-    let level = heatmap_level(value, max_value);
-    div()
-        .id(SharedString::from(format!("heatmap-cell-{date_text}")))
-        .size(cell_size)
-        .rounded_sm()
-        .bg(heatmap_level_color(level, p))
-        .hover(|style| style.opacity(0.78))
-        .tooltip(move |_, cx| {
-            cx.new(|_| HeatmapTooltip {
-                date: date_text.clone(),
-                level,
-                total_tokens: value,
-                models: models.clone(),
-            })
-            .into()
-        })
 }
 
 fn heatmap_level(value: u64, max_value: u64) -> usize {
@@ -1236,4 +1401,44 @@ fn format_cost(value: Option<f64>) -> String {
     value
         .map(|value| format!("$ {:.2}", value))
         .unwrap_or_else(|| t!("overview.unpriced").to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HEATMAP_CELL, HEATMAP_GAP, HEATMAP_WEEKS, heatmap_hit_index};
+    use gpui::{Bounds, point, px, size};
+
+    fn grid_bounds() -> Bounds<gpui::Pixels> {
+        let width = HEATMAP_WEEKS as f32 * HEATMAP_CELL + (HEATMAP_WEEKS - 1) as f32 * HEATMAP_GAP;
+        let height = 7.0 * HEATMAP_CELL + 6.0 * HEATMAP_GAP;
+        Bounds {
+            origin: point(px(10.0), px(20.0)),
+            size: size(px(width), px(height)),
+        }
+    }
+
+    #[test]
+    fn heatmap_hit_index_maps_cells_and_skips_gaps() {
+        let bounds = grid_bounds();
+        assert_eq!(
+            heatmap_hit_index(point(px(10.0), px(20.0)), bounds, HEATMAP_CELL, HEATMAP_GAP),
+            Some(0)
+        );
+        assert_eq!(
+            heatmap_hit_index(point(px(33.0), px(43.0)), bounds, HEATMAP_CELL, HEATMAP_GAP),
+            Some(0)
+        );
+        assert_eq!(
+            heatmap_hit_index(point(px(35.0), px(20.0)), bounds, HEATMAP_CELL, HEATMAP_GAP),
+            None
+        );
+        assert_eq!(
+            heatmap_hit_index(point(px(40.0), px(20.0)), bounds, HEATMAP_CELL, HEATMAP_GAP),
+            Some(7)
+        );
+        assert_eq!(
+            heatmap_hit_index(point(px(9.0), px(20.0)), bounds, HEATMAP_CELL, HEATMAP_GAP),
+            None
+        );
+    }
 }

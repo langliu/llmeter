@@ -279,7 +279,7 @@ fn project_filter(
                 .p_1()
                 .occlude()
                 .child(project_menu_item(
-                    &t!("sessions.all_projects").to_string(),
+                    t!("sessions.all_projects").as_ref(),
                     selected.is_none(),
                     None,
                     cx,

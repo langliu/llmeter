@@ -1,0 +1,11 @@
+[
+  {
+    "label": "Run LLMeter App",
+    "command": "cargo",
+    "args": ["run", "-p", "llmeter-app"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  }
+]

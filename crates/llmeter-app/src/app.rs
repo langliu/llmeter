@@ -14,7 +14,7 @@ use rust_i18n::t;
 use crate::{
     i18n::{self, LocalePreference},
     state::UiSnapshot,
-    views::dashboard::{DashboardPage, dashboard},
+    views::dashboard::{DashboardPage, HeatmapView, dashboard},
     views::sessions::{SessionProviderFilter, SessionRangeFilter},
     views::settings::SettingsSection,
 };
@@ -69,6 +69,7 @@ pub struct LLMeterView {
     pub(crate) theme_pref: ThemePreference,
     pub(crate) locale_pref: LocalePreference,
     pub(crate) settings_section: SettingsSection,
+    pub(crate) heatmap: Entity<HeatmapView>,
     _search_subscription: Subscription,
     _appearance_subscription: Subscription,
     refresh_task: Option<gpui::Task<()>>,
@@ -136,6 +137,7 @@ impl LLMeterView {
             theme_pref,
             locale_pref,
             settings_section: SettingsSection::default(),
+            heatmap: cx.new(|_| HeatmapView::default()),
             _search_subscription,
             _appearance_subscription,
             refresh_task: None,
@@ -399,7 +401,7 @@ mod tests {
     ) -> (gpui::Entity<LLMeterView>, &mut gpui::VisualTestContext) {
         let database = Database::open_in_memory().expect("in-memory database");
         let collector = Collector::new(database);
-        cx.update(|cx| gpui_component::init(cx));
+        cx.update(gpui_component::init);
         let (view, cx) = cx.add_window_view(|window, cx| LLMeterView::new(collector, window, cx));
         view.update(cx, |view, _| {
             view.snapshot.sessions = fake_sessions(60);
@@ -481,7 +483,7 @@ mod tests {
     fn theme_preference_applies_and_persists(cx: &mut TestAppContext) {
         let database = Database::open_in_memory().expect("in-memory database");
         let collector = Collector::new(database.clone());
-        cx.update(|cx| gpui_component::init(cx));
+        cx.update(gpui_component::init);
         let (view, cx) = cx.add_window_view(|window, cx| LLMeterView::new(collector, window, cx));
 
         // Default preference is System; the test platform reports a light appearance.
