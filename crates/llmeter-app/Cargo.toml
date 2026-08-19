@@ -3,6 +3,15 @@ name = "llmeter-app"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+description = "Local-first AI coding usage tracker"
+
+[package.metadata.bundle]
+name = "LLMeter"
+identifier = "io.github.langliu.llmeter"
+icon = ["crates/llmeter-app/assets/AppIcon.icns"]
+category = "Developer Tool"
+short_description = "Local-first AI coding usage tracker"
+long_description = "Track token usage from local AI coding agents without proxying traffic or uploading data."
 
 [[bin]]
 name = "llmeter"
@@ -25,4 +34,3 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
-

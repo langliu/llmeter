@@ -65,6 +65,15 @@ cargo run -p llmeter-app -- hook status --provider codex
 cargo run -p llmeter-app -- hook install --provider codex
 ~~~
 
+Build the macOS application bundle (requires
+[`cargo-bundle`](https://github.com/burtonageo/cargo-bundle)):
+
+~~~sh
+cargo install cargo-bundle
+cargo bundle --release -p llmeter-app
+open target/release/bundle/osx/LLMeter.app
+~~~
+
 The notify subcommand is intentionally lightweight: it writes a local signal
 and exits. The running app performs the actual incremental parse.
 The rescan subcommand explicitly clears derived usage and cursors, then
