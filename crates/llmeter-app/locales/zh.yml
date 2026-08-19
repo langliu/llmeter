@@ -63,7 +63,7 @@ providers:
   detection_unavailable: "提供商检测不可用"
 projects:
   title: "项目"
-  subtitle: "Token 用量按各会话工作目录归属"
+  subtitle: "Token 用量按项目名称汇总"
   usage_30: "项目用量 · 30 天"
 local:
   database: "数据库：%{path}"

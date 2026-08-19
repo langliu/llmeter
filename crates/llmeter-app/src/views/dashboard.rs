@@ -8,7 +8,7 @@ use gpui::{
     fill, point, prelude::*, px, relative, rgb, size,
 };
 use gpui_component::{
-    ActiveTheme, Selectable,
+    ActiveTheme, IconName, Selectable,
     button::{Button, ButtonCustomVariant, ButtonVariants},
 };
 use llmeter_core::{Provider, ProviderDetection, ProviderStatus};
@@ -47,6 +47,16 @@ impl DashboardPage {
             Self::Providers => t!("nav.providers").to_string(),
             Self::Projects => t!("nav.projects").to_string(),
             Self::Settings => t!("nav.settings").to_string(),
+        }
+    }
+
+    fn icon(self) -> IconName {
+        match self {
+            Self::Overview => IconName::LayoutDashboard,
+            Self::Sessions => IconName::Inbox,
+            Self::Providers => IconName::Bot,
+            Self::Projects => IconName::Folder,
+            Self::Settings => IconName::Settings,
         }
     }
 }
@@ -265,16 +275,22 @@ fn sidebar(active_page: DashboardPage, cx: &mut Context<LLMeterView>) -> impl In
             Button::new(item.clone())
                 .custom(variant)
                 .selected(is_active)
+                .icon(page.icon())
                 .w_full()
                 .justify_start()
-                .label(item)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(item),
+                )
                 .on_click(cx.listener(move |view, _, _, cx| view.navigate(page, cx))),
         );
     }
     div()
         .flex()
         .flex_col()
-        .min_w(px(176.0))
+        .min_w(px(200.0))
         .p_4()
         .bg(sidebar_background)
         .text_color(sidebar_foreground)
@@ -287,13 +303,6 @@ fn sidebar(active_page: DashboardPage, cx: &mut Context<LLMeterView>) -> impl In
                 .child(t!("app.tagline").to_string()),
         )
         .child(navigation)
-        .child(
-            div()
-                .pt_6()
-                .text_xs()
-                .text_color(sidebar_muted)
-                .child(t!("app.no_cloud").to_string()),
-        )
 }
 
 fn page_heading(title: String, subtitle: String, p: Palette) -> impl IntoElement {

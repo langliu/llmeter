@@ -106,9 +106,14 @@ fn section_nav(
                 .custom(variant)
                 .selected(active)
                 .icon(item.icon())
-                .label(item.label())
                 .w_full()
                 .justify_start()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(item.label()),
+                )
                 .on_click(cx.listener(move |view, _, _, cx| {
                     view.set_settings_section(item, cx);
                 })),

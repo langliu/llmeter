@@ -367,10 +367,10 @@ impl UsageRepository {
     ) -> Result<Vec<ProjectUsage>, StorageError> {
         let connection = self.database.lock()?;
         let mut statement = connection.prepare(
-            "SELECT COALESCE(project_name, 'Unknown project'), project_path,
+            "SELECT COALESCE(project_name, 'Unknown project'), MAX(project_path),
                     COALESCE(SUM(total_tokens), 0), SUM(estimated_cost_usd), MAX(timestamp)
              FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
-             GROUP BY project_name, project_path ORDER BY 3 DESC",
+             GROUP BY 1 ORDER BY 3 DESC",
         )?;
         let rows = statement.query_map(params![start.timestamp(), end.timestamp()], |row| {
             let last_activity: Option<i64> = row.get(4)?;

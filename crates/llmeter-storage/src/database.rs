@@ -458,4 +458,39 @@ mod tests {
             Some("codex resume 019fff13-bd73-7c71-a844-4dbe59993141")
         );
     }
+
+    #[test]
+    fn project_usage_merges_same_name_across_worktree_paths() {
+        let database = Database::open_in_memory().unwrap();
+        let started = Utc::now() - chrono::Duration::hours(1);
+        let mut main = event("main", Some("a"), 100);
+        main.timestamp = started;
+        main.project_name = Some("workstation-web".into());
+        main.project_path = Some(PathBuf::from(
+            "/Users/liulang/WebstormProjects/workstation-web",
+        ));
+        let mut worktree = event("worktree", Some("b"), 50);
+        worktree.timestamp = started + chrono::Duration::minutes(5);
+        worktree.project_name = Some("workstation-web".into());
+        worktree.project_path = Some(PathBuf::from(
+            "/Users/liulang/WebstormProjects/worktrees/workstation-web/loyal-yak/workstation-web",
+        ));
+        let mut other = event("other", Some("c"), 25);
+        other.timestamp = started + chrono::Duration::minutes(6);
+        other.project_name = Some("llmeter".into());
+        other.project_path = Some(PathBuf::from("/Users/liulang/lang-projects/llmeter"));
+        database
+            .insert_usage_events_with_summary(&[main, worktree, other])
+            .unwrap();
+
+        let start = chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        let projects = UsageRepository::new(database)
+            .get_project_usage(start, Utc::now() + chrono::Duration::seconds(1))
+            .unwrap();
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].project_name, "workstation-web");
+        assert_eq!(projects[0].total_tokens, 150);
+        assert_eq!(projects[1].project_name, "llmeter");
+        assert_eq!(projects[1].total_tokens, 25);
+    }
 }

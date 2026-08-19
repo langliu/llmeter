@@ -63,7 +63,7 @@ providers:
   detection_unavailable: "Provider detection unavailable"
 projects:
   title: "Projects"
-  subtitle: "Token usage attributed from each agent session working directory"
+  subtitle: "Token usage rolled up by project name"
   usage_30: "Project Usage · 30 days"
 local:
   database: "Database: %{path}"
