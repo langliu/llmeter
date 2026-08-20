@@ -29,7 +29,7 @@ pub(crate) enum SessionProviderFilter {
 }
 
 impl SessionProviderFilter {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::All,
         Self::Provider(Provider::Claude),
         Self::Provider(Provider::Codex),
@@ -37,6 +37,7 @@ impl SessionProviderFilter {
         Self::Provider(Provider::OpenCode),
         Self::Provider(Provider::Zed),
         Self::Provider(Provider::Grok),
+        Self::Provider(Provider::Hermes),
     ];
 
     fn label(self) -> String {

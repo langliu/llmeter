@@ -2,13 +2,14 @@ use std::borrow::Cow;
 
 use gpui::{AssetSource, Result, SharedString};
 
-const PROVIDER_ASSETS: [&str; 6] = [
+const PROVIDER_ASSETS: [&str; 7] = [
     "providers/codex.svg",
     "providers/claude.svg",
     "providers/opencode.svg",
     "providers/pi.svg",
     "providers/zed.svg",
     "providers/grok.svg",
+    "providers/hermes.svg",
 ];
 
 pub(crate) struct Assets;
@@ -28,6 +29,9 @@ impl AssetSource for Assets {
             "providers/pi.svg" => Some(include_bytes!("../assets/providers/pi.svg").as_slice()),
             "providers/zed.svg" => Some(include_bytes!("../assets/providers/zed.svg").as_slice()),
             "providers/grok.svg" => Some(include_bytes!("../assets/providers/grok.svg").as_slice()),
+            "providers/hermes.svg" => {
+                Some(include_bytes!("../assets/providers/hermes.svg").as_slice())
+            }
             _ => None,
         };
         match asset {

@@ -15,6 +15,7 @@ use serde_json::Value;
 mod claude;
 mod codex;
 mod grok;
+mod hermes;
 mod opencode;
 mod pi;
 mod zed;
@@ -22,6 +23,7 @@ mod zed;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use grok::GrokAdapter;
+pub use hermes::HermesAdapter;
 pub use opencode::OpenCodeAdapter;
 pub use pi::PiAdapter;
 pub use zed::ZedAdapter;
@@ -72,6 +74,7 @@ pub fn default_adapters() -> Vec<Box<dyn ProviderAdapter>> {
         Box::new(PiAdapter::default()),
         Box::new(ZedAdapter::default()),
         Box::new(GrokAdapter::default()),
+        Box::new(HermesAdapter::default()),
     ]
 }
 

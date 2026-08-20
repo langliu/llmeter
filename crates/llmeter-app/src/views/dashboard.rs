@@ -924,6 +924,7 @@ fn provider_color(provider: Provider) -> Rgba {
         Provider::Pi => rgb(0x7c3aed),
         Provider::Zed => rgb(0x111827),
         Provider::Grok => rgb(0x64748b),
+        Provider::Hermes => rgb(0x475569),
     }
 }
 

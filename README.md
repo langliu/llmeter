@@ -37,6 +37,8 @@ safety rescan.
   zstd-compressed thread payloads are supported
 - Grok: ~/.grok/sessions/**/updates.jsonl (or $GROK_HOME/sessions), including
   cache-token breakdowns and the exact cost reported by Grok Build
+- Hermes Agent: $HERMES_HOME/state.db (default ~/.hermes/state.db) plus local
+  profile databases, using per-model usage with aggregate-session reconciliation
 
 Codex last_token_usage snapshots are treated as direct deltas when present.
 Other cumulative snapshots go through a per-session cumulative tracker, so

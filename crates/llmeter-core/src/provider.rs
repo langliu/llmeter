@@ -12,16 +12,18 @@ pub enum Provider {
     Pi,
     Zed,
     Grok,
+    Hermes,
 }
 
 impl Provider {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Codex,
         Self::Claude,
         Self::OpenCode,
         Self::Pi,
         Self::Zed,
         Self::Grok,
+        Self::Hermes,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -32,6 +34,7 @@ impl Provider {
             Self::Pi => "pi",
             Self::Zed => "zed",
             Self::Grok => "grok",
+            Self::Hermes => "hermes",
         }
     }
 
@@ -43,6 +46,7 @@ impl Provider {
             Self::Pi => "Pi",
             Self::Zed => "Zed",
             Self::Grok => "Grok",
+            Self::Hermes => "Hermes",
         }
     }
 
@@ -53,6 +57,7 @@ impl Provider {
             Self::OpenCode => Some(format!("opencode --session {session_ref}")),
             Self::Pi => Some(format!("pi --session {session_ref}")),
             Self::Grok => Some(format!("grok --resume {session_ref}")),
+            Self::Hermes => Some(format!("hermes --resume {session_ref}")),
             Self::Zed => None,
         }
     }
@@ -122,6 +127,7 @@ impl FromStr for Provider {
             "pi" | "pi-mono" => Ok(Self::Pi),
             "zed" => Ok(Self::Zed),
             "grok" | "grok-build" | "grok_build" => Ok(Self::Grok),
+            "hermes" | "hermes-agent" | "hermes_agent" => Ok(Self::Hermes),
             other => Err(format!("unsupported provider: {other}")),
         }
     }
@@ -277,6 +283,11 @@ mod tests {
             Some("opencode --session ses_01108a3edffeJgAoTLxwgsAYkm")
         );
         assert_eq!(Provider::Zed.resume_command("thread-id"), None);
+        assert_eq!(
+            Provider::Hermes.resume_command("session-id").as_deref(),
+            Some("hermes --resume session-id")
+        );
+        assert_eq!("hermes-agent".parse(), Ok(Provider::Hermes));
     }
 
     #[test]

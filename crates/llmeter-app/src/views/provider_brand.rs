@@ -9,11 +9,17 @@ pub(crate) fn provider_logo(provider: Provider, size: f32) -> AnyElement {
         Provider::Pi => "providers/pi.svg",
         Provider::Zed => "providers/zed.svg",
         Provider::Grok => "providers/grok.svg",
+        Provider::Hermes => "providers/hermes.svg",
     };
 
     if matches!(
         provider,
-        Provider::Claude | Provider::OpenCode | Provider::Pi | Provider::Zed | Provider::Grok
+        Provider::Claude
+            | Provider::OpenCode
+            | Provider::Pi
+            | Provider::Zed
+            | Provider::Grok
+            | Provider::Hermes
     ) {
         return div()
             .size(px(size))

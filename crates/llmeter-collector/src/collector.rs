@@ -145,6 +145,9 @@ fn watch_roots() -> Vec<PathBuf> {
     let grok_home = std::env::var_os("GROK_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".grok"));
+    let hermes_home = std::env::var_os("HERMES_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".hermes"));
     // Watch the signal directory instead of the signal file itself. Hooks may
     // create the signal file after the app has already started.
     let signal_directory = hooks::signal_path()
@@ -171,6 +174,7 @@ fn watch_roots() -> Vec<PathBuf> {
             .join("zed")
             .join("threads"),
         grok_home.join("sessions"),
+        hermes_home,
         signal_directory,
     ]
     .into_iter()
