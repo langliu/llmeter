@@ -5,6 +5,7 @@ use gpui_component::{ActiveTheme, theme::Theme};
 /// without keeping a borrow of `cx` alive.
 #[derive(Clone, Copy)]
 pub(crate) struct Palette {
+    pub is_dark: bool,
     pub background: Hsla,
     pub foreground: Hsla,
     pub muted: Hsla,
@@ -21,6 +22,7 @@ pub(crate) struct Palette {
 impl Palette {
     pub(crate) fn from_theme(theme: &Theme) -> Self {
         Self {
+            is_dark: theme.is_dark(),
             background: theme.background,
             foreground: theme.foreground,
             muted: theme.muted,

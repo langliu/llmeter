@@ -452,11 +452,18 @@ fn glass_card(p: Palette) -> gpui::Div {
 }
 
 fn stat_chip(value: String, label: String, p: Palette) -> impl IntoElement {
+    let (background, border): (gpui::Hsla, gpui::Hsla) = if p.is_dark {
+        (p.muted.opacity(0.65), p.border.opacity(0.35))
+    } else {
+        (rgb(0xf1f5f9).into(), rgb(0xe2e8f0).into())
+    };
     div()
         .flex_1()
         .min_w(px(0.0))
         .rounded_xl()
-        .bg(p.muted.opacity(0.65))
+        .bg(background)
+        .border_1()
+        .border_color(border)
         .px_2()
         .py_3()
         .child(
