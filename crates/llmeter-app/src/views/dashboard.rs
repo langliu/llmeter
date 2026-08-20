@@ -20,8 +20,8 @@ use crate::{
     app::{LLMeterView, OverviewPeriod},
     state::UiSnapshot,
     views::{
-        palette::Palette, provider_brand::provider_logo, sessions::sessions_page,
-        settings::settings_page,
+        limits::limits_page, palette::Palette, provider_brand::provider_logo,
+        sessions::sessions_page, settings::settings_page,
     },
 };
 
@@ -30,15 +30,17 @@ pub(crate) enum DashboardPage {
     #[default]
     Overview,
     Sessions,
+    Limits,
     Providers,
     Projects,
     Settings,
 }
 
 impl DashboardPage {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Overview,
         Self::Sessions,
+        Self::Limits,
         Self::Providers,
         Self::Projects,
         Self::Settings,
@@ -48,6 +50,7 @@ impl DashboardPage {
         match self {
             Self::Overview => t!("nav.overview").to_string(),
             Self::Sessions => t!("nav.sessions").to_string(),
+            Self::Limits => t!("nav.limits").to_string(),
             Self::Providers => t!("nav.providers").to_string(),
             Self::Projects => t!("nav.projects").to_string(),
             Self::Settings => t!("nav.settings").to_string(),
@@ -58,6 +61,7 @@ impl DashboardPage {
         match self {
             Self::Overview => IconName::LayoutDashboard,
             Self::Sessions => IconName::Inbox,
+            Self::Limits => IconName::ChartPie,
             Self::Providers => IconName::Bot,
             Self::Projects => IconName::Folder,
             Self::Settings => IconName::Settings,
@@ -109,6 +113,10 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
         DashboardPage::Sessions => div()
             .size_full()
             .child(sessions_page(view, cx))
+            .into_any_element(),
+        DashboardPage::Limits => div()
+            .size_full()
+            .child(limits_page(view, cx))
             .into_any_element(),
         DashboardPage::Providers => div()
             .flex()

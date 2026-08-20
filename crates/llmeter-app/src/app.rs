@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Datelike, Days, Duration as ChronoDuration, Local, NaiveDate, Utc};
 use gpui::{AppContext, ClipboardItem, Context, Entity, Render, Subscription, Window, point, px};
@@ -9,7 +9,8 @@ use gpui_component::{
     input::{InputEvent, InputState},
     theme::{Theme as UiTheme, ThemeMode},
 };
-use llmeter_collector::{Collector, CollectorEvent};
+use llmeter_collector::{Collector, CollectorEvent, LimitCollector};
+use llmeter_core::LimitsSnapshot;
 use llmeter_storage::{SessionSummary, UsageRepository};
 use rust_i18n::t;
 
@@ -124,6 +125,12 @@ impl ThemePreference {
 
 pub struct LLMeterView {
     collector: Collector,
+    limit_collector: LimitCollector,
+    limit_sender: std::sync::mpsc::Sender<LimitsSnapshot>,
+    limit_receiver: std::sync::mpsc::Receiver<LimitsSnapshot>,
+    limit_refresh_started_at: Option<Instant>,
+    pub(crate) limits: LimitsSnapshot,
+    pub(crate) limits_refreshing: bool,
     pub(crate) snapshot: UiSnapshot,
     pub(crate) active_page: DashboardPage,
     pub(crate) session_provider: SessionProviderFilter,
@@ -150,6 +157,9 @@ pub struct LLMeterView {
 impl LLMeterView {
     pub fn new(collector: Collector, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let repository = UsageRepository::new(collector.engine().database().clone());
+        let limit_collector = LimitCollector::new(collector.engine().database().clone());
+        let limits = limit_collector.cached_snapshot();
+        let (limit_sender, limit_receiver) = std::sync::mpsc::channel();
         let theme_pref = ThemePreference::from_setting(
             repository.database().get_setting("theme").ok().flatten(),
         );
@@ -213,6 +223,12 @@ impl LLMeterView {
         });
         let mut view = Self {
             collector,
+            limit_collector,
+            limit_sender,
+            limit_receiver,
+            limit_refresh_started_at: None,
+            limits,
+            limits_refreshing: false,
             snapshot,
             active_page: DashboardPage::Overview,
             session_provider: SessionProviderFilter::All,
@@ -236,6 +252,9 @@ impl LLMeterView {
             refresh_task: None,
         };
         view.apply_theme(window, cx);
+        if !cfg!(test) {
+            view.start_limit_refresh();
+        }
         let task = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -438,6 +457,11 @@ impl LLMeterView {
         cx.notify();
     }
 
+    pub(crate) fn refresh_limits(&mut self, cx: &mut Context<Self>) {
+        self.start_limit_refresh();
+        cx.notify();
+    }
+
     pub(crate) fn visible_session_indices(&self, cx: &gpui::App) -> Vec<usize> {
         let query = self.session_search.read(cx).value();
         let query = query.to_string();
@@ -484,7 +508,40 @@ impl LLMeterView {
             }
             changed = true;
         }
+        while let Ok(snapshot) = self.limit_receiver.try_recv() {
+            self.limits = snapshot;
+            self.limits_refreshing = false;
+            changed = true;
+        }
+        if !cfg!(test)
+            && !self.limits_refreshing
+            && self
+                .limit_refresh_started_at
+                .is_none_or(|started| started.elapsed() >= Duration::from_secs(5 * 60))
+        {
+            self.start_limit_refresh();
+            changed = true;
+        }
         changed
+    }
+
+    fn start_limit_refresh(&mut self) {
+        if self.limits_refreshing {
+            return;
+        }
+        self.limits_refreshing = true;
+        self.limit_refresh_started_at = Some(Instant::now());
+        let collector = self.limit_collector.clone();
+        let sender = self.limit_sender.clone();
+        if std::thread::Builder::new()
+            .name("llmeter-limit-refresh".into())
+            .spawn(move || {
+                let _ = sender.send(collector.refresh());
+            })
+            .is_err()
+        {
+            self.limits_refreshing = false;
+        }
     }
 
     fn reload_snapshot(&mut self, sync: Option<(chrono::DateTime<Utc>, Vec<String>)>) {
@@ -538,7 +595,7 @@ mod tests {
     use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, point, px};
     use gpui_component::ActiveTheme;
     use llmeter_collector::Collector;
-    use llmeter_core::Provider;
+    use llmeter_core::{LimitSource, LimitWindow, Provider, ProviderLimits};
     use llmeter_storage::{Database, ModelUsage, ProviderUsage, SessionSummary};
 
     fn scroll(
@@ -846,6 +903,47 @@ mod tests {
         view.update(cx, |view, cx| {
             view.set_settings_section(crate::views::settings::SettingsSection::Data, cx);
         });
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+    }
+
+    #[gpui::test]
+    fn limits_page_renders_live_cached_and_disconnected_states(cx: &mut TestAppContext) {
+        let (view, cx) = setup_sessions_page(cx);
+        view.update(cx, |view, cx| {
+            let now = Utc::now();
+            view.limits.providers = vec![
+                ProviderLimits {
+                    provider: Provider::Claude,
+                    configured: true,
+                    plan: Some("Max".into()),
+                    windows: vec![LimitWindow {
+                        reset_at: Some(now + Duration::hours(2)),
+                        ..LimitWindow::new("five_hour", 78.0)
+                    }],
+                    captured_at: now,
+                    source: LimitSource::ProviderApi,
+                    stale: false,
+                    error: None,
+                    last_error: None,
+                },
+                ProviderLimits {
+                    provider: Provider::Codex,
+                    configured: true,
+                    plan: Some("Plus".into()),
+                    windows: vec![LimitWindow::new("seven_day", 25.0)],
+                    captured_at: now - Duration::minutes(5),
+                    source: LimitSource::DiskCache,
+                    stale: true,
+                    error: None,
+                    last_error: Some("offline".into()),
+                },
+                ProviderLimits::not_configured(Provider::Grok, now),
+            ];
+            view.navigate(DashboardPage::Limits, cx);
+        });
+
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
         });

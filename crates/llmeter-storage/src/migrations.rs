@@ -57,6 +57,12 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS limit_snapshots (
+            provider TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            captured_at INTEGER NOT NULL
+        );
         "#,
     )?;
 
@@ -72,7 +78,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
             [],
         )?;
     }
-    connection.pragma_update(None, "user_version", 3)?;
+    connection.pragma_update(None, "user_version", 4)?;
     Ok(())
 }
 
@@ -134,7 +140,7 @@ mod tests {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
     }
 }
