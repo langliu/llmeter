@@ -3,17 +3,17 @@ use llmeter_core::Provider;
 
 pub(crate) fn provider_logo(provider: Provider, size: f32) -> AnyElement {
     let path = match provider {
-        Provider::Codex => "providers/openai.svg",
+        Provider::Codex => "providers/codex.svg",
         Provider::Claude => "providers/claude.svg",
         Provider::OpenCode => "providers/opencode.svg",
         Provider::Pi => "providers/pi.svg",
         Provider::Zed => "providers/zed.svg",
-        Provider::Grok => "providers/grok.png",
+        Provider::Grok => "providers/grok.svg",
     };
 
     if matches!(
         provider,
-        Provider::Claude | Provider::OpenCode | Provider::Pi | Provider::Zed
+        Provider::Claude | Provider::OpenCode | Provider::Pi | Provider::Zed | Provider::Grok
     ) {
         return div()
             .size(px(size))

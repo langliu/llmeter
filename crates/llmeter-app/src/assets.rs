@@ -3,12 +3,12 @@ use std::borrow::Cow;
 use gpui::{AssetSource, Result, SharedString};
 
 const PROVIDER_ASSETS: [&str; 6] = [
-    "providers/openai.svg",
+    "providers/codex.svg",
     "providers/claude.svg",
     "providers/opencode.svg",
     "providers/pi.svg",
     "providers/zed.svg",
-    "providers/grok.png",
+    "providers/grok.svg",
 ];
 
 pub(crate) struct Assets;
@@ -16,8 +16,8 @@ pub(crate) struct Assets;
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         let asset = match path {
-            "providers/openai.svg" => {
-                Some(include_bytes!("../assets/providers/openai.svg").as_slice())
+            "providers/codex.svg" => {
+                Some(include_bytes!("../assets/providers/codex.svg").as_slice())
             }
             "providers/claude.svg" => {
                 Some(include_bytes!("../assets/providers/claude.svg").as_slice())
@@ -27,7 +27,7 @@ impl AssetSource for Assets {
             }
             "providers/pi.svg" => Some(include_bytes!("../assets/providers/pi.svg").as_slice()),
             "providers/zed.svg" => Some(include_bytes!("../assets/providers/zed.svg").as_slice()),
-            "providers/grok.png" => Some(include_bytes!("../assets/providers/grok.png").as_slice()),
+            "providers/grok.svg" => Some(include_bytes!("../assets/providers/grok.svg").as_slice()),
             _ => None,
         };
         match asset {
