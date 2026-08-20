@@ -121,6 +121,7 @@ impl ProviderAdapter for PiAdapter {
             project_name: project_name(project_path.as_deref()),
             project_path,
             source_event_id: source_event_id(&value),
+            reported_cost_usd: None,
         }))
     }
 }

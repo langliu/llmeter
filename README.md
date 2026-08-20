@@ -33,6 +33,10 @@ safety rescan.
   unknown SQLite schemas are explicitly marked unsupported
 - pi: ~/.pi/agent/sessions and ~/.omp/agent/sessions, with canonical-path
   de-duplication
+- Zed: the validated threads SQLite database on macOS and Linux; both JSON and
+  zstd-compressed thread payloads are supported
+- Grok: ~/.grok/sessions/**/updates.jsonl (or $GROK_HOME/sessions), including
+  cache-token breakdowns and the exact cost reported by Grok Build
 
 Codex last_token_usage snapshots are treated as direct deltas when present.
 Other cumulative snapshots go through a per-session cumulative tracker, so

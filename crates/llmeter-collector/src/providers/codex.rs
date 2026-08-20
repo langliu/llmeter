@@ -151,6 +151,7 @@ impl ProviderAdapter for CodexAdapter {
             project_name: project_name(project_path.as_deref()),
             project_path,
             source_event_id: source_event_id(payload).or_else(|| source_event_id(&value)),
+            reported_cost_usd: None,
         }))
     }
 }

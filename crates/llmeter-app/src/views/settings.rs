@@ -48,8 +48,8 @@ pub(crate) fn settings_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
     v_flex()
         .size_full()
         .px_8()
-        .pt_6()
-        .pb_6()
+        .pt_3()
+        .pb_3()
         .child(
             div()
                 .text_3xl()

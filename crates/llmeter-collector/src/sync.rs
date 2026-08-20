@@ -321,7 +321,9 @@ impl SyncEngine {
             output_tokens: counts.output_tokens,
             reasoning_tokens: counts.reasoning_tokens,
             total_tokens: counts.total_tokens,
-            estimated_cost_usd: estimate_cost_usd(source.provider, parsed.model.as_deref(), counts),
+            estimated_cost_usd: parsed
+                .reported_cost_usd
+                .or_else(|| estimate_cost_usd(source.provider, parsed.model.as_deref(), counts)),
             source_file: Some(source.path.clone()),
             source_event_id: parsed.source_event_id.clone(),
         }

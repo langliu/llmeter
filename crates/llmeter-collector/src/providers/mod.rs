@@ -14,13 +14,17 @@ use serde_json::Value;
 
 mod claude;
 mod codex;
+mod grok;
 mod opencode;
 mod pi;
+mod zed;
 
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
+pub use grok::GrokAdapter;
 pub use opencode::OpenCodeAdapter;
 pub use pi::PiAdapter;
+pub use zed::ZedAdapter;
 
 pub const PARSER_VERSION: u32 = 1;
 
@@ -34,6 +38,7 @@ pub struct ParsedUsage {
     pub project_path: Option<PathBuf>,
     pub project_name: Option<String>,
     pub source_event_id: Option<String>,
+    pub reported_cost_usd: Option<f64>,
 }
 
 pub trait ProviderAdapter: Send + Sync {
@@ -65,6 +70,8 @@ pub fn default_adapters() -> Vec<Box<dyn ProviderAdapter>> {
         Box::new(ClaudeAdapter::default()),
         Box::new(OpenCodeAdapter::default()),
         Box::new(PiAdapter::default()),
+        Box::new(ZedAdapter::default()),
+        Box::new(GrokAdapter::default()),
     ]
 }
 

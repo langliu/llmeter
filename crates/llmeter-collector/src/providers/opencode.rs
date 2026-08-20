@@ -172,6 +172,7 @@ impl ProviderAdapter for OpenCodeAdapter {
                 .or_else(|| source.project_name.clone()),
             project_path,
             source_event_id: source_event_id(&value),
+            reported_cost_usd: None,
         }))
     }
 
@@ -228,6 +229,7 @@ impl ProviderAdapter for OpenCodeAdapter {
                 project_name: project_name(Some(&project_path)),
                 project_path: Some(project_path),
                 source_event_id: Some(format!("{table}:{session_id}")),
+                reported_cost_usd: None,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

@@ -142,6 +142,9 @@ impl Collector {
 
 fn watch_roots() -> Vec<PathBuf> {
     let home = home_dir();
+    let grok_home = std::env::var_os("GROK_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".grok"));
     // Watch the signal directory instead of the signal file itself. Hooks may
     // create the signal file after the app has already started.
     let signal_directory = hooks::signal_path()
@@ -159,6 +162,15 @@ fn watch_roots() -> Vec<PathBuf> {
             .join("Application Support")
             .join("opencode"),
         home.join(".opencode"),
+        home.join("Library")
+            .join("Application Support")
+            .join("Zed")
+            .join("threads"),
+        home.join(".local")
+            .join("share")
+            .join("zed")
+            .join("threads"),
+        grok_home.join("sessions"),
         signal_directory,
     ]
     .into_iter()

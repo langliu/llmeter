@@ -113,7 +113,8 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
             .flex()
             .flex_col()
             .gap_4()
-            .p_4()
+            .px_4()
+            .py_1()
             .child(page_heading(
                 t!("providers.title").to_string(),
                 t!("providers.subtitle").to_string(),
@@ -140,7 +141,8 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
             .flex()
             .flex_col()
             .gap_4()
-            .p_4()
+            .px_4()
+            .py_1()
             .child(page_heading(
                 t!("projects.title").to_string(),
                 t!("projects.subtitle").to_string(),
@@ -157,7 +159,11 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
     let main = div().flex().flex_1().min_w(px(0.0)).p_3().child(
         div()
             .flex()
+            .flex_col()
             .size_full()
+            // GPUI's overflow mask is rectangular, so keep the scroll viewport
+            // inside the rounded corners instead of relying on rounded clipping.
+            .py_3()
             .rounded_3xl()
             .bg(p.background.opacity(0.96))
             .text_color(p.foreground)
@@ -165,7 +171,9 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
             .child(
                 div()
                     .id("main-scroll")
-                    .size_full()
+                    .w_full()
+                    .flex_1()
+                    .min_h(px(0.0))
                     .overflow_y_scroll()
                     .on_scroll_wheel(cx.listener(|view, _, _, cx| {
                         view.heatmap
@@ -393,7 +401,7 @@ fn overview_page(
         .flex()
         .items_start()
         .gap_3()
-        .p_3()
+        .px_3()
         .child(
             div()
                 .w(px(380.0))
@@ -914,6 +922,8 @@ fn provider_color(provider: Provider) -> Rgba {
         Provider::Claude => rgb(0xd97706),
         Provider::OpenCode => rgb(0x0891b2),
         Provider::Pi => rgb(0x7c3aed),
+        Provider::Zed => rgb(0x111827),
+        Provider::Grok => rgb(0x64748b),
     }
 }
 

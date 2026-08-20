@@ -1,4 +1,4 @@
-use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, img, px};
+use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, img, px, rgb};
 use llmeter_core::Provider;
 
 pub(crate) fn provider_logo(provider: Provider, size: f32) -> AnyElement {
@@ -7,7 +7,25 @@ pub(crate) fn provider_logo(provider: Provider, size: f32) -> AnyElement {
         Provider::Claude => "providers/claude.svg",
         Provider::OpenCode => "providers/opencode.svg",
         Provider::Pi => "providers/pi.svg",
+        Provider::Zed => "providers/zed.svg",
+        Provider::Grok => "providers/grok.png",
     };
+
+    if matches!(
+        provider,
+        Provider::Claude | Provider::OpenCode | Provider::Pi | Provider::Zed
+    ) {
+        return div()
+            .size(px(size))
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_shrink_0()
+            .rounded_md()
+            .bg(rgb(0xffffff))
+            .child(img(path).size(px(size * 0.72)))
+            .into_any_element();
+    }
 
     div()
         .size(px(size))

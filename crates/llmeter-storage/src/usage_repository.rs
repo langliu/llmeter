@@ -138,7 +138,7 @@ impl SessionSummary {
     pub fn resume_command(&self) -> Option<String> {
         self.provider
             .resume_ref(self.session_id.as_deref(), self.source_file.as_deref())
-            .map(|value| self.provider.resume_command(&value))
+            .and_then(|value| self.provider.resume_command(&value))
     }
 
     pub fn matches_query(&self, query: &str) -> bool {

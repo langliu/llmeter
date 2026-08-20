@@ -94,6 +94,7 @@ impl ProviderAdapter for ClaudeAdapter {
             project_name: project_name(project_path.as_deref())
                 .or_else(|| source.project_name.clone()),
             source_event_id: source_event_id(&value),
+            reported_cost_usd: None,
         }))
     }
 }

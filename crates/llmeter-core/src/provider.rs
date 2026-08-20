@@ -10,10 +10,19 @@ pub enum Provider {
     Claude,
     OpenCode,
     Pi,
+    Zed,
+    Grok,
 }
 
 impl Provider {
-    pub const ALL: [Self; 4] = [Self::Codex, Self::Claude, Self::OpenCode, Self::Pi];
+    pub const ALL: [Self; 6] = [
+        Self::Codex,
+        Self::Claude,
+        Self::OpenCode,
+        Self::Pi,
+        Self::Zed,
+        Self::Grok,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -21,6 +30,8 @@ impl Provider {
             Self::Claude => "claude",
             Self::OpenCode => "opencode",
             Self::Pi => "pi",
+            Self::Zed => "zed",
+            Self::Grok => "grok",
         }
     }
 
@@ -30,15 +41,19 @@ impl Provider {
             Self::Claude => "Claude Code",
             Self::OpenCode => "OpenCode",
             Self::Pi => "Pi",
+            Self::Zed => "Zed",
+            Self::Grok => "Grok",
         }
     }
 
-    pub fn resume_command(self, session_ref: &str) -> String {
+    pub fn resume_command(self, session_ref: &str) -> Option<String> {
         match self {
-            Self::Codex => format!("codex resume {session_ref}"),
-            Self::Claude => format!("claude --resume {session_ref}"),
-            Self::OpenCode => format!("opencode --session {session_ref}"),
-            Self::Pi => format!("pi --session {session_ref}"),
+            Self::Codex => Some(format!("codex resume {session_ref}")),
+            Self::Claude => Some(format!("claude --resume {session_ref}")),
+            Self::OpenCode => Some(format!("opencode --session {session_ref}")),
+            Self::Pi => Some(format!("pi --session {session_ref}")),
+            Self::Grok => Some(format!("grok --resume {session_ref}")),
+            Self::Zed => None,
         }
     }
 
@@ -105,6 +120,8 @@ impl FromStr for Provider {
             "claude" | "claude_code" | "claude-code" => Ok(Self::Claude),
             "opencode" | "open_code" | "open-code" => Ok(Self::OpenCode),
             "pi" | "pi-mono" => Ok(Self::Pi),
+            "zed" => Ok(Self::Zed),
+            "grok" | "grok-build" | "grok_build" => Ok(Self::Grok),
             other => Err(format!("unsupported provider: {other}")),
         }
     }
@@ -253,9 +270,12 @@ mod tests {
             Some("019fff63-c7f7-7bc7-be2d-788e8136ab63"),
         );
         assert_eq!(
-            Provider::OpenCode.resume_command("ses_01108a3edffeJgAoTLxwgsAYkm"),
-            "opencode --session ses_01108a3edffeJgAoTLxwgsAYkm"
+            Provider::OpenCode
+                .resume_command("ses_01108a3edffeJgAoTLxwgsAYkm")
+                .as_deref(),
+            Some("opencode --session ses_01108a3edffeJgAoTLxwgsAYkm")
         );
+        assert_eq!(Provider::Zed.resume_command("thread-id"), None);
     }
 
     #[test]

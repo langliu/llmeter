@@ -35,3 +35,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 ureq = { version = "2", features = ["json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+zstd = "0.13"

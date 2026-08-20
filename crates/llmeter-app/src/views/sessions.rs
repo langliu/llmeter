@@ -29,12 +29,14 @@ pub(crate) enum SessionProviderFilter {
 }
 
 impl SessionProviderFilter {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 7] = [
         Self::All,
         Self::Provider(Provider::Claude),
         Self::Provider(Provider::Codex),
         Self::Provider(Provider::Pi),
         Self::Provider(Provider::OpenCode),
+        Self::Provider(Provider::Zed),
+        Self::Provider(Provider::Grok),
     ];
 
     fn label(self) -> String {
@@ -125,8 +127,8 @@ pub(crate) fn sessions_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
     v_flex()
         .size_full()
         .px_8()
-        .pt_6()
-        .pb_8()
+        .pt_3()
+        .pb_5()
         .child(
             h_flex()
                 .w_full()
