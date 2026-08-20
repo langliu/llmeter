@@ -1,9 +1,11 @@
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Datelike, Days, Duration as ChronoDuration, Local, NaiveDate, Utc};
 use gpui::{AppContext, ClipboardItem, Context, Entity, Render, Subscription, Window, point, px};
 use gpui_component::{
     VirtualListScrollHandle,
+    calendar::Date,
+    date_picker::{DatePickerEvent, DatePickerState},
     input::{InputEvent, InputState},
     theme::{Theme as UiTheme, ThemeMode},
 };
@@ -13,11 +15,76 @@ use rust_i18n::t;
 
 use crate::{
     i18n::{self, LocalePreference},
-    state::UiSnapshot,
+    state::{OverviewRangeSnapshot, UiSnapshot, local_midnight},
     views::dashboard::{DashboardPage, HeatmapView, dashboard},
     views::sessions::{SessionProviderFilter, SessionRangeFilter},
     views::settings::SettingsSection,
 };
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum OverviewPeriod {
+    #[default]
+    Day,
+    Week,
+    Month,
+    AllTime,
+    Custom,
+}
+
+impl OverviewPeriod {
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Day,
+        Self::Week,
+        Self::Month,
+        Self::AllTime,
+        Self::Custom,
+    ];
+
+    pub(crate) fn label(self) -> String {
+        match self {
+            Self::Day => t!("overview.period_day").to_string(),
+            Self::Week => t!("overview.period_week").to_string(),
+            Self::Month => t!("overview.period_month").to_string(),
+            Self::AllTime => t!("overview.period_total").to_string(),
+            Self::Custom => t!("overview.period_custom").to_string(),
+        }
+    }
+
+    fn bounds(
+        self,
+        now: DateTime<Local>,
+        custom: (NaiveDate, NaiveDate),
+    ) -> (DateTime<Utc>, DateTime<Utc>) {
+        let today = now.date_naive();
+        let current_end = now.with_timezone(&Utc) + ChronoDuration::seconds(1);
+        match self {
+            Self::Day => (local_midnight(today), current_end),
+            Self::Week => {
+                let start =
+                    today - ChronoDuration::days(i64::from(today.weekday().num_days_from_monday()));
+                (local_midnight(start), current_end)
+            }
+            Self::Month => {
+                let start =
+                    NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap_or(today);
+                (local_midnight(start), current_end)
+            }
+            Self::AllTime => (
+                DateTime::<Utc>::from_timestamp(0, 0).unwrap_or(current_end),
+                current_end,
+            ),
+            Self::Custom => {
+                let (start, end) = if custom.0 <= custom.1 {
+                    custom
+                } else {
+                    (custom.1, custom.0)
+                };
+                let exclusive_end = end.checked_add_days(Days::new(1)).unwrap_or(end);
+                (local_midnight(start), local_midnight(exclusive_end))
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ThemePreference {
@@ -70,7 +137,11 @@ pub struct LLMeterView {
     pub(crate) locale_pref: LocalePreference,
     pub(crate) settings_section: SettingsSection,
     pub(crate) heatmap: Entity<HeatmapView>,
+    pub(crate) overview_period: OverviewPeriod,
+    pub(crate) overview_date_range: Entity<DatePickerState>,
+    overview_custom_range: (NaiveDate, NaiveDate),
     _search_subscription: Subscription,
+    _overview_date_subscription: Subscription,
     _appearance_subscription: Subscription,
     refresh_task: Option<gpui::Task<()>>,
 }
@@ -86,14 +157,18 @@ impl LLMeterView {
         );
         i18n::apply(locale_pref);
         let detections = collector.detect_all();
-        let snapshot = UiSnapshot::load(&repository)
+        let today = Local::now().date_naive();
+        let overview_period = OverviewPeriod::default();
+        let overview_custom_range = (today, today);
+        let (overview_start, overview_end) =
+            overview_period.bounds(Local::now(), overview_custom_range);
+        let snapshot = UiSnapshot::load(&repository, overview_start, overview_end)
             .map(|snapshot| snapshot.with_detections(detections.clone()))
             .unwrap_or_else(|error| UiSnapshot {
                 today: Default::default(),
                 seven_days: Default::default(),
                 thirty_days: Default::default(),
-                all_time: Default::default(),
-                daily: Vec::new(),
+                overview_range: Default::default(),
                 heatmap_daily: Vec::new(),
                 heatmap_models: Vec::new(),
                 providers: Vec::new(),
@@ -105,6 +180,18 @@ impl LLMeterView {
                 database_path: repository.database().path().to_path_buf(),
                 last_sync: None,
                 warnings: vec![format!("database query failed: {error}")],
+            });
+        let overview_date_range = cx.new(|cx| {
+            let mut picker = DatePickerState::range(window, cx).date_format("%Y-%m-%d");
+            picker.set_date(overview_custom_range, window, cx);
+            picker
+        });
+        let _overview_date_subscription =
+            cx.subscribe(&overview_date_range, |this, _, event, cx| {
+                let DatePickerEvent::Change(Date::Range(Some(start), Some(end))) = event else {
+                    return;
+                };
+                this.set_overview_custom_range(*start, *end, cx);
             });
         let session_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(t!("sessions.search_placeholder").to_string())
@@ -138,7 +225,11 @@ impl LLMeterView {
             locale_pref,
             settings_section: SettingsSection::default(),
             heatmap: cx.new(|_| HeatmapView::default()),
+            overview_period,
+            overview_date_range,
+            overview_custom_range,
             _search_subscription,
+            _overview_date_subscription,
             _appearance_subscription,
             refresh_task: None,
         };
@@ -217,6 +308,53 @@ impl LLMeterView {
             self.active_page = page;
             self.session_project_open = false;
             cx.notify();
+        }
+    }
+
+    pub(crate) fn set_overview_period(&mut self, period: OverviewPeriod, cx: &mut Context<Self>) {
+        if self.overview_period == period {
+            return;
+        }
+        self.load_overview_period(period, self.overview_custom_range, cx);
+    }
+
+    fn set_overview_custom_range(
+        &mut self,
+        start: NaiveDate,
+        end: NaiveDate,
+        cx: &mut Context<Self>,
+    ) {
+        let range = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        self.overview_custom_range = range;
+        if self.overview_period == OverviewPeriod::Custom {
+            self.load_overview_period(OverviewPeriod::Custom, range, cx);
+        }
+    }
+
+    fn load_overview_period(
+        &mut self,
+        period: OverviewPeriod,
+        custom: (NaiveDate, NaiveDate),
+        cx: &mut Context<Self>,
+    ) {
+        let repository = UsageRepository::new(self.collector.engine().database().clone());
+        let (start, end) = period.bounds(Local::now(), custom);
+        match OverviewRangeSnapshot::load(&repository, start, end) {
+            Ok(snapshot) => {
+                self.overview_period = period;
+                self.snapshot.overview_range = snapshot;
+                cx.notify();
+            }
+            Err(error) => {
+                self.snapshot
+                    .warnings
+                    .push(format!("overview query failed: {error}"));
+                cx.notify();
+            }
         }
     }
 
@@ -330,7 +468,10 @@ impl LLMeterView {
 
     fn reload_snapshot(&mut self, sync: Option<(chrono::DateTime<Utc>, Vec<String>)>) {
         let repository = UsageRepository::new(self.collector.engine().database().clone());
-        if let Ok(snapshot) = UiSnapshot::load(&repository) {
+        let (overview_start, overview_end) = self
+            .overview_period
+            .bounds(Local::now(), self.overview_custom_range);
+        if let Ok(snapshot) = UiSnapshot::load(&repository, overview_start, overview_end) {
             let mut snapshot = snapshot.with_detections(self.snapshot.detections.clone());
             if let Some((timestamp, warnings)) = sync {
                 snapshot = snapshot.with_sync(timestamp, warnings);
@@ -360,10 +501,10 @@ impl Render for LLMeterView {
 
 #[cfg(test)]
 mod tests {
-    use super::{LLMeterView, LocalePreference};
+    use super::{LLMeterView, LocalePreference, OverviewPeriod};
     use crate::views::dashboard::DashboardPage;
     use crate::views::sessions::SessionProviderFilter;
-    use chrono::{Duration, Utc};
+    use chrono::{Duration, Local, NaiveDate, TimeZone, Utc};
     use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, point, px};
     use gpui_component::ActiveTheme;
     use llmeter_collector::Collector;
@@ -566,6 +707,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn overview_period_defaults_to_day() {
+        assert_eq!(OverviewPeriod::default(), OverviewPeriod::Day);
+    }
+
+    #[test]
+    fn overview_period_bounds_follow_local_calendar_periods() {
+        let now = Local
+            .with_ymd_and_hms(2026, 8, 20, 12, 30, 0)
+            .single()
+            .expect("valid local date");
+        let custom = (
+            NaiveDate::from_ymd_opt(2026, 7, 2).expect("valid start"),
+            NaiveDate::from_ymd_opt(2026, 7, 5).expect("valid end"),
+        );
+
+        let (day_start, _) = OverviewPeriod::Day.bounds(now, custom);
+        let (week_start, _) = OverviewPeriod::Week.bounds(now, custom);
+        let (month_start, _) = OverviewPeriod::Month.bounds(now, custom);
+        let (custom_start, custom_end) = OverviewPeriod::Custom.bounds(now, custom);
+
+        assert_eq!(
+            day_start.with_timezone(&Local).date_naive(),
+            now.date_naive()
+        );
+        assert_eq!(
+            week_start.with_timezone(&Local).date_naive(),
+            NaiveDate::from_ymd_opt(2026, 8, 17).expect("valid week start")
+        );
+        assert_eq!(
+            month_start.with_timezone(&Local).date_naive(),
+            NaiveDate::from_ymd_opt(2026, 8, 1).expect("valid month start")
+        );
+        assert_eq!(custom_start.with_timezone(&Local).date_naive(), custom.0);
+        assert_eq!(
+            custom_end.with_timezone(&Local).date_naive(),
+            NaiveDate::from_ymd_opt(2026, 7, 6).expect("exclusive day after custom end")
+        );
+    }
+
+    #[gpui::test]
+    fn overview_period_can_switch_from_default_day(cx: &mut TestAppContext) {
+        let (view, cx) = setup_sessions_page(cx);
+        view.update(cx, |view, cx| {
+            assert_eq!(view.overview_period, OverviewPeriod::Day);
+            view.set_overview_period(OverviewPeriod::Week, cx);
+            assert_eq!(view.overview_period, OverviewPeriod::Week);
+        });
+    }
+
+    #[gpui::test]
+    fn overview_custom_period_renders_date_range_picker(cx: &mut TestAppContext) {
+        let (view, cx) = setup_sessions_page(cx);
+        view.update(cx, |view, cx| {
+            view.active_page = DashboardPage::Overview;
+            view.set_overview_period(OverviewPeriod::Custom, cx);
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+    }
+
     #[gpui::test]
     fn settings_page_renders_both_sections(cx: &mut TestAppContext) {
         let (view, cx) = setup_sessions_page(cx);
@@ -591,7 +794,7 @@ mod tests {
     fn overview_renders_trend_with_data(cx: &mut TestAppContext) {
         let (view, cx) = setup_sessions_page(cx);
         view.update(cx, |view, _| {
-            view.snapshot.daily = (0..30)
+            view.snapshot.overview_range.daily = (0..30)
                 .map(|index| llmeter_storage::DailyUsage {
                     day: format!("2026-01-{:02}", index + 1),
                     total_tokens: (index as u64 + 1) * 1_000,

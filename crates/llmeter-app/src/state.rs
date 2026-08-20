@@ -12,8 +12,7 @@ pub struct UiSnapshot {
     pub today: Overview,
     pub seven_days: Overview,
     pub thirty_days: Overview,
-    pub all_time: Overview,
-    pub daily: Vec<DailyUsage>,
+    pub overview_range: OverviewRangeSnapshot,
     pub heatmap_daily: Vec<DailyUsage>,
     pub heatmap_models: Vec<DailyModelUsage>,
     pub providers: Vec<ProviderUsage>,
@@ -27,8 +26,35 @@ pub struct UiSnapshot {
     pub warnings: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct OverviewRangeSnapshot {
+    pub overview: Overview,
+    pub daily: Vec<DailyUsage>,
+    pub providers: Vec<ProviderUsage>,
+    pub models: Vec<ModelUsage>,
+}
+
+impl OverviewRangeSnapshot {
+    pub fn load(
+        repository: &UsageRepository,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Self, llmeter_storage::StorageError> {
+        Ok(Self {
+            overview: repository.get_overview(start, end)?,
+            daily: repository.get_daily_usage(start, end)?,
+            providers: repository.get_provider_usage(start, end)?,
+            models: repository.get_model_usage(start, end)?,
+        })
+    }
+}
+
 impl UiSnapshot {
-    pub fn load(repository: &UsageRepository) -> Result<Self, llmeter_storage::StorageError> {
+    pub fn load(
+        repository: &UsageRepository,
+        overview_start: DateTime<Utc>,
+        overview_end: DateTime<Utc>,
+    ) -> Result<Self, llmeter_storage::StorageError> {
         let now = Utc::now();
         let today_start = local_midnight(Local::now().date_naive());
         let seven_start = now - Duration::days(7);
@@ -37,11 +63,7 @@ impl UiSnapshot {
             today: repository.get_today_usage(today_start, now + Duration::seconds(1))?,
             seven_days: repository.get_overview(seven_start, now + Duration::seconds(1))?,
             thirty_days: repository.get_overview(thirty_start, now + Duration::seconds(1))?,
-            all_time: repository.get_overview(
-                DateTime::<Utc>::from_timestamp(0, 0).unwrap_or(now),
-                now + Duration::seconds(1),
-            )?,
-            daily: repository.get_daily_usage(thirty_start, now + Duration::seconds(1))?,
+            overview_range: OverviewRangeSnapshot::load(repository, overview_start, overview_end)?,
             // Keep enough history for the overview calendar while the trend remains a
             // compact 30-day view.
             heatmap_daily: repository
@@ -72,7 +94,7 @@ impl UiSnapshot {
     }
 }
 
-fn local_midnight(date: NaiveDate) -> DateTime<Utc> {
+pub(crate) fn local_midnight(date: NaiveDate) -> DateTime<Utc> {
     Local
         .from_local_datetime(&date.and_hms_opt(0, 0, 0).unwrap_or_default())
         .single()

@@ -8,15 +8,16 @@ use gpui::{
     fill, point, prelude::*, px, relative, rgb, size,
 };
 use gpui_component::{
-    ActiveTheme, IconName, Selectable, TITLE_BAR_HEIGHT,
-    button::{Button, ButtonCustomVariant, ButtonVariants},
+    ActiveTheme, IconName, Selectable, Sizable, TITLE_BAR_HEIGHT,
+    button::{Button, ButtonCustomVariant, ButtonGroup, ButtonVariants},
+    date_picker::DatePicker,
 };
 use llmeter_core::{Provider, ProviderDetection, ProviderStatus};
 use llmeter_storage::{DailyModelUsage, ModelUsage, ProjectUsage, ProviderUsage, RecentActivity};
 use rust_i18n::t;
 
 use crate::{
-    app::LLMeterView,
+    app::{LLMeterView, OverviewPeriod},
     state::UiSnapshot,
     views::{
         palette::Palette, provider_brand::provider_logo, sessions::sessions_page,
@@ -198,14 +199,16 @@ fn overview_page(
     p: Palette,
     cx: &mut Context<LLMeterView>,
 ) -> gpui::AnyElement {
+    let range = &snapshot.overview_range;
     let model_total = snapshot
+        .overview_range
         .models
         .iter()
         .map(|model| model.total_tokens)
         .sum::<u64>()
         .max(1);
     let mut ranking = div().flex().flex_col();
-    for (index, model) in snapshot.models.iter().take(3).enumerate() {
+    for (index, model) in range.models.iter().take(3).enumerate() {
         let percent = model.total_tokens as f64 / model_total as f64 * 100.0;
         ranking = ranking.child(
             div()
@@ -249,7 +252,7 @@ fn overview_page(
                 ),
         );
     }
-    if snapshot.models.is_empty() {
+    if range.models.is_empty() {
         ranking = ranking.child(empty_state(t!("overview.models_pending").to_string(), p));
     }
 
@@ -314,13 +317,14 @@ fn overview_page(
         );
 
     let provider_total = snapshot
+        .overview_range
         .providers
         .iter()
         .map(|provider| provider.total_tokens)
         .sum::<u64>()
         .max(1);
     let mut model_counts = HashMap::<Provider, usize>::new();
-    for model in &snapshot.models {
+    for model in &range.models {
         *model_counts.entry(model.provider).or_default() += 1;
     }
     let mut share_bar = div()
@@ -330,7 +334,7 @@ fn overview_page(
         .overflow_hidden()
         .rounded_full()
         .bg(p.muted);
-    for provider in &snapshot.providers {
+    for provider in &range.providers {
         let ratio = provider.total_tokens as f32 / provider_total as f32;
         if ratio <= 0.0 {
             continue;
@@ -346,12 +350,12 @@ fn overview_page(
     provider_cards = provider_cards.child(share_card(
         t!("overview.share_all").to_string(),
         100.0,
-        snapshot.models.len(),
+        range.models.len(),
         None,
         rgb(0x16a34a),
         p,
     ));
-    for provider in &snapshot.providers {
+    for provider in &range.providers {
         let percent = provider.total_tokens as f64 / provider_total as f64 * 100.0;
         provider_cards = provider_cards.child(share_card(
             provider.provider.to_string(),
@@ -364,6 +368,7 @@ fn overview_page(
     }
 
     let hero = glass_card(p)
+        .child(overview_period_filter(view, cx))
         .flex_1()
         .child(
             div()
@@ -383,7 +388,7 @@ fn overview_page(
                         .pt_3()
                         .text_3xl()
                         .font_weight(FontWeight::BOLD)
-                        .child(format_full_number(snapshot.all_time.total_tokens)),
+                        .child(format_full_number(range.overview.total_tokens)),
                 )
                 .child(
                     div()
@@ -391,7 +396,7 @@ fn overview_page(
                         .text_base()
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(p.success)
-                        .child(format_cost(snapshot.all_time.estimated_cost_usd)),
+                        .child(format_cost(range.overview.estimated_cost_usd)),
                 ),
         )
         .child(div().pt_6().child(share_bar))
@@ -418,8 +423,12 @@ fn overview_page(
                     cx,
                 ))
                 .child(panel(
-                    t!("overview.token_trend").to_string(),
-                    trend(&snapshot.daily, p),
+                    t!(
+                        "overview.token_trend_period",
+                        period = view.overview_period.label()
+                    )
+                    .to_string(),
+                    trend(&range.daily, p),
                     p,
                 )),
         )
@@ -438,6 +447,46 @@ fn overview_page(
                 )),
         )
         .into_any_element()
+}
+
+fn overview_period_filter(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl IntoElement {
+    let mut group = ButtonGroup::new("overview-period-filter")
+        .compact()
+        .outline();
+    for (index, period) in OverviewPeriod::ALL.into_iter().enumerate() {
+        group = group.child(
+            Button::new(("overview-period", index))
+                .label(period.label())
+                .selected(view.overview_period == period),
+        );
+    }
+
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .pb_3()
+        .child(
+            group.on_click(cx.listener(|view, clicks: &Vec<usize>, _, cx| {
+                if let Some(&index) = clicks.first()
+                    && let Some(period) = OverviewPeriod::ALL.get(index).copied()
+                {
+                    view.set_overview_period(period, cx);
+                }
+            })),
+        )
+        .when(view.overview_period == OverviewPeriod::Custom, |this| {
+            this.child(
+                div().w(px(224.0)).child(
+                    DatePicker::new(&view.overview_date_range)
+                        .small()
+                        .number_of_months(1)
+                        .placeholder(t!("overview.custom_range_placeholder").to_string()),
+                ),
+            )
+        })
 }
 
 fn glass_card(p: Palette) -> gpui::Div {
