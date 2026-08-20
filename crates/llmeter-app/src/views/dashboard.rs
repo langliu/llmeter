@@ -685,11 +685,18 @@ fn all_model_detail(
 }
 
 fn all_models_icon(size: f32, color: Hsla) -> gpui::AnyElement {
-    svg()
-        .path("icons/layers.svg")
+    div()
         .size(px(size))
+        .flex()
+        .items_center()
+        .justify_center()
         .flex_shrink_0()
-        .text_color(color)
+        .child(
+            svg()
+                .path("icons/layers.svg")
+                .size(px(size * 0.72))
+                .text_color(color),
+        )
         .into_any_element()
 }
 
