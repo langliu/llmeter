@@ -200,6 +200,7 @@ mod tests {
     use std::sync::Mutex;
 
     use llmeter_core::{Provider, UsageEvent, current_catalog, install_catalog};
+    use llmeter_storage::UsageRepository;
     use serde_json::json;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -227,6 +228,7 @@ mod tests {
             output_tokens: output,
             reasoning_tokens: 0,
             total_tokens: input + output,
+            reported_cost_usd: None,
             estimated_cost_usd: None,
             source_file: None,
             source_event_id: Some(id.into()),
@@ -280,6 +282,40 @@ mod tests {
 
         let stored = database.list_usage_for_pricing().unwrap();
         assert_eq!(stored[0].estimated_cost_usd, Some(17.5));
+        install_catalog(PricingCatalog::fallback());
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn refresh_preserves_provider_reported_cost() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        install_catalog(PricingCatalog::fallback());
+        let cache_dir = temp_cache_dir("reported-cost");
+        let database = Database::open_in_memory().unwrap();
+        let mut usage = event("reported", "gpt-5.4", 1_000_000, 1_000_000);
+        usage.reported_cost_usd = Some(3.25);
+        database.insert_usage_events(&[usage]).unwrap();
+
+        refresh_pricing_with(&cache_dir, Some(&database), || {
+            Ok(json!({
+                "gpt-5.4": {
+                    "input_cost_per_token": 2.5e-6,
+                    "output_cost_per_token": 1.5e-5
+                }
+            }))
+        })
+        .unwrap();
+
+        let stored = database.list_usage_for_pricing().unwrap();
+        assert_eq!(stored[0].estimated_cost_usd, Some(17.5));
+        let overview = UsageRepository::new(database)
+            .get_overview(
+                chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap(),
+                chrono::Utc::now() + chrono::Duration::seconds(1),
+            )
+            .unwrap();
+        assert_eq!(overview.estimated_cost_usd, Some(3.25));
+
         install_catalog(PricingCatalog::fallback());
         let _ = fs::remove_dir_all(cache_dir);
     }

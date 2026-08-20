@@ -218,7 +218,7 @@ impl UsageRepository {
                 "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(cached_input_tokens), 0),
                         COALESCE(SUM(cache_creation_input_tokens), 0), COALESCE(SUM(output_tokens), 0),
                         COALESCE(SUM(reasoning_tokens), 0), COALESCE(SUM(total_tokens), 0),
-                        SUM(estimated_cost_usd)
+                        SUM(COALESCE(reported_cost_usd, estimated_cost_usd))
                  FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2",
                 params![start.timestamp(), end.timestamp()],
                 |row| {
@@ -253,7 +253,8 @@ impl UsageRepository {
         let connection = self.database.lock()?;
         let mut statement = connection.prepare(
             "SELECT strftime('%Y-%m-%d', timestamp, 'unixepoch', 'localtime') AS day,
-                    COALESCE(SUM(total_tokens), 0), SUM(estimated_cost_usd)
+                    COALESCE(SUM(total_tokens), 0),
+                    SUM(COALESCE(reported_cost_usd, estimated_cost_usd))
              FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
              GROUP BY day ORDER BY day",
         )?;
@@ -300,7 +301,7 @@ impl UsageRepository {
         let mut statement = connection.prepare(
             "SELECT provider, COALESCE(SUM(total_tokens), 0), COALESCE(SUM(input_tokens), 0),
                     COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_input_tokens), 0),
-                    SUM(estimated_cost_usd), MAX(timestamp)
+                    SUM(COALESCE(reported_cost_usd, estimated_cost_usd)), MAX(timestamp)
              FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
              GROUP BY provider ORDER BY 2 DESC",
         )?;
@@ -336,7 +337,8 @@ impl UsageRepository {
     ) -> Result<Vec<ModelUsage>, StorageError> {
         let connection = self.database.lock()?;
         let mut statement = connection.prepare(
-            "SELECT provider, COALESCE(model, 'Unknown'), COALESCE(SUM(total_tokens), 0), SUM(estimated_cost_usd)
+            "SELECT provider, COALESCE(model, 'Unknown'), COALESCE(SUM(total_tokens), 0),
+                    SUM(COALESCE(reported_cost_usd, estimated_cost_usd))
              FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
              GROUP BY provider, model ORDER BY 3 DESC",
         )?;
@@ -368,7 +370,8 @@ impl UsageRepository {
         let connection = self.database.lock()?;
         let mut statement = connection.prepare(
             "SELECT COALESCE(project_name, 'Unknown project'), MAX(project_path),
-                    COALESCE(SUM(total_tokens), 0), SUM(estimated_cost_usd), MAX(timestamp)
+                    COALESCE(SUM(total_tokens), 0),
+                    SUM(COALESCE(reported_cost_usd, estimated_cost_usd)), MAX(timestamp)
              FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
              GROUP BY 1 ORDER BY 3 DESC",
         )?;
@@ -430,7 +433,7 @@ impl UsageRepository {
                     MAX(timestamp),
                     COUNT(*),
                     COALESCE(SUM(total_tokens), 0),
-                    SUM(estimated_cost_usd)
+                    SUM(COALESCE(reported_cost_usd, estimated_cost_usd))
              FROM usage_events
              GROUP BY provider,
                       COALESCE(session_id, source_file, id),

@@ -9,7 +9,7 @@ use super::{
     ParsedUsage, ProviderAdapter, data_status, home_dir, json_value, nested, project_name,
 };
 
-const GROK_PARSER_VERSION: u32 = 1;
+const GROK_PARSER_VERSION: u32 = 2;
 const USD_TICKS_PER_DOLLAR: f64 = 10_000_000_000.0;
 
 #[derive(Clone, Debug)]
@@ -238,7 +238,14 @@ fn grok_timestamp(value: &Value) -> DateTime<Utc> {
 mod tests {
     use std::{fs, path::PathBuf};
 
+    use chrono::Utc;
+    use llmeter_core::{FileCursor, UsageEvent};
+    use llmeter_storage::{Database, UsageRepository};
+
     use super::*;
+    use crate::sync::SyncEngine;
+
+    const GROK_USAGE_LINE: &[u8] = br#"{"timestamp":1786949023,"params":{"_meta":{"agentTimestampMs":1786949023318},"update":{"sessionUpdate":"plan","prompt_id":"prompt-1","usage":{"inputTokens":64257,"outputTokens":2144,"totalTokens":66401,"cachedReadTokens":51072,"reasoningTokens":249,"costUsdTicks":126890500,"modelUsage":{"grok-4.6-build":{"inputTokens":64257,"outputTokens":2144,"totalTokens":66401,"cachedReadTokens":51072,"reasoningTokens":249,"modelCalls":3}}}}}}"#;
 
     #[test]
     fn parses_acp_prompt_usage_without_double_counting_cache() {
@@ -251,9 +258,10 @@ mod tests {
             project_path: Some(PathBuf::from("/tmp/project")),
             project_name: Some("project".into()),
         };
-        let line = br#"{"timestamp":1786949023,"params":{"_meta":{"agentTimestampMs":1786949023318},"update":{"sessionUpdate":"plan","prompt_id":"prompt-1","usage":{"inputTokens":64257,"outputTokens":2144,"totalTokens":66401,"cachedReadTokens":51072,"reasoningTokens":249,"costUsdTicks":126890500,"modelUsage":{"grok-4.6-build":{"inputTokens":64257,"outputTokens":2144,"totalTokens":66401,"cachedReadTokens":51072,"reasoningTokens":249,"modelCalls":3}}}}}}"#;
-
-        let parsed = adapter.parse_line(&source, line).unwrap().unwrap();
+        let parsed = adapter
+            .parse_line(&source, GROK_USAGE_LINE)
+            .unwrap()
+            .unwrap();
         assert_eq!(parsed.counts.input_tokens, 13_185);
         assert_eq!(parsed.counts.cached_input_tokens, 51_072);
         assert_eq!(parsed.counts.output_tokens, 2_144);
@@ -288,6 +296,73 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].session_id.as_deref(), Some("session-id"));
         assert_eq!(sources[0].project_name.as_deref(), Some("project"));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn parser_upgrade_rebuilds_reported_costs() {
+        let home = std::env::temp_dir().join(format!(
+            "llmeter-grok-parser-upgrade-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        let session = home
+            .join(".grok")
+            .join("sessions")
+            .join("%2Ftmp%2Fproject")
+            .join("session-id");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            session.join("summary.json"),
+            r#"{"info":{"id":"session-id","cwd":"/tmp/project"}}"#,
+        )
+        .unwrap();
+        let source_path = session.join("updates.jsonl");
+        let mut line = GROK_USAGE_LINE.to_vec();
+        line.push(b'\n');
+        fs::write(&source_path, line).unwrap();
+
+        let database = Database::open_in_memory().unwrap();
+        database
+            .insert_usage_events(&[UsageEvent {
+                id: "old-grok-event".into(),
+                provider: Provider::Grok,
+                model: Some("grok-4.6-build".into()),
+                session_id: Some("session-id".into()),
+                project_path: Some(PathBuf::from("/tmp/project")),
+                project_name: Some("project".into()),
+                timestamp: Utc::now(),
+                input_tokens: 999,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                output_tokens: 0,
+                reasoning_tokens: 0,
+                total_tokens: 999,
+                reported_cost_usd: None,
+                estimated_cost_usd: None,
+                source_file: Some(source_path.clone()),
+                source_event_id: Some("old-prompt".into()),
+            }])
+            .unwrap();
+        database
+            .upsert_cursor(&FileCursor::new(source_path, Provider::Grok, 1))
+            .unwrap();
+
+        let engine = SyncEngine::with_adapters(
+            database.clone(),
+            vec![Box::new(GrokAdapter::with_home(home.clone()))],
+        );
+        let result = engine.sync_all().unwrap();
+        assert_eq!(result.events_inserted, 1);
+
+        let overview = UsageRepository::new(database)
+            .get_overview(
+                chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+                Utc::now() + chrono::Duration::days(365),
+            )
+            .unwrap();
+        assert_eq!(overview.total_tokens, 66_401);
+        assert_eq!(overview.estimated_cost_usd, Some(0.01268905));
         let _ = fs::remove_dir_all(home);
     }
 }

@@ -89,9 +89,9 @@ impl Database {
             "INSERT OR IGNORE INTO usage_events (
                 id, provider, model, session_id, project_path, project_name, timestamp,
                 input_tokens, cached_input_tokens, cache_creation_input_tokens, output_tokens,
-                reasoning_tokens, total_tokens, estimated_cost_usd, source_file, source_event_id,
-                created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                reasoning_tokens, total_tokens, reported_cost_usd, estimated_cost_usd,
+                source_file, source_event_id, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         )?;
         let mut summary = InsertSummary::default();
         for event in events {
@@ -112,6 +112,7 @@ impl Database {
                 to_sqlite_i64(event.output_tokens)?,
                 to_sqlite_i64(event.reasoning_tokens)?,
                 to_sqlite_i64(event.total_tokens)?,
+                event.reported_cost_usd,
                 event.estimated_cost_usd,
                 event
                     .source_file
@@ -142,9 +143,9 @@ impl Database {
             "INSERT INTO usage_events (
                 id, provider, model, session_id, project_path, project_name, timestamp,
                 input_tokens, cached_input_tokens, cache_creation_input_tokens, output_tokens,
-                reasoning_tokens, total_tokens, estimated_cost_usd, source_file, source_event_id,
-                created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                reasoning_tokens, total_tokens, reported_cost_usd, estimated_cost_usd,
+                source_file, source_event_id, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
             ON CONFLICT(id) DO UPDATE SET
                 provider = excluded.provider,
                 model = excluded.model,
@@ -158,6 +159,7 @@ impl Database {
                 output_tokens = excluded.output_tokens,
                 reasoning_tokens = excluded.reasoning_tokens,
                 total_tokens = excluded.total_tokens,
+                reported_cost_usd = excluded.reported_cost_usd,
                 estimated_cost_usd = excluded.estimated_cost_usd,
                 source_file = excluded.source_file,
                 source_event_id = excluded.source_event_id",
@@ -185,6 +187,7 @@ impl Database {
                 to_sqlite_i64(event.output_tokens)?,
                 to_sqlite_i64(event.reasoning_tokens)?,
                 to_sqlite_i64(event.total_tokens)?,
+                event.reported_cost_usd,
                 event.estimated_cost_usd,
                 event
                     .source_file
@@ -451,6 +454,7 @@ mod tests {
             output_tokens: 0,
             reasoning_tokens: 0,
             total_tokens: total,
+            reported_cost_usd: None,
             estimated_cost_usd: Some(0.1),
             source_file: Some(PathBuf::from("/tmp/session.jsonl")),
             source_event_id: source_event_id.map(str::to_string),
@@ -476,6 +480,46 @@ mod tests {
             .unwrap();
         assert_eq!(overview.total_tokens, 100);
         assert_eq!(overview.event_count, 1);
+    }
+
+    #[test]
+    fn reported_cost_takes_priority_in_usage_aggregates() {
+        let database = Database::open_in_memory().unwrap();
+        let mut usage = event("reported", Some("reported-1"), 100);
+        usage.reported_cost_usd = Some(0.25);
+        usage.estimated_cost_usd = Some(9.0);
+        database.insert_usage_events(&[usage]).unwrap();
+
+        let repository = UsageRepository::new(database);
+        let start = chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        let end = Utc::now() + chrono::Duration::seconds(1);
+        assert_eq!(
+            repository
+                .get_overview(start, end)
+                .unwrap()
+                .estimated_cost_usd,
+            Some(0.25)
+        );
+        assert_eq!(
+            repository.get_daily_usage(start, end).unwrap()[0].estimated_cost_usd,
+            Some(0.25)
+        );
+        assert_eq!(
+            repository.get_provider_usage(start, end).unwrap()[0].estimated_cost_usd,
+            Some(0.25)
+        );
+        assert_eq!(
+            repository.get_model_usage(start, end).unwrap()[0].estimated_cost_usd,
+            Some(0.25)
+        );
+        assert_eq!(
+            repository.get_project_usage(start, end).unwrap()[0].estimated_cost_usd,
+            Some(0.25)
+        );
+        assert_eq!(
+            repository.get_sessions().unwrap()[0].estimated_cost_usd,
+            Some(0.25)
+        );
     }
 
     #[test]

@@ -23,6 +23,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
             output_tokens INTEGER NOT NULL DEFAULT 0,
             reasoning_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens INTEGER NOT NULL DEFAULT 0,
+            reported_cost_usd REAL,
             estimated_cost_usd REAL,
             source_file TEXT,
             source_event_id TEXT,
@@ -59,20 +60,81 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         "#,
     )?;
 
-    let has_source_metadata = {
-        let mut statement = connection.prepare("PRAGMA table_info(file_cursors)")?;
-        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
-        columns
-            .collect::<Result<Vec<_>, _>>()?
-            .iter()
-            .any(|column| column == "source_metadata_json")
-    };
-    if !has_source_metadata {
+    if !has_column(connection, "file_cursors", "source_metadata_json")? {
         connection.execute(
             "ALTER TABLE file_cursors ADD COLUMN source_metadata_json TEXT",
             [],
         )?;
     }
-    connection.pragma_update(None, "user_version", 2)?;
+    if !has_column(connection, "usage_events", "reported_cost_usd")? {
+        connection.execute(
+            "ALTER TABLE usage_events ADD COLUMN reported_cost_usd REAL",
+            [],
+        )?;
+    }
+    connection.pragma_update(None, "user_version", 3)?;
     Ok(())
+}
+
+fn has_column(connection: &Connection, table: &str, expected: &str) -> Result<bool, StorageError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    Ok(columns
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|column| column == expected))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adds_reported_cost_column_without_losing_existing_usage() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE usage_events (
+                    id TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    model TEXT,
+                    session_id TEXT,
+                    project_path TEXT,
+                    project_name TEXT,
+                    timestamp INTEGER NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    estimated_cost_usd REAL,
+                    source_file TEXT,
+                    source_event_id TEXT,
+                    created_at INTEGER NOT NULL
+                );
+                INSERT INTO usage_events (
+                    id, provider, timestamp, total_tokens, created_at
+                ) VALUES ('existing', 'grok', 1, 42, 1);",
+            )
+            .unwrap();
+
+        run(&connection).unwrap();
+
+        assert!(has_column(&connection, "usage_events", "reported_cost_usd").unwrap());
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM usage_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+    }
 }
