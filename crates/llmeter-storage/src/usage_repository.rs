@@ -39,6 +39,7 @@ pub struct ProviderUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
     pub estimated_cost_usd: Option<f64>,
     pub last_activity: Option<DateTime<Utc>>,
 }
@@ -301,6 +302,7 @@ impl UsageRepository {
         let mut statement = connection.prepare(
             "SELECT provider, COALESCE(SUM(total_tokens), 0), COALESCE(SUM(input_tokens), 0),
                     COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_input_tokens), 0),
+                    COALESCE(SUM(cache_creation_input_tokens), 0),
                     SUM(COALESCE(reported_cost_usd, estimated_cost_usd)), MAX(timestamp)
              FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
              GROUP BY provider ORDER BY 2 DESC",
@@ -314,14 +316,15 @@ impl UsageRepository {
                     Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
                 )
             })?;
-            let last_activity: Option<i64> = row.get(6)?;
+            let last_activity: Option<i64> = row.get(7)?;
             Ok(ProviderUsage {
                 provider,
                 total_tokens: from_sqlite_u64(row.get(1)?),
                 input_tokens: from_sqlite_u64(row.get(2)?),
                 output_tokens: from_sqlite_u64(row.get(3)?),
                 cached_input_tokens: from_sqlite_u64(row.get(4)?),
-                estimated_cost_usd: row.get(5)?,
+                cache_creation_input_tokens: from_sqlite_u64(row.get(5)?),
+                estimated_cost_usd: row.get(6)?,
                 last_activity: last_activity
                     .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0)),
             })

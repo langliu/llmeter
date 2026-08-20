@@ -5,7 +5,7 @@ use std::rc::Rc;
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use gpui::{
     Bounds, Context, FontWeight, Hsla, IntoElement, MouseMoveEvent, Render, Rgba, canvas, div,
-    fill, point, prelude::*, px, relative, rgb, size,
+    fill, point, prelude::*, px, relative, rgb, size, svg,
 };
 use gpui_component::{
     ActiveTheme, IconName, Selectable, Sizable, TITLE_BAR_HEIGHT,
@@ -346,14 +346,16 @@ fn overview_page(
                 .bg(provider_color(provider.provider)),
         );
     }
+    let all_models = aggregate_model_usage(&range.models);
     let mut provider_cards = div().flex().flex_wrap().gap_3();
     provider_cards = provider_cards.child(share_card(
         t!("overview.share_all").to_string(),
         100.0,
-        range.models.len(),
+        all_models.len(),
         None,
-        rgb(0x16a34a),
         p,
+        view.overview_provider.is_none(),
+        cx,
     ));
     for provider in &range.providers {
         let percent = provider.total_tokens as f64 / provider_total as f64 * 100.0;
@@ -362,10 +364,24 @@ fn overview_page(
             percent,
             model_counts.get(&provider.provider).copied().unwrap_or(0),
             Some(provider.provider),
-            provider_color(provider.provider),
             p,
+            view.overview_provider == Some(provider.provider),
+            cx,
         ));
     }
+
+    let provider_detail = match view.overview_provider {
+        None => Some(all_model_detail(
+            &all_models,
+            range.overview.total_tokens,
+            p,
+        )),
+        Some(selected) => range
+            .providers
+            .iter()
+            .find(|usage| usage.provider == selected)
+            .map(|usage| provider_model_detail(usage, &range.models, p)),
+    };
 
     let hero = glass_card(p)
         .child(overview_period_filter(view, cx))
@@ -400,7 +416,8 @@ fn overview_page(
                 ),
         )
         .child(div().pt_6().child(share_bar))
-        .child(div().pt_5().child(provider_cards));
+        .child(div().pt_5().child(provider_cards))
+        .when_some(provider_detail, |this, detail| this.child(detail));
 
     div()
         .flex()
@@ -536,21 +553,41 @@ fn share_card(
     percent: f64,
     models: usize,
     provider: Option<Provider>,
-    color: Rgba,
     p: Palette,
+    selected: bool,
+    cx: &mut Context<LLMeterView>,
 ) -> impl IntoElement {
     let marker = match provider {
         Some(provider) => provider_logo(provider, 20.0),
-        None => div().size_2().rounded_full().bg(color).into_any_element(),
+        None => all_models_icon(20.0, p.foreground),
     };
+    let provider_key = provider.map(Provider::as_str).unwrap_or("all");
     div()
+        .id(format!("overview-provider-card-{provider_key}"))
         .w(px(168.0))
         .rounded_2xl()
         .border_1()
-        .border_color(p.border.opacity(0.7))
-        .bg(p.background.opacity(0.94))
+        .border_color(if selected {
+            p.link.opacity(0.72)
+        } else {
+            p.border.opacity(0.7)
+        })
+        .bg(if selected {
+            p.accent.opacity(0.5)
+        } else {
+            p.background.opacity(0.94)
+        })
         .px_3()
         .py_3()
+        .cursor_pointer()
+        .hover(move |style| {
+            style
+                .border_color(p.link.opacity(0.5))
+                .bg(p.accent.opacity(0.38))
+        })
+        .on_click(cx.listener(move |view, _, _, cx| {
+            view.set_overview_provider(provider, cx);
+        }))
         .child(
             div().flex().items_center().gap_2().child(marker).child(
                 div()
@@ -575,6 +612,269 @@ fn share_card(
                 .text_color(p.muted_foreground)
                 .child(t!("overview.model_count", count = models).to_string()),
         )
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DetailModelUsage {
+    model: String,
+    total_tokens: u64,
+    estimated_cost_usd: Option<f64>,
+}
+
+fn aggregate_model_usage(models: &[ModelUsage]) -> Vec<DetailModelUsage> {
+    let mut aggregated = HashMap::<String, DetailModelUsage>::new();
+    for model in models {
+        let entry = aggregated
+            .entry(model.model.clone())
+            .or_insert_with(|| DetailModelUsage {
+                model: model.model.clone(),
+                total_tokens: 0,
+                estimated_cost_usd: None,
+            });
+        entry.total_tokens = entry.total_tokens.saturating_add(model.total_tokens);
+        if let Some(cost) = model.estimated_cost_usd {
+            entry.estimated_cost_usd = Some(entry.estimated_cost_usd.unwrap_or_default() + cost);
+        }
+    }
+    let mut models = aggregated.into_values().collect::<Vec<_>>();
+    models.sort_by(|left, right| {
+        right
+            .total_tokens
+            .cmp(&left.total_tokens)
+            .then_with(|| left.model.cmp(&right.model))
+    });
+    models
+}
+
+fn all_model_detail(
+    models: &[DetailModelUsage],
+    total_tokens: u64,
+    p: Palette,
+) -> gpui::AnyElement {
+    div()
+        .mt_5()
+        .pt_5()
+        .border_t_1()
+        .border_color(p.border)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(all_models_icon(22.0, p.foreground))
+                .child(
+                    div()
+                        .text_base()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(t!("overview.all_models").to_string()),
+                ),
+        )
+        .child(
+            div()
+                .pt_2()
+                .text_xs()
+                .text_color(p.muted_foreground)
+                .child(t!("overview.all_models_description").to_string()),
+        )
+        .child(
+            div()
+                .pt_2()
+                .child(model_detail_rows(models, total_tokens, rgb(0x16a34a), p)),
+        )
+        .into_any_element()
+}
+
+fn all_models_icon(size: f32, color: Hsla) -> gpui::AnyElement {
+    svg()
+        .path("icons/layers.svg")
+        .size(px(size))
+        .flex_shrink_0()
+        .text_color(color)
+        .into_any_element()
+}
+
+fn provider_model_detail(
+    provider: &ProviderUsage,
+    models: &[ModelUsage],
+    p: Palette,
+) -> gpui::AnyElement {
+    let provider_models = models
+        .iter()
+        .filter(|model| model.provider == provider.provider)
+        .map(|model| DetailModelUsage {
+            model: model.model.clone(),
+            total_tokens: model.total_tokens,
+            estimated_cost_usd: model.estimated_cost_usd,
+        })
+        .collect::<Vec<_>>();
+    let total_prompt_input = total_prompt_input(
+        provider.provider,
+        provider.input_tokens,
+        provider.cached_input_tokens,
+        provider.cache_creation_input_tokens,
+    );
+    let cache_rate = cache_hit_rate(provider.cached_input_tokens, total_prompt_input);
+    let rows = model_detail_rows(
+        &provider_models,
+        provider.total_tokens,
+        provider_color(provider.provider),
+        p,
+    );
+
+    div()
+        .mt_5()
+        .pt_5()
+        .border_t_1()
+        .border_color(p.border)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(provider_logo(provider.provider, 22.0))
+                .child(
+                    div().text_base().font_weight(FontWeight::SEMIBOLD).child(
+                        t!(
+                            "overview.agent_breakdown",
+                            provider = provider.provider.display_name()
+                        )
+                        .to_string(),
+                    ),
+                ),
+        )
+        .child(
+            div().pt_3().text_xs().text_color(p.muted_foreground).child(
+                t!(
+                    "overview.cache_summary",
+                    rate = format_detail_percentage(cache_rate),
+                    cached = format_full_number(provider.cached_input_tokens),
+                    input = format_full_number(total_prompt_input)
+                )
+                .to_string(),
+            ),
+        )
+        .child(div().pt_2().child(rows))
+        .into_any_element()
+}
+
+fn model_detail_rows(
+    models: &[DetailModelUsage],
+    total_tokens: u64,
+    color: Rgba,
+    p: Palette,
+) -> gpui::AnyElement {
+    let mut rows = div().flex().flex_col();
+    for model in models {
+        let ratio = model.total_tokens as f32 / total_tokens.max(1) as f32;
+        let percentage = ratio as f64 * 100.0;
+        rows = rows.child(
+            div()
+                .py_3()
+                .border_b_1()
+                .border_color(p.border.opacity(0.7))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .flex_1()
+                                .truncate()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(model.model.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .gap_4()
+                                .text_sm()
+                                .child(
+                                    div()
+                                        .w(px(108.0))
+                                        .text_right()
+                                        .text_color(p.muted_foreground)
+                                        .child(format_full_number(model.total_tokens)),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(76.0))
+                                        .text_right()
+                                        .text_color(p.muted_foreground)
+                                        .child(format_cost(model.estimated_cost_usd)),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(54.0))
+                                        .text_right()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(format_detail_percentage(percentage)),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .mt_2()
+                        .h(px(4.0))
+                        .w_full()
+                        .overflow_hidden()
+                        .rounded_full()
+                        .bg(p.muted)
+                        .child(
+                            div()
+                                .h_full()
+                                .w(relative(ratio.clamp(0.0, 1.0)))
+                                .rounded_full()
+                                .bg(color),
+                        ),
+                ),
+        );
+    }
+    if models.is_empty() {
+        rows = rows.child(empty_state(
+            t!("overview.agent_models_empty").to_string(),
+            p,
+        ));
+    }
+    rows.into_any_element()
+}
+
+fn total_prompt_input(
+    provider: Provider,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+) -> u64 {
+    match provider {
+        // Codex reports cached input as a subset of input_tokens. The other
+        // supported providers report uncached, cache-read, and cache-write
+        // input as separate categories.
+        Provider::Codex => input_tokens,
+        _ => input_tokens
+            .saturating_add(cached_input_tokens)
+            .saturating_add(cache_creation_input_tokens),
+    }
+}
+
+fn cache_hit_rate(cached_input_tokens: u64, total_prompt_input: u64) -> f64 {
+    if total_prompt_input == 0 {
+        0.0
+    } else {
+        (cached_input_tokens as f64 / total_prompt_input as f64 * 100.0).min(100.0)
+    }
+}
+
+fn format_detail_percentage(value: f64) -> String {
+    if (value - value.round()).abs() < 0.05 {
+        format!("{value:.0}%")
+    } else {
+        format!("{value:.1}%")
+    }
 }
 
 fn sidebar(active_page: DashboardPage, cx: &mut Context<LLMeterView>) -> impl IntoElement {
@@ -1638,8 +1938,13 @@ fn format_cost(value: Option<f64>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{HEATMAP_CELL, HEATMAP_GAP, HEATMAP_WEEKS, heatmap_hit_index};
+    use super::{
+        HEATMAP_CELL, HEATMAP_GAP, HEATMAP_WEEKS, aggregate_model_usage, cache_hit_rate,
+        format_detail_percentage, heatmap_hit_index, total_prompt_input,
+    };
     use gpui::{Bounds, point, px, size};
+    use llmeter_core::Provider;
+    use llmeter_storage::ModelUsage;
 
     fn grid_bounds() -> Bounds<gpui::Pixels> {
         let width = HEATMAP_WEEKS as f32 * HEATMAP_CELL + (HEATMAP_WEEKS - 1) as f32 * HEATMAP_GAP;
@@ -1673,5 +1978,55 @@ mod tests {
             heatmap_hit_index(point(px(9.0), px(20.0)), bounds, HEATMAP_CELL, HEATMAP_GAP),
             None
         );
+    }
+
+    #[test]
+    fn cache_hit_rate_handles_usage_and_zero_input() {
+        let codex_input = total_prompt_input(Provider::Codex, 388, 370, 0);
+        assert_eq!(codex_input, 388);
+        assert_eq!(cache_hit_rate(370, codex_input), 370.0 / 388.0 * 100.0);
+        assert_eq!(
+            format_detail_percentage(cache_hit_rate(370, codex_input)),
+            "95.4%"
+        );
+
+        let pi_input = total_prompt_input(Provider::Pi, 100, 300, 20);
+        assert_eq!(pi_input, 420);
+        assert_eq!(cache_hit_rate(300, pi_input), 300.0 / 420.0 * 100.0);
+        assert_eq!(cache_hit_rate(10, 0), 0.0);
+        assert_eq!(format_detail_percentage(87.0), "87%");
+    }
+
+    #[test]
+    fn all_model_usage_merges_names_across_providers_and_sorts_by_tokens() {
+        let models = vec![
+            ModelUsage {
+                provider: Provider::Codex,
+                model: "shared-model".into(),
+                total_tokens: 100,
+                estimated_cost_usd: Some(0.4),
+            },
+            ModelUsage {
+                provider: Provider::Pi,
+                model: "shared-model".into(),
+                total_tokens: 50,
+                estimated_cost_usd: Some(0.1),
+            },
+            ModelUsage {
+                provider: Provider::Grok,
+                model: "larger-model".into(),
+                total_tokens: 200,
+                estimated_cost_usd: None,
+            },
+        ];
+
+        let aggregated = aggregate_model_usage(&models);
+        assert_eq!(aggregated.len(), 2);
+        assert_eq!(aggregated[0].model, "larger-model");
+        assert_eq!(aggregated[0].total_tokens, 200);
+        assert_eq!(aggregated[0].estimated_cost_usd, None);
+        assert_eq!(aggregated[1].model, "shared-model");
+        assert_eq!(aggregated[1].total_tokens, 150);
+        assert_eq!(aggregated[1].estimated_cost_usd, Some(0.5));
     }
 }

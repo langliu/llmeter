@@ -486,6 +486,8 @@ mod tests {
     fn reported_cost_takes_priority_in_usage_aggregates() {
         let database = Database::open_in_memory().unwrap();
         let mut usage = event("reported", Some("reported-1"), 100);
+        usage.cached_input_tokens = 60;
+        usage.cache_creation_input_tokens = 7;
         usage.reported_cost_usd = Some(0.25);
         usage.estimated_cost_usd = Some(9.0);
         database.insert_usage_events(&[usage]).unwrap();
@@ -504,10 +506,10 @@ mod tests {
             repository.get_daily_usage(start, end).unwrap()[0].estimated_cost_usd,
             Some(0.25)
         );
-        assert_eq!(
-            repository.get_provider_usage(start, end).unwrap()[0].estimated_cost_usd,
-            Some(0.25)
-        );
+        let provider_usage = &repository.get_provider_usage(start, end).unwrap()[0];
+        assert_eq!(provider_usage.cached_input_tokens, 60);
+        assert_eq!(provider_usage.cache_creation_input_tokens, 7);
+        assert_eq!(provider_usage.estimated_cost_usd, Some(0.25));
         assert_eq!(
             repository.get_model_usage(start, end).unwrap()[0].estimated_cost_usd,
             Some(0.25)

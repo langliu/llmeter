@@ -64,6 +64,11 @@ overview:
   active_days: "%{days} active days"
   model_count: "%{count} models"
   share_all: "All"
+  all_models: "All models"
+  all_models_description: "Models with the same name are merged across tools and sorted by total usage."
+  agent_breakdown: "%{provider} model usage"
+  cache_summary: "%{rate} cache hit rate · %{cached} cached / %{input} input"
+  agent_models_empty: "No model usage in this period"
 providers:
   title: "Providers"
   subtitle: "Usage totals and detected local coding agents"

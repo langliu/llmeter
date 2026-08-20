@@ -139,6 +139,7 @@ pub struct LLMeterView {
     pub(crate) heatmap: Entity<HeatmapView>,
     pub(crate) overview_period: OverviewPeriod,
     pub(crate) overview_date_range: Entity<DatePickerState>,
+    pub(crate) overview_provider: Option<llmeter_core::Provider>,
     overview_custom_range: (NaiveDate, NaiveDate),
     _search_subscription: Subscription,
     _overview_date_subscription: Subscription,
@@ -227,6 +228,7 @@ impl LLMeterView {
             heatmap: cx.new(|_| HeatmapView::default()),
             overview_period,
             overview_date_range,
+            overview_provider: None,
             overview_custom_range,
             _search_subscription,
             _overview_date_subscription,
@@ -318,6 +320,17 @@ impl LLMeterView {
         self.load_overview_period(period, self.overview_custom_range, cx);
     }
 
+    pub(crate) fn set_overview_provider(
+        &mut self,
+        provider: Option<llmeter_core::Provider>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.overview_provider != provider {
+            self.overview_provider = provider;
+            cx.notify();
+        }
+    }
+
     fn set_overview_custom_range(
         &mut self,
         start: NaiveDate,
@@ -345,6 +358,14 @@ impl LLMeterView {
         let (start, end) = period.bounds(Local::now(), custom);
         match OverviewRangeSnapshot::load(&repository, start, end) {
             Ok(snapshot) => {
+                if self.overview_provider.is_some_and(|selected| {
+                    !snapshot
+                        .providers
+                        .iter()
+                        .any(|usage| usage.provider == selected)
+                }) {
+                    self.overview_provider = None;
+                }
                 self.overview_period = period;
                 self.snapshot.overview_range = snapshot;
                 cx.notify();
@@ -479,6 +500,15 @@ impl LLMeterView {
                 snapshot.last_sync = self.snapshot.last_sync;
                 snapshot.warnings = self.snapshot.warnings.clone();
             }
+            if self.overview_provider.is_some_and(|selected| {
+                !snapshot
+                    .overview_range
+                    .providers
+                    .iter()
+                    .any(|usage| usage.provider == selected)
+            }) {
+                self.overview_provider = None;
+            }
             self.snapshot = snapshot;
         }
     }
@@ -509,7 +539,7 @@ mod tests {
     use gpui_component::ActiveTheme;
     use llmeter_collector::Collector;
     use llmeter_core::Provider;
-    use llmeter_storage::{Database, SessionSummary};
+    use llmeter_storage::{Database, ModelUsage, ProviderUsage, SessionSummary};
 
     fn scroll(
         view_position: gpui::Point<gpui::Pixels>,
@@ -766,6 +796,37 @@ mod tests {
         });
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
+        });
+    }
+
+    #[gpui::test]
+    fn overview_provider_selection_renders_model_and_cache_details(cx: &mut TestAppContext) {
+        let (view, cx) = setup_sessions_page(cx);
+        view.update(cx, |view, cx| {
+            view.active_page = DashboardPage::Overview;
+            view.snapshot.overview_range.providers = vec![ProviderUsage {
+                provider: Provider::Codex,
+                total_tokens: 500,
+                input_tokens: 400,
+                output_tokens: 100,
+                cached_input_tokens: 300,
+                cache_creation_input_tokens: 0,
+                estimated_cost_usd: Some(0.5),
+                last_activity: None,
+            }];
+            view.snapshot.overview_range.models = vec![ModelUsage {
+                provider: Provider::Codex,
+                model: "gpt-5.6-sol".into(),
+                total_tokens: 500,
+                estimated_cost_usd: Some(0.5),
+            }];
+            view.set_overview_provider(Some(Provider::Codex), cx);
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.overview_provider, Some(Provider::Codex));
         });
     }
 

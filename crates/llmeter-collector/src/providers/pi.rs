@@ -10,7 +10,7 @@ use super::{
     source_event_id, timestamp, walk_jsonl,
 };
 
-const PI_PARSER_VERSION: u32 = 2;
+const PI_PARSER_VERSION: u32 = 3;
 
 #[derive(Clone, Debug)]
 pub struct PiAdapter {
@@ -140,5 +140,20 @@ mod tests {
         let parsed = adapter.parse_line(&source, line).unwrap().unwrap();
         assert_eq!(parsed.counts.total_tokens, 48);
         assert_eq!(parsed.session_id.as_deref(), Some("pi-session"));
+    }
+
+    #[test]
+    fn parses_pi_cache_read_and_write_usage() {
+        let adapter = PiAdapter::with_home(PathBuf::from("/tmp"));
+        let source = SourceFile::new(PathBuf::from("/tmp/pi.jsonl"), Provider::Pi);
+        let line = br#"{"type":"message_end","sessionId":"pi-cache","model":"gpt-5.6-sol","usage":{"input":100,"output":50,"cacheRead":300,"cacheWrite":20,"totalTokens":470}}"#;
+
+        let parsed = adapter.parse_line(&source, line).unwrap().unwrap();
+
+        assert_eq!(parsed.counts.input_tokens, 100);
+        assert_eq!(parsed.counts.cached_input_tokens, 300);
+        assert_eq!(parsed.counts.cache_creation_input_tokens, 20);
+        assert_eq!(parsed.counts.output_tokens, 50);
+        assert_eq!(parsed.counts.total_tokens, 470);
     }
 }

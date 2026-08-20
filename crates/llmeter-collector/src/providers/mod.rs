@@ -187,7 +187,11 @@ pub(crate) fn object_with_usage(value: &Value) -> Option<&Value> {
         "output_tokens",
         "outputTokens",
         "cache_read_input_tokens",
+        "cacheRead",
+        "cache_read",
         "cache_creation_input_tokens",
+        "cacheWrite",
+        "cache_write",
         "total_tokens",
         "totalTokens",
     ];
@@ -229,6 +233,8 @@ pub(crate) fn counts_from_usage(
                 "cachedInputTokens",
                 "cache_read_input_tokens",
                 "cacheReadInputTokens",
+                "cacheRead",
+                "cache_read",
             ],
         )
         .unwrap_or_default(),
@@ -237,7 +243,11 @@ pub(crate) fn counts_from_usage(
             &[
                 "cache_creation_input_tokens",
                 "cacheCreationInputTokens",
+                "cache_write_input_tokens",
+                "cacheWriteInputTokens",
                 "cache_creation",
+                "cacheWrite",
+                "cache_write",
             ],
         )
         .unwrap_or_default(),

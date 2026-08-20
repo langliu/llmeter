@@ -64,6 +64,11 @@ overview:
   active_days: "活跃天数 %{days} 天"
   model_count: "%{count} 个模型"
   share_all: "全部"
+  all_models: "全部模型"
+  all_models_description: "同名模型会跨工具合并，并按总用量排序。"
+  agent_breakdown: "%{provider} 模型使用明细"
+  cache_summary: "缓存命中率 %{rate} · %{cached} 缓存 / %{input} 输入"
+  agent_models_empty: "当前统计时段暂无模型用量"
 providers:
   title: "提供商"
   subtitle: "用量总计与检测到的本地编程代理"

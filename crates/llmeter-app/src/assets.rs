@@ -11,6 +11,7 @@ const PROVIDER_ASSETS: [&str; 7] = [
     "providers/grok.svg",
     "providers/hermes.svg",
 ];
+const ICON_ASSETS: [&str; 1] = ["icons/layers.svg"];
 
 pub(crate) struct Assets;
 
@@ -32,6 +33,7 @@ impl AssetSource for Assets {
             "providers/hermes.svg" => {
                 Some(include_bytes!("../assets/providers/hermes.svg").as_slice())
             }
+            "icons/layers.svg" => Some(include_bytes!("../assets/icons/layers.svg").as_slice()),
             _ => None,
         };
         match asset {
@@ -44,6 +46,12 @@ impl AssetSource for Assets {
         let mut assets = AssetSource::list(&gpui_component_assets::Assets, path)?;
         assets.extend(
             PROVIDER_ASSETS
+                .iter()
+                .filter(|asset| asset.starts_with(path))
+                .map(|asset| SharedString::from(*asset)),
+        );
+        assets.extend(
+            ICON_ASSETS
                 .iter()
                 .filter(|asset| asset.starts_with(path))
                 .map(|asset| SharedString::from(*asset)),
@@ -61,6 +69,14 @@ mod tests {
         for path in PROVIDER_ASSETS {
             let asset = AssetSource::load(&Assets, path).unwrap();
             assert!(asset.is_some(), "missing embedded provider asset: {path}");
+        }
+    }
+
+    #[test]
+    fn embeds_app_icons() {
+        for path in ICON_ASSETS {
+            let asset = AssetSource::load(&Assets, path).unwrap();
+            assert!(asset.is_some(), "missing embedded app icon: {path}");
         }
     }
 }
