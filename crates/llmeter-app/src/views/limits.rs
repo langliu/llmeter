@@ -31,7 +31,7 @@ pub(crate) fn limits_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> 
     };
 
     v_flex()
-        .size_full()
+        .w_full()
         .px_8()
         .pt_3()
         .pb_6()
@@ -68,7 +68,7 @@ pub(crate) fn limits_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> 
                         .on_click(cx.listener(|view, _, _, cx| view.refresh_limits(cx))),
                 ),
         )
-        .child(div().w_full().grid().grid_cols(3).gap_4().children(cards))
+        .child(v_flex().w_full().gap_4().children(cards))
         .child(
             div()
                 .pt_1()
@@ -116,6 +116,7 @@ fn provider_card(
     });
 
     v_flex()
+        .w_full()
         .min_w(px(0.0))
         .rounded_2xl()
         .border_1()
@@ -243,7 +244,7 @@ fn window_row(window: &LimitWindow, p: Palette) -> impl IntoElement {
         )
         .child(
             div()
-                .h(px(5.0))
+                .h(px(10.0))
                 .w_full()
                 .overflow_hidden()
                 .rounded_full()

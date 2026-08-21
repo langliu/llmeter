@@ -115,7 +115,7 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
             .child(sessions_page(view, cx))
             .into_any_element(),
         DashboardPage::Limits => div()
-            .size_full()
+            .w_full()
             .child(limits_page(view, cx))
             .into_any_element(),
         DashboardPage::Providers => div()
