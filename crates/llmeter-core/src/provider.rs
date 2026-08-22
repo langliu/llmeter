@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 pub enum Provider {
     Codex,
     Claude,
+    Cursor,
+    Qoder,
+    Trae,
     OpenCode,
     Pi,
     Zed,
@@ -16,9 +19,12 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 10] = [
         Self::Codex,
         Self::Claude,
+        Self::Cursor,
+        Self::Qoder,
+        Self::Trae,
         Self::OpenCode,
         Self::Pi,
         Self::Zed,
@@ -30,6 +36,9 @@ impl Provider {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Cursor => "cursor",
+            Self::Qoder => "qoder",
+            Self::Trae => "trae",
             Self::OpenCode => "opencode",
             Self::Pi => "pi",
             Self::Zed => "zed",
@@ -42,6 +51,9 @@ impl Provider {
         match self {
             Self::Codex => "Codex",
             Self::Claude => "Claude Code",
+            Self::Cursor => "Cursor",
+            Self::Qoder => "Qoder",
+            Self::Trae => "TRAE",
             Self::OpenCode => "OpenCode",
             Self::Pi => "Pi",
             Self::Zed => "Zed",
@@ -58,7 +70,7 @@ impl Provider {
             Self::Pi => Some(format!("pi --session {session_ref}")),
             Self::Grok => Some(format!("grok --resume {session_ref}")),
             Self::Hermes => Some(format!("hermes --resume {session_ref}")),
-            Self::Zed => None,
+            Self::Cursor | Self::Qoder | Self::Trae | Self::Zed => None,
         }
     }
 
@@ -123,6 +135,9 @@ impl FromStr for Provider {
         match value.to_ascii_lowercase().as_str() {
             "codex" => Ok(Self::Codex),
             "claude" | "claude_code" | "claude-code" => Ok(Self::Claude),
+            "cursor" => Ok(Self::Cursor),
+            "qoder" | "qoder-cn" | "qoder_cn" => Ok(Self::Qoder),
+            "trae" | "trae-solo" | "trae_solo" => Ok(Self::Trae),
             "opencode" | "open_code" | "open-code" => Ok(Self::OpenCode),
             "pi" | "pi-mono" => Ok(Self::Pi),
             "zed" => Ok(Self::Zed),

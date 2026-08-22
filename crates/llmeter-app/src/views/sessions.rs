@@ -29,10 +29,11 @@ pub(crate) enum SessionProviderFilter {
 }
 
 impl SessionProviderFilter {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::All,
         Self::Provider(Provider::Claude),
         Self::Provider(Provider::Codex),
+        Self::Provider(Provider::Qoder),
         Self::Provider(Provider::Pi),
         Self::Provider(Provider::OpenCode),
         Self::Provider(Provider::Zed),

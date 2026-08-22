@@ -39,6 +39,16 @@ safety rescan.
   cache-token breakdowns and the exact cost reported by Grok Build
 - Hermes Agent: $HERMES_HOME/state.db (default ~/.hermes/state.db) plus local
   profile databases, using per-model usage with aggregate-session reconciliation
+- Qoder and Qoder CN: the validated `SharedClientCache/cache/db/local.db`
+  assistant-token schema, with cached input separated from ordinary input
+
+The Limits page also reads account quota from the existing local login state for
+Claude Code, Codex, Cursor, Qoder/Qoder CN, and Grok. TRAE SOLO contributes its
+local entitlement and Fast Request allowance; its local state does not expose
+current usage, so LLMeter does not invent a percentage. Cursor and TRAE are
+detected as installed providers even though they do not expose readable local
+per-request token logs. TRAE SOLO CN installation and local sign-in state are
+also detected without transmitting its stored credential.
 
 Codex last_token_usage snapshots are treated as direct deltas when present.
 Other cumulative snapshots go through a per-session cumulative tracker, so

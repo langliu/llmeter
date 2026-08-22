@@ -1291,6 +1291,9 @@ fn provider_color(provider: Provider) -> Rgba {
     match provider {
         Provider::Codex => rgb(0x2563eb),
         Provider::Claude => rgb(0xd97706),
+        Provider::Cursor => rgb(0x171717),
+        Provider::Qoder => rgb(0x16a34a),
+        Provider::Trae => rgb(0x10b981),
         Provider::OpenCode => rgb(0x0891b2),
         Provider::Pi => rgb(0x7c3aed),
         Provider::Zed => rgb(0x111827),

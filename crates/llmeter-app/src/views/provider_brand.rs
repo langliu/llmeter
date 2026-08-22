@@ -5,6 +5,9 @@ pub(crate) fn provider_logo(provider: Provider, size: f32) -> AnyElement {
     let path = match provider {
         Provider::Codex => "providers/codex.svg",
         Provider::Claude => "providers/claude.svg",
+        Provider::Cursor => "providers/cursor.svg",
+        Provider::Qoder => "providers/qoder.svg",
+        Provider::Trae => "providers/trae.svg",
         Provider::OpenCode => "providers/opencode.svg",
         Provider::Pi => "providers/pi.svg",
         Provider::Zed => "providers/zed.svg",
@@ -15,11 +18,14 @@ pub(crate) fn provider_logo(provider: Provider, size: f32) -> AnyElement {
     if matches!(
         provider,
         Provider::Claude
+            | Provider::Cursor
+            | Provider::Qoder
             | Provider::OpenCode
             | Provider::Pi
             | Provider::Zed
             | Provider::Grok
             | Provider::Hermes
+            | Provider::Trae
     ) {
         return div()
             .size(px(size))

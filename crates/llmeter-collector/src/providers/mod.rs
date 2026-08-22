@@ -14,18 +14,27 @@ use serde_json::Value;
 
 mod claude;
 mod codex;
+mod cursor;
 mod grok;
 mod hermes;
 mod opencode;
 mod pi;
+mod qoder;
+mod trae;
 mod zed;
 
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
+pub use cursor::CursorAdapter;
+pub(crate) use cursor::cursor_root;
 pub use grok::GrokAdapter;
 pub use hermes::HermesAdapter;
 pub use opencode::OpenCodeAdapter;
 pub use pi::PiAdapter;
+pub use qoder::QoderAdapter;
+pub(crate) use qoder::qoder_root;
+pub use trae::TraeAdapter;
+pub(crate) use trae::{has_trae_cn_auth, read_entitlement, trae_cn_root, trae_root};
 pub use zed::ZedAdapter;
 
 pub const PARSER_VERSION: u32 = 1;
@@ -70,6 +79,9 @@ pub fn default_adapters() -> Vec<Box<dyn ProviderAdapter>> {
     vec![
         Box::new(CodexAdapter::default()),
         Box::new(ClaudeAdapter::default()),
+        Box::new(CursorAdapter::default()),
+        Box::new(QoderAdapter::default()),
+        Box::new(TraeAdapter::default()),
         Box::new(OpenCodeAdapter::default()),
         Box::new(PiAdapter::default()),
         Box::new(ZedAdapter::default()),
