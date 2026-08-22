@@ -232,6 +232,7 @@ mod tests {
             estimated_cost_usd: None,
             source_file: None,
             source_event_id: Some(id.into()),
+            snapshot_scope: None,
         }
     }
 

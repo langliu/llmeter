@@ -5,7 +5,9 @@ use gpui::{
 use gpui_component::{
     Icon, IconName, Selectable,
     button::{Button, ButtonCustomVariant, ButtonGroup, ButtonVariants},
-    h_flex, v_flex,
+    h_flex,
+    switch::Switch,
+    v_flex,
 };
 use llmeter_core::ProviderStatus;
 use rust_i18n::t;
@@ -311,6 +313,20 @@ fn data_card(view: &LLMeterView, p: Palette, cx: &mut Context<LLMeterView>) -> i
             t!("settings.detection").to_string(),
             detections,
             None,
+            false,
+            p,
+        ))
+        .child(setting_row(
+            t!("settings.trae_cn_usage").to_string(),
+            t!("settings.trae_cn_usage_subtitle").to_string(),
+            Some(
+                Switch::new("trae-cn-usage")
+                    .checked(view.trae_cn_usage_enabled)
+                    .on_click(cx.listener(|view, enabled, _, cx| {
+                        view.set_trae_cn_usage_enabled(*enabled, cx);
+                    }))
+                    .into_any_element(),
+            ),
             false,
             p,
         ))

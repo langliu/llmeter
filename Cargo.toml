@@ -15,10 +15,12 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1"
+aes = "0.8"
 async-trait = "0.1"
 base64 = "0.22"
 blake3 = "1"
 chrono = { version = "0.4", features = ["serde"] }
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
 dirs = "6"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "runtime_shaders"] }
@@ -30,6 +32,7 @@ rust-i18n = "3"
 sys-locale = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 tracing = "0.1"

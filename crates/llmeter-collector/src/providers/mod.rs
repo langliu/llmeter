@@ -12,6 +12,8 @@ use llmeter_core::{
 };
 use serde_json::Value;
 
+use llmeter_storage::Database;
+
 mod claude;
 mod codex;
 mod cursor;
@@ -26,14 +28,14 @@ mod zed;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::CursorAdapter;
-pub(crate) use cursor::cursor_root;
+pub(crate) use cursor::{cursor_root, cursor_session_cookie};
 pub use grok::GrokAdapter;
 pub use hermes::HermesAdapter;
 pub use opencode::OpenCodeAdapter;
 pub use pi::PiAdapter;
 pub use qoder::QoderAdapter;
 pub(crate) use qoder::qoder_root;
-pub use trae::TraeAdapter;
+pub use trae::{TRAE_CN_USAGE_SETTING, TraeAdapter};
 pub(crate) use trae::{has_trae_cn_auth, read_entitlement, trae_cn_root, trae_root};
 pub use zed::ZedAdapter;
 
@@ -50,6 +52,30 @@ pub struct ParsedUsage {
     pub project_name: Option<String>,
     pub source_event_id: Option<String>,
     pub reported_cost_usd: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum SnapshotPolicy {
+    #[default]
+    Upsert,
+    /// Replace every stored event for this provider.
+    ReplaceAll,
+    /// Replace this provider's events inside the authoritative remote window.
+    ReplaceSince(DateTime<Utc>),
+}
+
+#[derive(Clone, Debug)]
+pub struct ParsedSnapshot {
+    pub usages: Vec<ParsedUsage>,
+    pub policy: SnapshotPolicy,
+    /// Stable identity of the signed-in account that produced this snapshot.
+    /// Local file parsers leave this unset.
+    pub scope: Option<String>,
+}
+
+pub(crate) fn snapshot_scope(provider: Provider, identity: &str) -> String {
+    let value = format!("{provider}\u{0}{identity}");
+    blake3::hash(value.as_bytes()).to_hex().to_string()
 }
 
 pub trait ProviderAdapter: Send + Sync {
@@ -73,15 +99,23 @@ pub trait ProviderAdapter: Send + Sync {
             "SQLite source is not supported by this adapter"
         ))
     }
+    fn parse_snapshot(&self, _source: &SourceFile) -> Result<ParsedSnapshot> {
+        Err(anyhow::anyhow!(
+            "Snapshot source is not supported by this adapter"
+        ))
+    }
+    fn uses_remote_snapshot(&self) -> bool {
+        false
+    }
 }
 
-pub fn default_adapters() -> Vec<Box<dyn ProviderAdapter>> {
+pub fn default_adapters(database: &Database) -> Vec<Box<dyn ProviderAdapter>> {
     vec![
         Box::new(CodexAdapter::default()),
         Box::new(ClaudeAdapter::default()),
         Box::new(CursorAdapter::default()),
         Box::new(QoderAdapter::default()),
-        Box::new(TraeAdapter::default()),
+        Box::new(TraeAdapter::with_database(database.clone())),
         Box::new(OpenCodeAdapter::default()),
         Box::new(PiAdapter::default()),
         Box::new(ZedAdapter::default()),

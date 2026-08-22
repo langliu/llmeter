@@ -152,6 +152,7 @@ impl FromStr for Provider {
 pub enum SourceFormat {
     Jsonl,
     Sqlite,
+    Snapshot,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -252,6 +253,13 @@ pub struct UsageEvent {
     pub estimated_cost_usd: Option<f64>,
     pub source_file: Option<PathBuf>,
     pub source_event_id: Option<String>,
+    /// Stable account/snapshot identity for remote provider exports.
+    ///
+    /// Local log events leave this unset. The field is persisted separately
+    /// from `source_event_id` so the same provider event ID can safely exist
+    /// for two signed-in accounts.
+    #[serde(default)]
+    pub snapshot_scope: Option<String>,
 }
 
 impl UsageEvent {
@@ -325,6 +333,7 @@ mod tests {
             estimated_cost_usd: None,
             source_file: Some(PathBuf::from("/tmp/session.jsonl")),
             source_event_id: None,
+            snapshot_scope: None,
         };
         let serialized = serde_json::to_string(&event).unwrap();
         for forbidden in [

@@ -17,7 +17,8 @@ use llmeter_storage::{Database, LimitRepository};
 use serde_json::Value;
 
 use crate::providers::{
-    cursor_root, has_trae_cn_auth, qoder_root, read_entitlement, trae_cn_root, trae_root,
+    cursor_root, cursor_session_cookie, has_trae_cn_auth, qoder_root, read_entitlement,
+    trae_cn_root, trae_root,
 };
 
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -538,29 +539,9 @@ fn fetch_cursor(home: &Path, platform: &str, http: &dyn LimitHttpClient) -> Prov
     if !root.exists() {
         return ProviderFetch::NotConfigured;
     }
-    let state_db = root.join("User/globalStorage/state.vscdb");
-    let Some(token) = read_cursor_access_token(&state_db) else {
+    let Some(cookie) = cursor_session_cookie(home, platform) else {
         return ProviderFetch::NotConfigured;
     };
-    let user_id = read_json_file(&home.join(".cursor/cli-config.json"))
-        .and_then(|value| {
-            value
-                .pointer("/authInfo/authId")
-                .and_then(Value::as_str)
-                .and_then(normalize_cursor_subject)
-        })
-        .or_else(|| {
-            jwt_payload(&token).and_then(|value| {
-                value
-                    .get("sub")
-                    .and_then(Value::as_str)
-                    .and_then(normalize_cursor_subject)
-            })
-        });
-    let Some(user_id) = user_id else {
-        return ProviderFetch::NotConfigured;
-    };
-    let cookie = format!("WorkosCursorSessionToken={user_id}%3A%3A{token}");
     let body = match http.get_json(
         CURSOR_USAGE_URL,
         &[
@@ -587,36 +568,6 @@ fn fetch_cursor(home: &Path, platform: &str, http: &dyn LimitHttpClient) -> Prov
         Ok(limits) => ProviderFetch::Ready(limits),
         Err(error) => ProviderFetch::Failed(error),
     }
-}
-
-fn read_cursor_access_token(path: &Path) -> Option<String> {
-    let connection =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .ok()?;
-    connection
-        .query_row(
-            "SELECT value FROM ItemTable WHERE key = 'cursorAuth/accessToken'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
-        .filter(|value| value.len() >= 10)
-}
-
-fn normalize_cursor_subject(subject: &str) -> Option<String> {
-    let subject = subject.trim();
-    if let Some((_, native)) = subject.rsplit_once('|')
-        && native.starts_with("user_")
-        && native
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '_')
-    {
-        return Some(native.to_string());
-    }
-    let valid_prefix = ["google-oauth2|", "github|", "oidc|", "auth0|"]
-        .iter()
-        .any(|prefix| subject.starts_with(prefix) && subject.len() > prefix.len());
-    valid_prefix.then(|| subject.to_string())
 }
 
 fn normalize_cursor(body: &Value, now: DateTime<Utc>) -> Result<ProviderLimits, LimitFetchError> {
@@ -1671,19 +1622,6 @@ mod tests {
         assert_eq!(merged.windows.len(), 2);
         assert!(merged.stale);
         assert!(merged.last_error.is_some());
-    }
-
-    #[test]
-    fn cursor_subject_supports_native_and_workos_logins() {
-        assert_eq!(
-            normalize_cursor_subject("auth0|user_abc"),
-            Some("user_abc".into())
-        );
-        assert_eq!(
-            normalize_cursor_subject("google-oauth2|123"),
-            Some("google-oauth2|123".into())
-        );
-        assert_eq!(normalize_cursor_subject("invalid"), None);
     }
 
     #[test]

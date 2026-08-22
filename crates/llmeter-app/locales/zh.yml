@@ -186,6 +186,8 @@ settings:
   waiting_sync: "等待首次同步"
   warnings_count: "%{count} 条警告"
   detection: "提供商检测"
+  trae_cn_usage: "TRAE CN Token 用量"
+  trae_cn_usage_subtitle: "启用后会将本地登录 JWT 仅发送至 TRAE 官方接口，读取最近 30 天的按会话 Token 用量。"
   hooks: "Hook 管理"
   hooks_subtitle: "可选安装命令行钩子，实时触发同步："
   privacy: "隐私"

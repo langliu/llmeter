@@ -186,6 +186,8 @@ settings:
   waiting_sync: "Waiting for first sync"
   warnings_count: "%{count} warnings"
   detection: "Provider detection"
+  trae_cn_usage: "TRAE CN token usage"
+  trae_cn_usage_subtitle: "When enabled, the local sign-in JWT is sent only to TRAE's official API to read 30 days of per-session token usage."
   hooks: "Hook management"
   hooks_subtitle: "Optional CLI hooks for real-time sync:"
   privacy: "Privacy"

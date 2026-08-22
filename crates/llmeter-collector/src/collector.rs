@@ -15,7 +15,7 @@ use tracing::warn;
 
 use crate::{
     hooks,
-    providers::home_dir,
+    providers::{home_dir, qoder_root},
     sync::{SyncEngine, SyncOptions},
     watcher,
 };
@@ -51,11 +51,17 @@ impl Collector {
     }
 
     pub fn sync_now(&self) -> Result<SyncResult> {
-        self.sync_with_options(SyncOptions::default())
+        let mut result = self.sync_with_options(SyncOptions::local_changes())?;
+        result.merge(self.sync_with_options(SyncOptions::remote_snapshots())?);
+        Ok(result)
     }
 
     pub fn sync_provider(&self, provider: Provider) -> Result<SyncResult> {
         self.sync_with_options(SyncOptions::only(provider))
+    }
+
+    fn sync_local_changes(&self) -> Result<SyncResult> {
+        self.sync_with_options(SyncOptions::local_changes())
     }
 
     pub fn full_rescan(&self) -> Result<SyncResult> {
@@ -63,7 +69,7 @@ impl Collector {
             .sync_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("sync lock poisoned"))?;
-        self.engine.database().clear_usage_and_cursors()?;
+        self.engine.clear_rebuildable_usage()?;
         let result = self.engine.sync(SyncOptions::default())?;
         let _ = self
             .event_sender
@@ -126,7 +132,7 @@ impl Collector {
                             // Drain bursts and debounce before a single sync.
                             thread::sleep(Duration::from_millis(500));
                             while receiver.try_recv().is_ok() {}
-                            let _ = collector.sync_now();
+                            let _ = collector.sync_local_changes();
                         }
                         Ok(Err(error)) => warn!(error = %error, "filesystem watcher event failed"),
                         Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -165,6 +171,8 @@ fn watch_roots() -> Vec<PathBuf> {
             .join("Application Support")
             .join("opencode"),
         home.join(".opencode"),
+        qoder_root(&home, std::env::consts::OS, false).join("SharedClientCache/cache/db"),
+        qoder_root(&home, std::env::consts::OS, true).join("SharedClientCache/cache/db"),
         home.join("Library")
             .join("Application Support")
             .join("Zed")
