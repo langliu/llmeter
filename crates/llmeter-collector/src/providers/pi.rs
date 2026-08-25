@@ -222,5 +222,4 @@ mod tests {
         assert_eq!(parsed.counts.cached_input_tokens, 4);
         assert_eq!(parsed.counts.total_tokens, 17);
     }
-
 }

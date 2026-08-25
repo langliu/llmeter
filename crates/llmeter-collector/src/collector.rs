@@ -63,10 +63,6 @@ impl Collector {
         self.sync_with_options(SyncOptions::only(provider))
     }
 
-    fn sync_local_changes(&self) -> Result<SyncResult> {
-        self.sync_with_options(SyncOptions::local_changes())
-    }
-
     pub fn full_rescan(&self) -> Result<SyncResult> {
         let _guard = self
             .sync_lock

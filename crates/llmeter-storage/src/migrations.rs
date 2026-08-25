@@ -83,26 +83,26 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
             [],
         )?;
     }
-    // Remote snapshots are account-scoped. Keep legacy uniqueness for
-    // unscoped events while allowing one official ID per signed-in account.
-    connection.execute(
-        "DROP INDEX IF EXISTS idx_usage_events_provider_source_event",
-        [],
-    )?;
-    connection.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_provider_source_event_legacy
-         ON usage_events(provider, source_event_id)
-         WHERE source_event_id IS NOT NULL AND snapshot_scope IS NULL",
-        [],
-    )?;
-    connection.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_provider_scope_source_event
-         ON usage_events(provider, snapshot_scope, source_event_id)
-         WHERE snapshot_scope IS NOT NULL AND source_event_id IS NOT NULL",
-        [],
-    )?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version < 8 {
+        // Remote snapshots are account-scoped. Keep legacy uniqueness for
+        // unscoped events while allowing one official ID per signed-in account.
+        connection.execute(
+            "DROP INDEX IF EXISTS idx_usage_events_provider_source_event",
+            [],
+        )?;
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_provider_source_event_legacy
+             ON usage_events(provider, source_event_id)
+             WHERE source_event_id IS NOT NULL AND snapshot_scope IS NULL",
+            [],
+        )?;
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_provider_scope_source_event
+             ON usage_events(provider, snapshot_scope, source_event_id)
+             WHERE snapshot_scope IS NOT NULL AND source_event_id IS NOT NULL",
+            [],
+        )?;
         reattribute_omp_sessions(connection)?;
     }
     connection.pragma_update(None, "user_version", 8)?;
@@ -128,6 +128,10 @@ fn reattribute_omp_sessions(connection: &Connection) -> Result<(), StorageError>
              INNER JOIN usage_events AS keep
                ON keep.provider = 'omp'
               AND keep.source_event_id = pi.source_event_id
+              AND (
+                    (keep.snapshot_scope IS NULL AND pi.snapshot_scope IS NULL)
+                    OR keep.snapshot_scope = pi.snapshot_scope
+                  )
              WHERE pi.provider = 'pi'
                AND pi.source_event_id IS NOT NULL
                AND replace(pi.source_file, '\\', '/') LIKE '%/.omp/%'
@@ -223,9 +227,11 @@ mod tests {
 
         assert_eq!(
             connection
-                .query_row("SELECT count(*) FROM usage_events WHERE provider = 'omp'", [], |row| {
-                    row.get::<_, i64>(0)
-                })
+                .query_row(
+                    "SELECT count(*) FROM usage_events WHERE provider = 'omp'",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
                 .unwrap(),
             1
         );
@@ -251,9 +257,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        connection
-            .pragma_update(None, "user_version", 0)
-            .unwrap();
+        connection.pragma_update(None, "user_version", 0).unwrap();
 
         run(&connection).unwrap();
 
@@ -299,9 +303,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        connection
-            .pragma_update(None, "user_version", 0)
-            .unwrap();
+        connection.pragma_update(None, "user_version", 0).unwrap();
 
         run(&connection).unwrap();
 
@@ -320,7 +322,4 @@ mod tests {
             .unwrap();
         assert_eq!(rows, vec![("omp-keep".into(), "omp".into(), 7)]);
     }
-
-
-
 }

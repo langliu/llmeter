@@ -65,10 +65,9 @@ impl SyncOptions {
         Self {
             providers: Some(providers.into_iter().collect()),
             include_local: true,
-            include_remote_snapshots: false,
+            include_remote_snapshots: true,
         }
     }
-
 }
 
 #[derive(Clone)]
@@ -555,6 +554,20 @@ mod tests {
 
     use super::*;
     use crate::providers::{CodexAdapter, OpenCodeAdapter};
+
+    #[test]
+    fn watched_providers_include_remote_snapshots() {
+        let options = SyncOptions::providers([Provider::Cursor, Provider::Grok]);
+        assert!(options.include_local);
+        assert!(options.include_remote_snapshots);
+        assert_eq!(
+            options.providers.unwrap().len(),
+            2,
+            "only the watched providers are selected"
+        );
+        assert!(!SyncOptions::local_changes().include_remote_snapshots);
+    }
+
 
     struct SnapshotTestAdapter {
         path: PathBuf,

@@ -97,7 +97,6 @@ pub(crate) enum OverviewProviderFilter {
     Provider(llmeter_core::Provider),
 }
 
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ThemePreference {
     Light,
@@ -145,8 +144,6 @@ struct SnapshotUpdate {
     custom_range: (NaiveDate, NaiveDate),
     generation: u64,
 }
-
-
 
 pub struct LLMeterView {
     collector: Collector,
@@ -312,7 +309,9 @@ impl LLMeterView {
                 {
                     break;
                 }
-                cx.background_executor().timer(Duration::from_millis(250)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
             }
         });
         view.refresh_task = Some(task);
@@ -730,7 +729,6 @@ impl LLMeterView {
             .ok();
     }
 
-
     fn load_snapshot(&self, include_sessions: bool) -> Option<UiSnapshot> {
         let repository = UsageRepository::new(self.collector.engine().database().clone());
         let (overview_start, overview_end) = self
@@ -751,13 +749,22 @@ impl LLMeterView {
             if let Some((timestamp, warnings)) = update.sync {
                 self.snapshot.last_sync = Some(timestamp);
                 for warning in warnings {
-                    if !self.snapshot.warnings.iter().any(|existing| existing == &warning)
+                    if !self
+                        .snapshot
+                        .warnings
+                        .iter()
+                        .any(|existing| existing == &warning)
                     {
                         self.snapshot.warnings.push(warning);
                     }
                 }
             }
-            if !self.snapshot.warnings.iter().any(|warning| warning == &error) {
+            if !self
+                .snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning == &error)
+            {
                 self.snapshot.warnings.push(error);
             }
             return true;
@@ -1113,7 +1120,10 @@ mod tests {
                 "current generation should still apply non-range fields"
             );
             assert_eq!(view.overview_period, OverviewPeriod::Week);
-            assert_eq!(view.snapshot.overview_range.overview.total_tokens, 65_137_351);
+            assert_eq!(
+                view.snapshot.overview_range.overview.total_tokens,
+                65_137_351
+            );
             assert_eq!(view.snapshot.today.total_tokens, 99);
 
             let completed = view.snapshot_generation;
@@ -1133,7 +1143,10 @@ mod tests {
                 "a finished load must apply even if a newer reload already started"
             );
             assert_eq!(view.snapshot.today.total_tokens, 123);
-            assert_eq!(view.snapshot.overview_range.overview.total_tokens, 65_137_351);
+            assert_eq!(
+                view.snapshot.overview_range.overview.total_tokens,
+                65_137_351
+            );
 
             let mut older = view.snapshot.clone();
             older.overview_range.overview.total_tokens = 1;
@@ -1150,7 +1163,10 @@ mod tests {
                 }),
                 "older snapshot generation must be ignored"
             );
-            assert_eq!(view.snapshot.overview_range.overview.total_tokens, 65_137_351);
+            assert_eq!(
+                view.snapshot.overview_range.overview.total_tokens,
+                65_137_351
+            );
             assert_eq!(view.snapshot.today.total_tokens, 123);
 
             let synced_at = Utc::now();
@@ -1176,7 +1192,10 @@ mod tests {
                     .iter()
                     .any(|warning| warning == "collector warning")
             );
-            assert_eq!(view.snapshot.overview_range.overview.total_tokens, 65_137_351);
+            assert_eq!(
+                view.snapshot.overview_range.overview.total_tokens,
+                65_137_351
+            );
 
             let mut current = view.snapshot.clone();
             current.overview_range.overview.total_tokens = 70_000_000;
@@ -1189,7 +1208,10 @@ mod tests {
                 custom_range: view.overview_custom_range,
                 generation: view.snapshot_generation,
             }));
-            assert_eq!(view.snapshot.overview_range.overview.total_tokens, 70_000_000);
+            assert_eq!(
+                view.snapshot.overview_range.overview.total_tokens,
+                70_000_000
+            );
             assert_eq!(view.snapshot.last_sync, Some(synced_at));
             assert!(
                 view.snapshot
@@ -1206,7 +1228,6 @@ mod tests {
             );
         });
     }
-
 
     #[gpui::test]
     fn overview_custom_period_renders_date_range_picker(cx: &mut TestAppContext) {

@@ -203,7 +203,6 @@ impl ZedAdapter {
         self.reset_prompt_stamps(source);
     }
 
-
     fn next_prompt_time(&self, source: &Path, thread_id: &str) -> DateTime<Utc> {
         let times = self.prompt_times();
         let list = times.get(thread_id).map(Vec::as_slice).unwrap_or(&[]);
@@ -257,8 +256,6 @@ impl ZedAdapter {
             .insert(key, timestamp);
         timestamp
     }
-
-
 }
 
 fn existing_files(paths: &[PathBuf]) -> Vec<PathBuf> {
@@ -430,7 +427,10 @@ impl ProviderAdapter for ZedAdapter {
             let fallback = parse_timestamp(Some(&Value::String(updated_at)));
             let request_times = request_timestamps(
                 &user_message_ids(&thread),
-                prompt_times.get(&thread_id).map(Vec::as_slice).unwrap_or(&[]),
+                prompt_times
+                    .get(&thread_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
                 fallback,
             );
 
@@ -457,7 +457,6 @@ impl ProviderAdapter for ZedAdapter {
         Ok(parsed)
     }
 }
-
 
 fn all_prompt_request_times(logs: &[PathBuf]) -> HashMap<String, Vec<DateTime<Utc>>> {
     const MARKER: &str = "Received prompt request for session: ";
@@ -512,7 +511,6 @@ fn supported_schema(path: &Path) -> Result<bool> {
         .iter()
         .all(|required| columns.iter().any(|column| column == required)))
 }
-
 
 fn supported_thread_count(path: &Path) -> Result<u64> {
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -602,9 +600,10 @@ fn parse_telemetry_usage(
         .and_then(Value::as_str)
         .map(str::to_string);
     let prompt_id = properties.get("prompt_id").and_then(Value::as_str);
-    let model = properties.get("model").and_then(Value::as_str).map(|model| {
-        model.rsplit('/').next().unwrap_or(model).to_string()
-    });
+    let model = properties
+        .get("model")
+        .and_then(Value::as_str)
+        .map(|model| model.rsplit('/').next().unwrap_or(model).to_string());
     let elapsed_ms = value
         .get("milliseconds_since_first_event")
         .and_then(Value::as_u64)
@@ -649,12 +648,18 @@ fn log_identity(metadata: &std::fs::Metadata) -> Option<String> {
         use std::os::windows::fs::MetadataExt;
         match (metadata.volume_serial_number(), metadata.file_index()) {
             (Some(volume), Some(index)) => Some(format!("{volume}:{index}")),
-            _ => metadata.created().ok().map(|created| format!("{created:?}")),
+            _ => metadata
+                .created()
+                .ok()
+                .map(|created| format!("{created:?}")),
         }
     }
     #[cfg(not(any(unix, windows)))]
     {
-        metadata.created().ok().map(|created| format!("{created:?}"))
+        metadata
+            .created()
+            .ok()
+            .map(|created| format!("{created:?}"))
     }
 }
 
@@ -675,10 +680,12 @@ fn prompt_logs_rewound(old: &[PromptLogFingerprint], new: &[PromptLogFingerprint
     if old.is_empty() {
         return false;
     }
-    old.iter().any(|previous| match new.iter().find(|next| next.path == previous.path) {
-        None => true,
-        Some(next) => next.identity != previous.identity || next.size < previous.size,
-    })
+    old.iter().any(
+        |previous| match new.iter().find(|next| next.path == previous.path) {
+            None => true,
+            Some(next) => next.identity != previous.identity || next.size < previous.size,
+        },
+    )
 }
 
 fn zed_counts(value: &Value) -> Option<TokenCounts> {
@@ -711,9 +718,6 @@ fn zed_counts(value: &Value) -> Option<TokenCounts> {
     };
     (!counts.is_zero()).then_some(counts)
 }
-
-
-
 
 fn first_folder_path(value: &str) -> Option<PathBuf> {
     let value = value.trim();
@@ -832,14 +836,10 @@ mod tests {
         assert_eq!(map["today"], times[1]);
     }
 
-
-
     #[test]
     fn prefers_telemetry_completions_over_thread_snapshots() {
-        let root = std::env::temp_dir().join(format!(
-            "llmeter-zed-telemetry-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("llmeter-zed-telemetry-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let db_path = root.join("threads.db");
@@ -890,10 +890,7 @@ mod tests {
         let database = Database::open_in_memory().unwrap();
         let engine = SyncEngine::with_adapters(
             database.clone(),
-            vec![Box::new(ZedAdapter::new(
-                vec![db_path],
-                vec![telemetry],
-            ))],
+            vec![Box::new(ZedAdapter::new(vec![db_path], vec![telemetry]))],
         );
         let first = engine.sync_all().unwrap();
         assert_eq!(first.events_inserted, 2);
@@ -910,7 +907,6 @@ mod tests {
         assert_eq!(overview.output_tokens, 3604 + 39);
         let _ = fs::remove_dir_all(root);
     }
-
 
     fn write_thread_db(path: &std::path::Path, thread_id: &str, request_id: &str, tokens: u64) {
         let connection = Connection::open(path).unwrap();
@@ -948,7 +944,9 @@ mod tests {
         let body = entries
             .iter()
             .map(|(timestamp, session)| {
-                format!("{timestamp} INFO  [agent] Received prompt request for session: {session}\n")
+                format!(
+                    "{timestamp} INFO  [agent] Received prompt request for session: {session}\n"
+                )
             })
             .collect::<String>();
         fs::write(dir.join("Zed.log"), body).unwrap();
@@ -966,11 +964,7 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    fn write_thread_db_with_users(
-        path: &std::path::Path,
-        thread_id: &str,
-        users: &[(&str, u64)],
-    ) {
+    fn write_thread_db_with_users(path: &std::path::Path, thread_id: &str, users: &[(&str, u64)]) {
         let connection = Connection::open(path).unwrap();
         connection
             .execute_batch(
@@ -986,11 +980,7 @@ mod tests {
             .unwrap();
         let requests = users
             .iter()
-            .map(|(id, tokens)| {
-                format!(
-                    r#""{id}":{{"input_tokens":{tokens},"output_tokens":0}}"#
-                )
-            })
+            .map(|(id, tokens)| format!(r#""{id}":{{"input_tokens":{tokens},"output_tokens":0}}"#))
             .collect::<Vec<_>>()
             .join(",");
         let messages = users
@@ -1015,7 +1005,6 @@ mod tests {
             )
             .unwrap();
     }
-
 
     #[test]
     fn empty_telemetry_falls_back_to_sqlite() {
@@ -1043,10 +1032,7 @@ mod tests {
 
     #[test]
     fn sqlite_keeps_threads_missing_from_telemetry() {
-        let root = std::env::temp_dir().join(format!(
-            "llmeter-zed-merge-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("llmeter-zed-merge-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let db_path = root.join("threads.db");
@@ -1073,10 +1059,7 @@ mod tests {
 
     #[test]
     fn undated_telemetry_uses_prompt_log_in_order() {
-        let root = std::env::temp_dir().join(format!(
-            "llmeter-zed-undated-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("llmeter-zed-undated-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         write_zed_log(
@@ -1107,10 +1090,7 @@ mod tests {
 
     #[test]
     fn telemetry_rewind_reuses_first_prompt_time() {
-        let root = std::env::temp_dir().join(format!(
-            "llmeter-zed-rewind-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("llmeter-zed-rewind-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         write_zed_log(
@@ -1143,18 +1123,12 @@ mod tests {
 
     #[test]
     fn prompt_log_growth_is_visible_after_rediscover() {
-        let root = std::env::temp_dir().join(format!(
-            "llmeter-zed-log-growth-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("llmeter-zed-log-growth-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let db_path = root.join("threads.db");
-        write_thread_db_with_users(
-            &db_path,
-            "thread-1",
-            &[("user-old", 10), ("user-new", 20)],
-        );
+        write_thread_db_with_users(&db_path, "thread-1", &[("user-old", 10), ("user-new", 20)]);
         write_zed_log(&root, &[("2026-08-21T19:00:00+08:00", "thread-1")]);
         let telemetry = root.join("telemetry.log");
         fs::write(&telemetry, r#"{"event_type":"App Opened"}"#).unwrap();
@@ -1187,11 +1161,15 @@ mod tests {
         let second = adapter.parse_sqlite(&source).unwrap();
         let old = second
             .iter()
-            .find(|usage| usage.source_event_id.as_deref() == Some("thread:thread-1:request:user-old"))
+            .find(|usage| {
+                usage.source_event_id.as_deref() == Some("thread:thread-1:request:user-old")
+            })
             .unwrap();
         let new = second
             .iter()
-            .find(|usage| usage.source_event_id.as_deref() == Some("thread:thread-1:request:user-new"))
+            .find(|usage| {
+                usage.source_event_id.as_deref() == Some("thread:thread-1:request:user-new")
+            })
             .unwrap();
         assert_eq!(old.timestamp, rfc3339("2026-08-21T19:00:00+08:00"));
         assert_eq!(new.timestamp, rfc3339("2026-08-25T15:14:54+08:00"));
@@ -1200,10 +1178,8 @@ mod tests {
 
     #[test]
     fn same_prompt_id_reuses_prompt_time() {
-        let root = std::env::temp_dir().join(format!(
-            "llmeter-zed-prompt-id-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("llmeter-zed-prompt-id-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         write_zed_log(
@@ -1239,10 +1215,8 @@ mod tests {
 
     #[test]
     fn shrinking_prompt_log_resets_pairing_without_telemetry_rewind() {
-        let root = std::env::temp_dir().join(format!(
-            "llmeter-zed-log-shrink-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("llmeter-zed-log-shrink-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         write_zed_log(
@@ -1316,10 +1290,8 @@ mod tests {
 
     #[test]
     fn sync_engine_truncation_redates_from_first_prompt() {
-        let root = std::env::temp_dir().join(format!(
-            "llmeter-zed-sync-truncate-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("llmeter-zed-sync-truncate-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         write_zed_log(
@@ -1361,8 +1333,4 @@ mod tests {
         assert_eq!(recent[0].timestamp, rfc3339("2026-08-21T19:00:00+08:00"));
         let _ = fs::remove_dir_all(root);
     }
-
-
-
 }
-

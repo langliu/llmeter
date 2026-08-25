@@ -600,7 +600,6 @@ pub(crate) fn provider_card_columns(width: f32) -> u16 {
     ((width + GAP) / (MIN_COLUMN + GAP)).floor().clamp(1.0, 4.0) as u16
 }
 
-
 fn share_card(
     title: String,
     percent: f64,
@@ -2042,7 +2041,6 @@ mod tests {
         assert_eq!(provider_card_columns(676.0), 4);
         assert_eq!(provider_card_columns(1600.0), 4);
     }
-
 
     #[test]
     fn heatmap_hit_index_maps_cells_and_skips_gaps() {

@@ -144,5 +144,4 @@ mod tests {
         let line = br#"{"type":"message","message":{"role":"toolResult","details":{"response":{"model":"gpt-5.6-luna","usage":{"inputTokens":24826,"outputTokens":628,"totalTokens":29038}}}}}"#;
         assert!(adapter.parse_line(&source, line).unwrap().is_none());
     }
-
 }

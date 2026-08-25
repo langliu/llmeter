@@ -616,27 +616,6 @@ pub struct UsagePricingInput {
     pub estimated_cost_usd: Option<f64>,
 }
 
-fn existing_event_ids(
-    transaction: &Transaction<'_>,
-    events: &[UsageEvent],
-) -> Result<HashSet<String>, StorageError> {
-    let mut existing = HashSet::new();
-    for chunk in events.chunks(400) {
-        let placeholders = std::iter::repeat_n("?", chunk.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!("SELECT id FROM usage_events WHERE id IN ({placeholders})");
-        let mut statement = transaction.prepare(&sql)?;
-        let ids = statement.query_map(
-            rusqlite::params_from_iter(chunk.iter().map(|event| event.id.as_str())),
-            |row| row.get::<_, String>(0),
-        )?;
-        for id in ids {
-            existing.insert(id?);
-        }
-    }
-    Ok(existing)
-}
 
 fn to_sqlite_i64(value: u64) -> Result<i64, StorageError> {
     i64::try_from(value).map_err(|_| StorageError::NumericOverflow)
