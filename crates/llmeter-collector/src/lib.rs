@@ -3,6 +3,8 @@ pub mod hooks;
 pub mod limits;
 pub mod parsers;
 pub mod pricing;
+pub mod fx;
+
 pub mod providers;
 pub mod sync;
 pub mod watcher;

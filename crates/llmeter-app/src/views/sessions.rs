@@ -119,7 +119,7 @@ pub(crate) fn sessions_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
                         let session_index = *session_indices.get(position)?;
                         let session = view.snapshot.sessions.get(session_index)?.clone();
                         let copied = view.is_copied(&session);
-                        Some(session_row(session, copied, position == 0, p, cx))
+                        Some(session_row(view, session, copied, position == 0, p, cx))
                     })
                     .collect()
             },
@@ -327,6 +327,7 @@ fn project_menu_item(
 }
 
 fn session_row(
+    view: &LLMeterView,
     session: SessionSummary,
     copied: bool,
     first: bool,
@@ -418,9 +419,9 @@ fn session_row(
                     p,
                 ))
                 .child(metric_cell(
-                    format_cost(estimated_cost_usd),
+                    view.format_cost(estimated_cost_usd),
                     t!("sessions.cost").to_string(),
-                    72.0,
+                    144.0,
                     mono_font.clone(),
                     p,
                 ))
@@ -468,9 +469,11 @@ fn metric_cell(
 ) -> impl IntoElement {
     v_flex()
         .w(px(width))
+        .flex_shrink_0()
         .items_center()
         .child(
             div()
+                .whitespace_nowrap()
                 .text_base()
                 .font_family(mono_font)
                 .font_weight(FontWeight::SEMIBOLD)
@@ -546,11 +549,6 @@ fn trim_decimal(value: f64, suffix: &str) -> String {
     }
 }
 
-fn format_cost(value: Option<f64>) -> String {
-    value
-        .map(|value| format!("${value:.2}"))
-        .unwrap_or_else(|| "$0.00".into())
-}
 
 fn format_session_time(timestamp: chrono::DateTime<chrono::Utc>) -> String {
     let local = timestamp.with_timezone(&Local);

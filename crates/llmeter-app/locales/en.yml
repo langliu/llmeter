@@ -176,6 +176,8 @@ settings:
   theme_subtitle: "Choose how LLMeter displays in the dashboard."
   language: "Language"
   language_subtitle: "\"System\" follows this machine's language."
+  currency: "Currency"
+  currency_subtitle: "Convert displayed costs from USD. Prices stay stored in USD."
   theme_light: "Light"
   theme_dark: "Dark"
   system: "System"

@@ -17,6 +17,7 @@ use llmeter_storage::{SessionSummary, UsageRepository};
 use rust_i18n::t;
 
 use crate::{
+    currency::{self, CURRENCY_SETTING, DisplayCurrency},
     i18n::{self, LocalePreference},
     state::{OverviewRangeSnapshot, UiSnapshot, local_midnight},
     views::dashboard::{DashboardPage, HeatmapView, dashboard},
@@ -166,6 +167,8 @@ pub struct LLMeterView {
     pub(crate) copied_session: Option<String>,
     pub(crate) theme_pref: ThemePreference,
     pub(crate) locale_pref: LocalePreference,
+    pub(crate) currency: DisplayCurrency,
+    pub(crate) fx_rates: llmeter_collector::fx::ExchangeRates,
     pub(crate) trae_cn_usage_enabled: bool,
     pub(crate) settings_section: SettingsSection,
     pub(crate) heatmap: Entity<HeatmapView>,
@@ -201,6 +204,12 @@ impl LLMeterView {
             .ok()
             .flatten()
             .is_some_and(|value| matches!(value.trim(), "1" | "true"));
+        let currency = DisplayCurrency::from_setting(
+            repository.database().get_setting(CURRENCY_SETTING).ok().flatten(),
+        );
+        let fx_rates = llmeter_collector::fx::load_cached_exchange_rates(
+            llmeter_collector::hooks::data_dir().join("cache"),
+        );
         i18n::apply(locale_pref);
         let detections = collector.detect_all();
         let today = Local::now().date_naive();
@@ -279,6 +288,8 @@ impl LLMeterView {
             theme_pref,
             locale_pref,
             trae_cn_usage_enabled,
+            currency,
+            fx_rates,
             settings_section: SettingsSection::default(),
             heatmap: cx.new(|_| HeatmapView::default()),
             overview_period,
@@ -341,6 +352,24 @@ impl LLMeterView {
         self.apply_theme(window, cx);
         cx.notify();
     }
+    pub(crate) fn set_currency(&mut self, currency: DisplayCurrency, cx: &mut Context<Self>) {
+        if self.currency == currency {
+            return;
+        }
+        self.currency = currency;
+        let database = self.collector.engine().database().clone();
+        let _ = database.set_setting(CURRENCY_SETTING, currency.as_str());
+        cx.notify();
+    }
+
+    pub(crate) fn format_cost(&self, usd: Option<f64>) -> String {
+        currency::format_cost(usd, self.currency, &self.fx_rates)
+    }
+
+    pub(crate) fn format_amount(&self, usd: f64) -> String {
+        currency::format_amount(usd, self.currency, &self.fx_rates)
+    }
+
 
     pub(crate) fn set_locale_preference(
         &mut self,
@@ -617,6 +646,9 @@ impl LLMeterView {
                 CollectorEvent::PricingUpdated => {
                     pending_reload.get_or_insert(None);
                 }
+                CollectorEvent::FxUpdated(rates) => {
+                    self.fx_rates = rates;
+                }
             }
             changed = true;
         }
@@ -839,7 +871,8 @@ impl Render for LLMeterView {
 #[cfg(test)]
 mod tests {
     use super::{
-        LLMeterView, LocalePreference, OverviewPeriod, OverviewProviderFilter, SnapshotUpdate,
+        CURRENCY_SETTING, DisplayCurrency, LLMeterView, LocalePreference, OverviewPeriod,
+        OverviewProviderFilter, SnapshotUpdate,
     };
     use crate::views::dashboard::DashboardPage;
     use crate::views::sessions::SessionProviderFilter;
@@ -1005,6 +1038,47 @@ mod tests {
             assert_eq!(view.theme_pref, super::ThemePreference::Light);
         });
     }
+
+    #[gpui::test]
+    fn currency_preference_converts_and_persists(cx: &mut TestAppContext) {
+        let database = Database::open_in_memory().expect("in-memory database");
+        let collector = Collector::new(database.clone());
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|window, cx| LLMeterView::new(collector, window, cx));
+
+        view.update(cx, |view, _| {
+            view.fx_rates = llmeter_collector::fx::ExchangeRates::default();
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.currency, DisplayCurrency::Usd);
+            assert_eq!(view.format_cost(Some(1.0)), "$ 1.00");
+            assert_eq!(view.format_amount(1.0), "$ 1.00");
+        });
+
+        view.update(cx, |view, cx| {
+            view.set_currency(DisplayCurrency::Cny, cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.currency, DisplayCurrency::Cny);
+            assert_eq!(view.format_amount(1.0), "¥ 7.20");
+        });
+        assert_eq!(
+            database.get_setting(CURRENCY_SETTING).unwrap().as_deref(),
+            Some("CNY")
+        );
+
+        let collector = Collector::new(database.clone());
+        let (restored, cx) =
+            cx.add_window_view(|window, cx| LLMeterView::new(collector, window, cx));
+        restored.update(cx, |view, _| {
+            view.fx_rates = llmeter_collector::fx::ExchangeRates::default();
+        });
+        restored.read_with(cx, |view, _| {
+            assert_eq!(view.currency, DisplayCurrency::Cny);
+            assert_eq!(view.format_amount(1.0), "¥ 7.20");
+        });
+    }
+
 
     #[test]
     fn locale_preference_from_setting_parses_values() {

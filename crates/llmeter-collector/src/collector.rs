@@ -27,6 +27,7 @@ use crate::{
 pub enum CollectorEvent {
     UsageChanged(SyncResult),
     PricingUpdated,
+    FxUpdated(crate::fx::ExchangeRates),
 }
 
 #[derive(Clone)]
@@ -112,6 +113,7 @@ impl Collector {
                     Ok(_) => {}
                     Err(error) => warn!(error = %error, "pricing refresh failed"),
                 }
+                refresh_exchange_rates(&collector);
 
                 let Ok((mut watcher, receiver)) = watcher::start(&[]) else {
                     warn!(
@@ -120,6 +122,7 @@ impl Collector {
                     let _ = collector.sync_now();
                     loop {
                         thread::sleep(Duration::from_secs(300));
+                        refresh_exchange_rates(&collector);
                         let _ = collector.sync_now();
                     }
                 };
@@ -145,6 +148,7 @@ impl Collector {
                         Ok(Err(error)) => warn!(error = %error, "filesystem watcher event failed"),
                         Err(RecvTimeoutError::Timeout) => {
                             refresh_watches(&mut watcher, &mut watched, &collector.engine);
+                            refresh_exchange_rates(&collector);
                             let _ = collector.sync_now();
                         }
                         Err(RecvTimeoutError::Disconnected) => break,
@@ -152,6 +156,18 @@ impl Collector {
                 }
             })
             .expect("failed to start collector thread");
+    }
+}
+
+fn refresh_exchange_rates(collector: &Collector) {
+    match crate::fx::refresh_exchange_rates(hooks::data_dir().join("cache")) {
+        Ok(rates) if rates.source == crate::fx::FxSource::Upstream => {
+            let _ = collector
+                .event_sender
+                .send(CollectorEvent::FxUpdated(rates));
+        }
+        Ok(_) => {}
+        Err(error) => warn!(error = %error, "exchange-rate refresh failed"),
     }
 }
 

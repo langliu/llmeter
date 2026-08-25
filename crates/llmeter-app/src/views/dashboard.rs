@@ -76,7 +76,7 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
 
     let mut provider_rows = div().flex().flex_col().gap_2();
     for provider in &snapshot.providers {
-        provider_rows = provider_rows.child(provider_row(provider, p));
+        provider_rows = provider_rows.child(provider_row(provider, view, p));
     }
     if snapshot.providers.is_empty() {
         provider_rows = provider_rows.child(empty_state(t!("overview.no_usage").to_string(), p));
@@ -84,7 +84,7 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
 
     let mut model_rows = div().flex().flex_col().gap_2();
     for model in &snapshot.models {
-        model_rows = model_rows.child(model_row(model, p));
+        model_rows = model_rows.child(model_row(model, view, p));
     }
     if snapshot.models.is_empty() {
         model_rows = model_rows.child(empty_state(t!("overview.models_pending").to_string(), p));
@@ -101,7 +101,7 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
 
     let mut project_rows = div().flex().flex_col();
     for project in &snapshot.projects {
-        project_rows = project_rows.child(project_row(project, p));
+        project_rows = project_rows.child(project_row(project, view, p));
     }
     if snapshot.projects.is_empty() {
         project_rows =
@@ -417,13 +417,14 @@ fn overview_page(
         OverviewProviderFilter::All => Some(all_model_detail(
             &all_models,
             range.overview.total_tokens,
+            view,
             p,
         )),
         OverviewProviderFilter::Provider(selected) => range
             .providers
             .iter()
             .find(|usage| usage.provider == selected)
-            .map(|usage| provider_model_detail(usage, &range.models, p)),
+            .map(|usage| provider_model_detail(usage, &range.models, view, p)),
     };
 
     let hero = glass_card(p)
@@ -455,7 +456,7 @@ fn overview_page(
                         .text_base()
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(p.success)
-                        .child(format_cost(range.overview.estimated_cost_usd)),
+                        .child(view.format_cost(range.overview.estimated_cost_usd)),
                 ),
         )
         .child(div().pt_6().child(share_bar))
@@ -488,7 +489,7 @@ fn overview_page(
                         period = view.overview_period.label()
                     )
                     .to_string(),
-                    trend(&range.daily, p),
+                    trend(&range.daily, view, p),
                     p,
                 )),
         )
@@ -705,6 +706,7 @@ fn aggregate_model_usage(models: &[ModelUsage]) -> Vec<DetailModelUsage> {
 fn all_model_detail(
     models: &[DetailModelUsage],
     total_tokens: u64,
+    view: &LLMeterView,
     p: Palette,
 ) -> gpui::AnyElement {
     div()
@@ -735,7 +737,7 @@ fn all_model_detail(
         .child(
             div()
                 .pt_2()
-                .child(model_detail_rows(models, total_tokens, rgb(0x16a34a), p)),
+                .child(model_detail_rows(models, total_tokens, rgb(0x16a34a), view, p)),
         )
         .into_any_element()
 }
@@ -759,6 +761,7 @@ fn all_models_icon(size: f32, color: Hsla) -> gpui::AnyElement {
 fn provider_model_detail(
     provider: &ProviderUsage,
     models: &[ModelUsage],
+    view: &LLMeterView,
     p: Palette,
 ) -> gpui::AnyElement {
     let provider_models = models
@@ -781,6 +784,7 @@ fn provider_model_detail(
         &provider_models,
         provider.total_tokens,
         provider_color(provider.provider),
+        view,
         p,
     );
 
@@ -824,6 +828,7 @@ fn model_detail_rows(
     models: &[DetailModelUsage],
     total_tokens: u64,
     color: Rgba,
+    view: &LLMeterView,
     p: Palette,
 ) -> gpui::AnyElement {
     let mut rows = div().flex().flex_col();
@@ -866,10 +871,12 @@ fn model_detail_rows(
                                 )
                                 .child(
                                     div()
-                                        .w(px(76.0))
+                                        .w(px(120.0))
+                                        .flex_shrink_0()
+                                        .whitespace_nowrap()
                                         .text_right()
                                         .text_color(p.muted_foreground)
-                                        .child(format_cost(model.estimated_cost_usd)),
+                                        .child(view.format_cost(model.estimated_cost_usd)),
                                 )
                                 .child(
                                     div()
@@ -1091,7 +1098,7 @@ fn panel(title: String, content: impl IntoElement, p: Palette) -> impl IntoEleme
         )
 }
 
-fn provider_row(provider: &ProviderUsage, p: Palette) -> impl IntoElement {
+fn provider_row(provider: &ProviderUsage, view: &LLMeterView, p: Palette) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
@@ -1134,7 +1141,7 @@ fn provider_row(provider: &ProviderUsage, p: Palette) -> impl IntoElement {
                             div()
                                 .text_xs()
                                 .text_color(p.muted_foreground)
-                                .child(format_cost(provider.estimated_cost_usd)),
+                                .child(view.format_cost(provider.estimated_cost_usd)),
                         ),
                 ),
         )
@@ -1209,7 +1216,7 @@ fn activity_row(activity: &RecentActivity, p: Palette) -> impl IntoElement {
         .child(token_pill(activity.total_tokens, p))
 }
 
-fn project_row(project: &ProjectUsage, p: Palette) -> impl IntoElement {
+fn project_row(project: &ProjectUsage, view: &LLMeterView, p: Palette) -> impl IntoElement {
     div()
         .flex()
         .items_center()
@@ -1234,12 +1241,12 @@ fn project_row(project: &ProjectUsage, p: Palette) -> impl IntoElement {
                 .child(format!(
                     "{} · {}",
                     format_tokens(project.total_tokens),
-                    format_cost(project.estimated_cost_usd)
+                    view.format_cost(project.estimated_cost_usd)
                 )),
         )
 }
 
-fn model_row(model: &ModelUsage, p: Palette) -> impl IntoElement {
+fn model_row(model: &ModelUsage, view: &LLMeterView, p: Palette) -> impl IntoElement {
     div()
         .flex()
         .items_center()
@@ -1284,7 +1291,7 @@ fn model_row(model: &ModelUsage, p: Palette) -> impl IntoElement {
                 .items_center()
                 .gap_2()
                 .child(token_pill(model.total_tokens, p))
-                .child(pricing_pill(model.estimated_cost_usd, p)),
+                .child(pricing_pill(model.estimated_cost_usd, view, p)),
         )
 }
 
@@ -1320,10 +1327,10 @@ fn token_pill(value: u64, p: Palette) -> impl IntoElement {
         .child(format_tokens(value))
 }
 
-fn pricing_pill(value: Option<f64>, p: Palette) -> impl IntoElement {
+fn pricing_pill(value: Option<f64>, view: &LLMeterView, p: Palette) -> impl IntoElement {
     let (label, background, foreground): (String, gpui::Hsla, gpui::Hsla) = match value {
         Some(value) => (
-            format!("$ {:.2}", value),
+            view.format_amount(value),
             rgb(0x22c55e).opacity(0.12).into(),
             p.success,
         ),
@@ -1738,7 +1745,7 @@ fn heatmap_level_color(level: usize, p: Palette) -> gpui::Hsla {
     }
 }
 
-fn trend(daily: &[llmeter_storage::DailyUsage], p: Palette) -> gpui::AnyElement {
+fn trend(daily: &[llmeter_storage::DailyUsage], view: &LLMeterView, p: Palette) -> gpui::AnyElement {
     if daily.is_empty() {
         return div()
             .size_full()
@@ -1759,7 +1766,7 @@ fn trend(daily: &[llmeter_storage::DailyUsage], p: Palette) -> gpui::AnyElement 
         } else {
             0.01
         });
-        let tooltip_text = trend_tooltip_text(day);
+        let tooltip_text = trend_tooltip_text(day, view);
         chart = chart.child(
             div()
                 .id(("trend-bar", index))
@@ -1794,10 +1801,10 @@ fn trend(daily: &[llmeter_storage::DailyUsage], p: Palette) -> gpui::AnyElement 
         .into_any_element()
 }
 
-fn trend_tooltip_text(day: &llmeter_storage::DailyUsage) -> String {
+fn trend_tooltip_text(day: &llmeter_storage::DailyUsage, view: &LLMeterView) -> String {
     let mut text = format!("{} · {} tokens", day.day, format_tokens(day.total_tokens));
     if let Some(cost) = day.estimated_cost_usd {
-        text.push_str(&format!(" · ${cost:.2}"));
+        text.push_str(&format!(" · {}", view.format_amount(cost)));
     }
     text
 }
@@ -2007,11 +2014,7 @@ fn format_heatmap_tokens(value: u64) -> String {
     }
 }
 
-fn format_cost(value: Option<f64>) -> String {
-    value
-        .map(|value| format!("$ {:.2}", value))
-        .unwrap_or_else(|| t!("overview.unpriced").to_string())
-}
+
 
 #[cfg(test)]
 mod tests {

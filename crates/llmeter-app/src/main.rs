@@ -1,5 +1,6 @@
 mod app;
 mod assets;
+mod currency;
 mod i18n;
 mod state;
 mod views;

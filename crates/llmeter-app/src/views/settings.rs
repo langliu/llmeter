@@ -14,6 +14,7 @@ use rust_i18n::t;
 
 use crate::{
     app::{LLMeterView, ThemePreference},
+    currency::DisplayCurrency,
     i18n::LocalePreference,
     views::palette::Palette,
 };
@@ -212,6 +213,13 @@ fn appearance_card(
             false,
             p,
         ))
+        .child(setting_row(
+            t!("settings.currency").to_string(),
+            t!("settings.currency_subtitle").to_string(),
+            Some(currency_control(view, cx).into_any_element()),
+            false,
+            p,
+        ))
 }
 
 fn locale_control(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl IntoElement {
@@ -229,6 +237,25 @@ fn locale_control(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Int
             && let Some(preference) = LocalePreference::ALL.get(index).copied()
         {
             view.set_locale_preference(preference, cx);
+        }
+    }))
+}
+
+fn currency_control(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl IntoElement {
+    let selected = view.currency;
+    let mut group = ButtonGroup::new("currency-preference").compact();
+    for (index, currency) in DisplayCurrency::ALL.into_iter().enumerate() {
+        group = group.child(
+            Button::new(("currency-preference", index))
+                .label(currency.as_str())
+                .selected(selected == currency),
+        );
+    }
+    group.on_click(cx.listener(|view, clicks: &Vec<usize>, _, cx| {
+        if let Some(&index) = clicks.first()
+            && let Some(currency) = DisplayCurrency::ALL.get(index).copied()
+        {
+            view.set_currency(currency, cx);
         }
     }))
 }

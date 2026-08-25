@@ -176,6 +176,8 @@ settings:
   theme_subtitle: "选择 LLMeter 在仪表盘中的显示方式。"
   language: "语言"
   language_subtitle: "使用“系统”时会默认跟随本机语言。"
+  currency: "显示货币"
+  currency_subtitle: "费用按美元汇率换算后显示，库内费用仍存美元。"
   theme_light: "浅色"
   theme_dark: "深色"
   system: "系统"
