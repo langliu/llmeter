@@ -438,7 +438,6 @@ fn overview_page(
 
     let hero = glass_card(p)
         .child(overview_period_filter(view, cx))
-        .flex_1()
         .child(
             div()
                 .w_full()

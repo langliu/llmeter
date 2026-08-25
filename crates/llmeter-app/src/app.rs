@@ -183,7 +183,9 @@ pub struct LLMeterView {
     pub(crate) session_search: Entity<InputState>,
     pub(crate) session_scroll: VirtualListScrollHandle,
     pub(crate) session_project_open: bool,
+    pub(crate) session_provider_open: bool,
     pub(crate) copied_session: Option<String>,
+    copied_reset_task: Option<gpui::Task<()>>,
     pub(crate) theme_pref: ThemePreference,
     pub(crate) locale_pref: LocalePreference,
     pub(crate) currency: DisplayCurrency,
@@ -327,7 +329,9 @@ impl LLMeterView {
             session_search,
             session_scroll: VirtualListScrollHandle::new(),
             session_project_open: false,
+            session_provider_open: false,
             copied_session: None,
+            copied_reset_task: None,
             theme_pref,
             locale_pref,
             trae_cn_usage_enabled,
@@ -467,6 +471,7 @@ impl LLMeterView {
         if self.active_page != page {
             self.active_page = page;
             self.session_project_open = false;
+            self.session_provider_open = false;
             if page == DashboardPage::Limits {
                 self.start_limit_refresh();
             }
@@ -608,7 +613,9 @@ impl LLMeterView {
         filter: SessionProviderFilter,
         cx: &mut Context<Self>,
     ) {
+        self.session_provider_open = false;
         if self.session_provider == filter {
+            cx.notify();
             return;
         }
         self.session_provider = filter;
@@ -703,6 +710,7 @@ impl LLMeterView {
     pub(crate) fn set_session_project(&mut self, project: Option<String>, cx: &mut Context<Self>) {
         self.session_project = project;
         self.session_project_open = false;
+        self.session_provider_open = false;
         self.reset_session_scroll();
         cx.notify();
     }
@@ -713,6 +721,13 @@ impl LLMeterView {
 
     pub(crate) fn toggle_session_projects(&mut self, cx: &mut Context<Self>) {
         self.session_project_open = !self.session_project_open;
+        self.session_provider_open = false;
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_session_providers(&mut self, cx: &mut Context<Self>) {
+        self.session_provider_open = !self.session_provider_open;
+        self.session_project_open = false;
         cx.notify();
     }
 
@@ -721,7 +736,19 @@ impl LLMeterView {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(command));
-        self.copied_session = Some(session_key(session));
+        let key = session_key(session);
+        self.copied_session = Some(key.clone());
+        self.copied_reset_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_secs(2))
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.copied_session.as_deref() == Some(key.as_str()) {
+                    view.copied_session = None;
+                    cx.notify();
+                }
+            });
+        }));
         cx.notify();
     }
 

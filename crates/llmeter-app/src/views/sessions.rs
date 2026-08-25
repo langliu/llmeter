@@ -100,6 +100,7 @@ pub(crate) fn sessions_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
     let total_count = view.snapshot.sessions.len();
     let projects = view.session_projects();
     let project_open = view.session_project_open;
+    let provider_open = view.session_provider_open;
     let selected_project = view.session_project.clone();
 
     let rows: AnyElement = if session_indices.is_empty() {
@@ -172,7 +173,7 @@ pub(crate) fn sessions_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
                 .gap_2()
                 .flex_wrap()
                 .items_center()
-                .child(provider_filter(view.session_provider, cx))
+                .child(provider_filter(view.session_provider, provider_open, p, cx))
                 .child(range_filter(view.session_range, cx))
                 .child(project_filter(
                     selected_project.as_deref(),
@@ -203,25 +204,85 @@ pub(crate) fn sessions_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
 
 fn provider_filter(
     selected: SessionProviderFilter,
+    open: bool,
+    p: Palette,
     cx: &mut Context<LLMeterView>,
 ) -> impl IntoElement {
-    let mut group = ButtonGroup::new("session-provider-filter")
+    v_flex()
+        .relative()
+        .child(
+            Button::new("session-provider-filter")
+                .icon(IconName::Bot)
+                .label(selected.label())
+                .compact()
+                .on_click(cx.listener(|view, _, _, cx| view.toggle_session_providers(cx))),
+        )
+        .when(open, |this| {
+            let mut menu = v_flex()
+                .absolute()
+                .top_full()
+                .left_0()
+                .mt_1()
+                .min_w(px(180.0))
+                .max_h(px(320.0))
+                .id("session-provider-menu")
+                .overflow_y_scroll()
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .rounded_lg()
+                .border_1()
+                .border_color(p.border)
+                .bg(p.popover)
+                .shadow_sm()
+                .p_1()
+                .occlude();
+            for (index, filter) in SessionProviderFilter::ALL.into_iter().enumerate() {
+                menu = menu.child(provider_menu_item(filter, selected == filter, index, p, cx));
+            }
+            this.child(deferred(menu).with_priority(1))
+        })
+}
+
+fn provider_menu_item(
+    filter: SessionProviderFilter,
+    selected: bool,
+    index: usize,
+    p: Palette,
+    cx: &mut Context<LLMeterView>,
+) -> impl IntoElement {
+    let label = filter.label();
+    Button::new(("session-provider-item", index))
+        .ghost()
         .compact()
-        .outline();
-    for (index, filter) in SessionProviderFilter::ALL.into_iter().enumerate() {
-        group = group.child(
-            Button::new(("session-provider", index))
-                .label(filter.label())
-                .selected(selected == filter),
-        );
-    }
-    group.on_click(cx.listener(|view, clicks: &Vec<usize>, _, cx| {
-        if let Some(&index) = clicks.first()
-            && let Some(filter) = SessionProviderFilter::ALL.get(index).copied()
-        {
+        .w_full()
+        .justify_start()
+        .selected(selected)
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .when_some(
+                    match filter {
+                        SessionProviderFilter::Provider(provider) => Some(provider),
+                        SessionProviderFilter::All => None,
+                    },
+                    |this, provider| this.child(provider_logo(provider, 14.0)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_left()
+                        .text_color(if selected {
+                            p.foreground
+                        } else {
+                            p.muted_foreground
+                        })
+                        .child(label),
+                ),
+        )
+        .on_click(cx.listener(move |view, _, _, cx| {
             view.set_session_provider(filter, cx);
-        }
-    }))
+        }))
 }
 
 fn range_filter(selected: SessionRangeFilter, cx: &mut Context<LLMeterView>) -> impl IntoElement {
