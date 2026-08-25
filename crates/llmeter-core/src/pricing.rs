@@ -46,6 +46,7 @@ impl PricingSource {
 #[derive(Clone, Debug, Default)]
 pub struct PricingCatalog {
     rates: HashMap<String, ModelRates>,
+    suffix_index: HashMap<String, Vec<(String, ModelRates)>>,
     source: PricingSource,
 }
 
@@ -122,6 +123,7 @@ impl PricingCatalog {
     pub fn fallback() -> Self {
         Self {
             rates: HashMap::new(),
+            suffix_index: HashMap::new(),
             source: PricingSource::Fallback,
         }
     }
@@ -129,7 +131,11 @@ impl PricingCatalog {
     pub fn from_litellm_json(value: &Value, source: PricingSource) -> Self {
         let mut rates = HashMap::new();
         let Some(object) = value.as_object() else {
-            return Self { rates, source };
+            return Self {
+                rates,
+                suffix_index: HashMap::new(),
+                source,
+            };
         };
         for (name, entry) in object {
             if name.starts_with('_') {
@@ -139,7 +145,12 @@ impl PricingCatalog {
                 rates.insert(name.to_ascii_lowercase(), rate);
             }
         }
-        Self { rates, source }
+        let suffix_index = suffix_index_from_rates(&rates);
+        Self {
+            rates,
+            suffix_index,
+            source,
+        }
     }
 
     pub fn source(&self) -> PricingSource {
@@ -200,19 +211,17 @@ impl PricingCatalog {
         }
         fallback_estimate(provider, model, counts)
     }
-
     fn lookup_prefixed(&self, model: &str) -> Option<ModelRates> {
-        let suffix = format!("/{model}");
         let mut best_key: Option<&str> = None;
-        for key in self.rates.keys() {
-            if key.len() > suffix.len()
-                && key.ends_with(&suffix)
-                && better_prefix_key(key, best_key)
-            {
+        let mut best_rates = None;
+        let candidates = self.suffix_index.get(model)?;
+        for (key, rates) in candidates {
+            if better_prefix_key(key, best_key) {
                 best_key = Some(key);
+                best_rates = Some(*rates);
             }
         }
-        best_key.and_then(|key| self.rates.get(key)).copied()
+        best_rates
     }
 
     fn lookup_contained(&self, model: &str) -> Option<ModelRates> {
@@ -339,6 +348,21 @@ fn normalize_model(model: &str) -> String {
     }
     let normalized = normalize_claude_name(&normalized);
     strip_reasoning_suffix(&normalized)
+}
+
+fn suffix_index_from_rates(
+    rates: &HashMap<String, ModelRates>,
+) -> HashMap<String, Vec<(String, ModelRates)>> {
+    let mut index = HashMap::<String, Vec<(String, ModelRates)>>::new();
+    for (name, rate) in rates {
+        if let Some((_, suffix)) = name.rsplit_once('/') {
+            index
+                .entry(suffix.to_string())
+                .or_default()
+                .push((name.clone(), *rate));
+        }
+    }
+    index
 }
 
 fn normalize_claude_name(model: &str) -> String {

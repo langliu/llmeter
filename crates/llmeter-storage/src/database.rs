@@ -1,10 +1,11 @@
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
 
 use llmeter_core::{FileCursor, Provider, TokenCounts, UsageEvent};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
 
 use crate::migrations;
@@ -49,6 +50,7 @@ impl Database {
             std::fs::create_dir_all(parent)?;
         }
         let connection = Connection::open(&path)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
         migrations::run(&connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -58,6 +60,7 @@ impl Database {
 
     pub fn open_in_memory() -> Result<Self, StorageError> {
         let connection = Connection::open_in_memory()?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
         migrations::run(&connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -135,10 +138,12 @@ impl Database {
         &self,
         events: &[UsageEvent],
     ) -> Result<UpsertSummary, StorageError> {
+        if events.is_empty() {
+            return Ok(UpsertSummary::default());
+        }
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
-        let mut existing_statement =
-            transaction.prepare("SELECT 1 FROM usage_events WHERE id = ?1 LIMIT 1")?;
+        let existing = existing_event_ids(&transaction, events)?;
         let mut statement = transaction.prepare(
             "INSERT INTO usage_events (
                 id, provider, model, session_id, project_path, project_name, timestamp,
@@ -166,10 +171,7 @@ impl Database {
         )?;
         let mut summary = UpsertSummary::default();
         for event in events {
-            let exists = existing_statement
-                .query_row(params![event.id], |_| Ok(()))
-                .optional()?
-                .is_some();
+            let exists = existing.contains(&event.id);
             statement.execute(params![
                 event.id,
                 event.provider.as_str(),
@@ -204,7 +206,6 @@ impl Database {
             }
         }
         drop(statement);
-        drop(existing_statement);
         transaction.commit()?;
         Ok(summary)
     }
@@ -419,6 +420,28 @@ pub struct UsagePricingInput {
     pub model: Option<String>,
     pub counts: TokenCounts,
     pub estimated_cost_usd: Option<f64>,
+}
+
+fn existing_event_ids(
+    transaction: &Transaction<'_>,
+    events: &[UsageEvent],
+) -> Result<HashSet<String>, StorageError> {
+    let mut existing = HashSet::new();
+    for chunk in events.chunks(400) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT id FROM usage_events WHERE id IN ({placeholders})");
+        let mut statement = transaction.prepare(&sql)?;
+        let ids = statement.query_map(
+            rusqlite::params_from_iter(chunk.iter().map(|event| event.id.as_str())),
+            |row| row.get::<_, String>(0),
+        )?;
+        for id in ids {
+            existing.insert(id?);
+        }
+    }
+    Ok(existing)
 }
 
 fn to_sqlite_i64(value: u64) -> Result<i64, StorageError> {

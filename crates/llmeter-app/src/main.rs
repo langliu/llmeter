@@ -80,7 +80,6 @@ fn main() -> Result<()> {
     let data_dir = prepare_data_dir()?;
     let database = Database::open(data_dir.join("llmeter.db"))?;
     let collector = Collector::new(database);
-    collector.start_background();
 
     let application = gpui_platform::application().with_assets(assets::Assets);
     application.run(move |cx: &mut App| {

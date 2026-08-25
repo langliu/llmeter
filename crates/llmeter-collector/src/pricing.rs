@@ -51,9 +51,9 @@ pub fn refresh_pricing_with(
     let path = cache_path(cache_dir);
     let catalog = load_or_fetch_catalog(&path, fetch)?;
     install_catalog(catalog.clone());
-    let repriced = match database {
-        Some(database) => reprice_events(database)?,
-        None => 0,
+    let repriced = match (database, catalog.source()) {
+        (Some(database), PricingSource::Upstream) => reprice_events(database)?,
+        _ => 0,
     };
     info!(
         source = catalog.source().as_str(),

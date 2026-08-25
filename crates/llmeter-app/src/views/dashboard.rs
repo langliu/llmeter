@@ -17,7 +17,7 @@ use llmeter_storage::{DailyModelUsage, ModelUsage, ProjectUsage, ProviderUsage, 
 use rust_i18n::t;
 
 use crate::{
-    app::{LLMeterView, OverviewPeriod},
+    app::{LLMeterView, OverviewPeriod, OverviewProviderFilter},
     state::UiSnapshot,
     views::{
         limits::limits_page, palette::Palette, provider_brand::provider_logo,
@@ -83,7 +83,7 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
     }
 
     let mut model_rows = div().flex().flex_col().gap_2();
-    for model in snapshot.models.iter().take(6) {
+    for model in &snapshot.models {
         model_rows = model_rows.child(model_row(model, p));
     }
     if snapshot.models.is_empty() {
@@ -100,7 +100,7 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
     }
 
     let mut project_rows = div().flex().flex_col();
-    for project in snapshot.projects.iter().take(6) {
+    for project in &snapshot.projects {
         project_rows = project_rows.child(project_row(project, p));
     }
     if snapshot.projects.is_empty() {
@@ -297,7 +297,7 @@ fn overview_page(
                     p,
                 ))
                 .child(stat_chip(
-                    format_tokens(snapshot.sessions.len() as u64),
+                    format_tokens(snapshot.session_count),
                     t!("overview.conversations").to_string(),
                     p,
                 )),
@@ -355,36 +355,71 @@ fn overview_page(
         );
     }
     let all_models = aggregate_model_usage(&range.models);
-    let mut provider_cards = div().flex().flex_wrap().gap_3();
+    let card_columns = provider_card_columns(view.overview_cards_width);
+    let view_entity = cx.entity();
+    let mut provider_cards = div()
+        .id("overview-provider-grid")
+        .w_full()
+        .grid()
+        .grid_cols(card_columns)
+        .gap_3();
     provider_cards = provider_cards.child(share_card(
         t!("overview.share_all").to_string(),
         100.0,
         all_models.len(),
         None,
         p,
-        view.overview_provider.is_none(),
+        view.overview_provider == OverviewProviderFilter::All,
         cx,
     ));
     for provider in &range.providers {
         let percent = provider.total_tokens as f64 / provider_total as f64 * 100.0;
         provider_cards = provider_cards.child(share_card(
-            provider.provider.to_string(),
+            provider.provider.display_name().to_string(),
             percent,
             model_counts.get(&provider.provider).copied().unwrap_or(0),
             Some(provider.provider),
             p,
-            view.overview_provider == Some(provider.provider),
+            view.overview_provider == OverviewProviderFilter::Provider(provider.provider),
             cx,
         ));
     }
+    let provider_grid = div()
+        .w_full()
+        .relative()
+        .child(
+            canvas(
+                move |bounds, window, app| {
+                    let width = bounds.size.width.as_f32();
+                    let next = provider_card_columns(width);
+                    let current = provider_card_columns(view_entity.read(app).overview_cards_width);
+                    if next == current {
+                        return;
+                    }
+                    let view_entity = view_entity.clone();
+                    window.on_next_frame(move |_, app| {
+                        let _ = view_entity.update(app, |view, cx| {
+                            if view.set_overview_cards_width(width) {
+                                cx.notify();
+                            }
+                        });
+                    });
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0(),
+        )
+        .child(provider_cards);
 
     let provider_detail = match view.overview_provider {
-        None => Some(all_model_detail(
+        OverviewProviderFilter::None => None,
+        OverviewProviderFilter::All => Some(all_model_detail(
             &all_models,
             range.overview.total_tokens,
             p,
         )),
-        Some(selected) => range
+        OverviewProviderFilter::Provider(selected) => range
             .providers
             .iter()
             .find(|usage| usage.provider == selected)
@@ -424,7 +459,7 @@ fn overview_page(
                 ),
         )
         .child(div().pt_6().child(share_bar))
-        .child(div().pt_5().child(provider_cards))
+        .child(div().w_full().pt_5().child(provider_grid))
         .when_some(provider_detail, |this, detail| this.child(detail));
 
     div()
@@ -556,6 +591,16 @@ fn stat_chip(value: String, label: String, p: Palette) -> impl IntoElement {
         )
 }
 
+pub(crate) fn provider_card_columns(width: f32) -> u16 {
+    const GAP: f32 = 12.0;
+    const MIN_COLUMN: f32 = 160.0;
+    if width <= 0.0 {
+        return 3;
+    }
+    ((width + GAP) / (MIN_COLUMN + GAP)).floor().clamp(1.0, 4.0) as u16
+}
+
+
 fn share_card(
     title: String,
     percent: f64,
@@ -572,7 +617,7 @@ fn share_card(
     let provider_key = provider.map(Provider::as_str).unwrap_or("all");
     div()
         .id(format!("overview-provider-card-{provider_key}"))
-        .w(px(168.0))
+        .w_full()
         .rounded_2xl()
         .border_1()
         .border_color(if selected {
@@ -594,7 +639,11 @@ fn share_card(
                 .bg(p.accent.opacity(0.38))
         })
         .on_click(cx.listener(move |view, _, _, cx| {
-            view.set_overview_provider(provider, cx);
+            let filter = match provider {
+                Some(provider) => OverviewProviderFilter::Provider(provider),
+                None => OverviewProviderFilter::All,
+            };
+            view.set_overview_provider(filter, cx);
         }))
         .child(
             div().flex().items_center().gap_2().child(marker).child(
@@ -995,10 +1044,20 @@ fn provider_status_row(detection: &ProviderDetection, p: Palette) -> impl IntoEl
         .child(
             div()
                 .flex()
-                .items_center()
-                .gap_2()
-                .child(provider_logo(detection.provider, 22.0))
-                .child(detection.provider.display_name()),
+                .min_w(px(0.0))
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(provider_logo(detection.provider, 22.0))
+                        .child(detection.provider.display_name()),
+                )
+                .when_some(detection.detail.clone(), |this, detail| {
+                    this.child(div().text_color(p.muted_foreground).child(detail))
+                }),
         )
         .child(div().text_color(color).child(label))
 }
@@ -1293,6 +1352,7 @@ fn provider_color(provider: Provider) -> Rgba {
         Provider::Claude => rgb(0xd97706),
         Provider::OpenCode => rgb(0x0891b2),
         Provider::Pi => rgb(0x7c3aed),
+        Provider::Omp => rgb(0x0f766e),
         Provider::Zed => rgb(0x111827),
         Provider::Grok => rgb(0x64748b),
         Provider::Hermes => rgb(0x475569),
@@ -1955,7 +2015,7 @@ fn format_cost(value: Option<f64>) -> String {
 mod tests {
     use super::{
         HEATMAP_CELL, HEATMAP_GAP, HEATMAP_WEEKS, aggregate_model_usage, cache_hit_rate,
-        format_detail_percentage, heatmap_hit_index, total_prompt_input,
+        format_detail_percentage, heatmap_hit_index, provider_card_columns, total_prompt_input,
     };
     use gpui::{Bounds, point, px, size};
     use llmeter_core::Provider;
@@ -1969,6 +2029,17 @@ mod tests {
             size: size(px(width), px(height)),
         }
     }
+
+    #[test]
+    fn provider_card_columns_follow_container_breakpoints() {
+        assert_eq!(provider_card_columns(0.0), 3);
+        assert_eq!(provider_card_columns(159.0), 1);
+        assert_eq!(provider_card_columns(332.0), 2);
+        assert_eq!(provider_card_columns(504.0), 3);
+        assert_eq!(provider_card_columns(676.0), 4);
+        assert_eq!(provider_card_columns(1600.0), 4);
+    }
+
 
     #[test]
     fn heatmap_hit_index_maps_cells_and_skips_gaps() {

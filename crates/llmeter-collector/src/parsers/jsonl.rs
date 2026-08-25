@@ -78,7 +78,7 @@ impl IncrementalJsonlReader {
             .modified()
             .ok()
             .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-            .map(|value| value.as_secs() as i64);
+            .and_then(|value| i64::try_from(value.as_millis()).ok());
 
         Ok(IncrementalRead {
             lines,
@@ -88,6 +88,19 @@ impl IncrementalJsonlReader {
             modified_at,
             reset,
         })
+    }
+
+    pub fn is_unchanged(path: &Path, cursor: &FileCursor) -> io::Result<bool> {
+        let metadata = std::fs::metadata(path)?;
+        let identity = file_identity(&metadata);
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .and_then(|value| i64::try_from(value.as_millis()).ok());
+        Ok(cursor.file_identity == identity
+            && cursor.file_size == metadata.len()
+            && cursor.modified_at == modified_at)
     }
 }
 

@@ -53,6 +53,9 @@ impl ProviderAdapter for GrokAdapter {
     fn parser_version(&self) -> u32 {
         GROK_PARSER_VERSION
     }
+    fn watch_roots(&self) -> Vec<PathBuf> {
+        vec![self.sessions_root()]
+    }
 
     fn detect(&self) -> Result<ProviderDetection> {
         let sessions = self.sessions_root();

@@ -29,11 +29,12 @@ pub(crate) enum SessionProviderFilter {
 }
 
 impl SessionProviderFilter {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::All,
         Self::Provider(Provider::Claude),
         Self::Provider(Provider::Codex),
         Self::Provider(Provider::Pi),
+        Self::Provider(Provider::Omp),
         Self::Provider(Provider::OpenCode),
         Self::Provider(Provider::Zed),
         Self::Provider(Provider::Grok),
@@ -329,7 +330,14 @@ fn session_row(
     p: Palette,
     cx: &mut Context<LLMeterView>,
 ) -> AnyElement {
-    let title = session.title();
+    let title = {
+        let title = session.title();
+        if title.trim().is_empty() {
+            t!("sessions.untitled").to_string()
+        } else {
+            title
+        }
+    };
     let model = session
         .model
         .clone()

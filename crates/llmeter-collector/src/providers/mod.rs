@@ -16,6 +16,7 @@ mod claude;
 mod codex;
 mod grok;
 mod hermes;
+mod omp;
 mod opencode;
 mod pi;
 mod zed;
@@ -24,6 +25,7 @@ pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use grok::GrokAdapter;
 pub use hermes::HermesAdapter;
+pub use omp::OmpAdapter;
 pub use opencode::OpenCodeAdapter;
 pub use pi::PiAdapter;
 pub use zed::ZedAdapter;
@@ -48,6 +50,9 @@ pub trait ProviderAdapter: Send + Sync {
     fn parser_version(&self) -> u32 {
         PARSER_VERSION
     }
+    fn watch_roots(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
     fn detect(&self) -> Result<ProviderDetection>;
     fn discover_sources(&self) -> Result<Vec<SourceFile>>;
     fn update_source_metadata(
@@ -58,7 +63,18 @@ pub trait ProviderAdapter: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+    fn begin_source(&self, _source: &SourceFile, _from_beginning: bool) {}
+
     fn parse_line(&self, source: &SourceFile, line: &[u8]) -> Result<Option<ParsedUsage>>;
+    fn ingest_line(
+        &self,
+        source: &SourceFile,
+        line: &[u8],
+        metadata: &mut SourceMetadata,
+    ) -> Result<Option<ParsedUsage>> {
+        self.update_source_metadata(source, line, metadata)?;
+        self.parse_line(source, line)
+    }
     fn parse_sqlite(&self, _source: &SourceFile) -> Result<Vec<ParsedUsage>> {
         Err(anyhow::anyhow!(
             "SQLite source is not supported by this adapter"
@@ -72,6 +88,7 @@ pub fn default_adapters() -> Vec<Box<dyn ProviderAdapter>> {
         Box::new(ClaudeAdapter::default()),
         Box::new(OpenCodeAdapter::default()),
         Box::new(PiAdapter::default()),
+        Box::new(OmpAdapter::default()),
         Box::new(ZedAdapter::default()),
         Box::new(GrokAdapter::default()),
         Box::new(HermesAdapter::default()),

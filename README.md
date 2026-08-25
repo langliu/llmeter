@@ -31,8 +31,8 @@ safety rescan.
 - Claude Code: ~/.claude/projects/**/*.jsonl
 - OpenCode: JSONL plus the validated SQLite session/session_v2 token schema;
   unknown SQLite schemas are explicitly marked unsupported
-- pi: ~/.pi/agent/sessions and ~/.omp/agent/sessions, with canonical-path
-  de-duplication
+- pi: ~/.pi/agent/sessions
+- Oh My Pi: ~/.omp/agent/sessions
 - Zed: the validated threads SQLite database on macOS and Linux; both JSON and
   zstd-compressed thread payloads are supported
 - Grok: ~/.grok/sessions/**/updates.jsonl (or $GROK_HOME/sessions), including
@@ -100,9 +100,9 @@ cargo test --workspace
 
 ## Current implementation decisions
 
-- GPUI is pinned to crates.io 0.2.2. The native macOS backend uses
-  runtime_shaders with default features disabled, so building does not require
-  the legacy xcrun Metal shader toolchain at compile time.
+- GPUI is pinned to the Zed git workspace crates (`gpui` / `gpui_platform`)
+  with `runtime_shaders`, so building does not require the legacy xcrun Metal
+  shader toolchain at compile time.
 - The first version is a single process. The collector/event boundary leaves
   room for a future daemon and IPC split.
 - Hook installation is opt-in, backs up existing configuration, and refuses

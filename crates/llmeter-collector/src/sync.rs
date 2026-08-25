@@ -1,4 +1,9 @@
-use std::{collections::HashSet, path::Path, sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -25,6 +30,12 @@ impl SyncOptions {
             providers: Some(HashSet::from([provider])),
         }
     }
+
+    pub fn providers(providers: impl IntoIterator<Item = Provider>) -> Self {
+        Self {
+            providers: Some(providers.into_iter().collect()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -47,6 +58,18 @@ impl SyncEngine {
 
     pub fn database(&self) -> &Database {
         &self.database
+    }
+
+    pub fn watch_roots(&self) -> Vec<(Provider, PathBuf)> {
+        self.adapters
+            .iter()
+            .flat_map(|adapter| {
+                adapter
+                    .watch_roots()
+                    .into_iter()
+                    .map(|path| (adapter.provider(), path))
+            })
+            .collect()
     }
 
     pub fn sync_all(&self) -> Result<SyncResult> {
@@ -123,6 +146,37 @@ impl SyncEngine {
         result: &mut SyncResult,
     ) -> Result<()> {
         result.files_scanned += 1;
+        let metadata = match std::fs::metadata(&source.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                debug!(path = %source.path.display(), "sqlite source disappeared during sync");
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|duration| i64::try_from(duration.as_millis()).ok());
+        let existing = self.database.get_cursor(&source.path)?;
+        let mut cursor = existing.clone().unwrap_or_else(|| {
+            FileCursor::new(
+                source.path.clone(),
+                source.provider,
+                adapter.parser_version(),
+            )
+        });
+        if existing.is_none() || cursor.parser_version != adapter.parser_version() {
+            self.database
+                .delete_usage_for_source(&source.path, source.provider)?;
+            cursor = FileCursor::new(
+                source.path.clone(),
+                source.provider,
+                adapter.parser_version(),
+            );
+        }
+
         let parsed = adapter.parse_sqlite(source)?;
         result.events_seen += parsed.len();
         let events = parsed
@@ -133,22 +187,10 @@ impl SyncEngine {
         result.events_inserted += summary.inserted;
         result.tokens_added = result.tokens_added.saturating_add(summary.tokens_added);
 
-        let metadata = std::fs::metadata(&source.path)?;
-        let mut cursor = self.database.get_cursor(&source.path)?.unwrap_or_else(|| {
-            FileCursor::new(
-                source.path.clone(),
-                source.provider,
-                adapter.parser_version(),
-            )
-        });
         cursor.file_identity = Some(format!("sqlite:{}", metadata.len()));
         cursor.byte_offset = metadata.len();
         cursor.file_size = metadata.len();
-        cursor.modified_at = metadata
-            .modified()
-            .ok()
-            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-            .and_then(|duration| i64::try_from(duration.as_secs()).ok());
+        cursor.modified_at = modified_at;
         cursor.parser_version = adapter.parser_version();
         cursor.last_event_hash = events.last().map(|event| event.id.clone());
         cursor.updated_at = Utc::now().timestamp();
@@ -179,6 +221,8 @@ impl SyncEngine {
                 source.provider,
                 adapter.parser_version(),
             );
+        } else if IncrementalJsonlReader::is_unchanged(&source.path, &cursor).unwrap_or(false) {
+            return Ok(());
         }
 
         let read = match IncrementalJsonlReader::read(&source.path, &cursor) {
@@ -190,10 +234,16 @@ impl SyncEngine {
             Err(error) => return Err(error.into()),
         };
 
+        let from_beginning = read.reset || cursor.byte_offset == 0;
         if read.reset {
+            self.database
+                .delete_usage_for_source(&source.path, source.provider)?;
             cursor.byte_offset = 0;
             cursor.last_cumulative = None;
+            cursor.source_metadata = Default::default();
         }
+        adapter.begin_source(source, from_beginning);
+
         let key = source.path.to_string_lossy().to_string();
         let mut cumulative_tracker = CumulativeUsageTracker::default();
         if let Some(snapshot) = cursor.last_cumulative {
@@ -202,10 +252,7 @@ impl SyncEngine {
 
         let mut events = Vec::new();
         for line in &read.lines {
-            let parsed = match adapter
-                .update_source_metadata(source, &line.raw, &mut cursor.source_metadata)
-                .and_then(|()| adapter.parse_line(source, &line.raw))
-            {
+            let parsed = match adapter.ingest_line(source, &line.raw, &mut cursor.source_metadata) {
                 Ok(parsed) => parsed,
                 Err(error) => {
                     // We advance past malformed/non-usage records as handled
@@ -605,6 +652,102 @@ mod tests {
         let updated = engine.sync_all().unwrap();
         assert_eq!(updated.events_inserted, 0);
         assert_eq!(overview(&database).total_tokens, 31);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn jsonl_rewrite_replaces_previous_usage_instead_of_double_counting() {
+        let home = test_home("rewrite");
+        let source_path = home.join(".codex").join("sessions").join("session.jsonl");
+        fs::write(
+            &source_path,
+            include_str!("../../../fixtures/codex/cumulative.jsonl"),
+        )
+        .unwrap();
+        let database = Database::open_in_memory().unwrap();
+        let engine = SyncEngine::with_adapters(
+            database.clone(),
+            vec![Box::new(CodexAdapter::with_home(home.clone()))],
+        );
+        assert_eq!(engine.sync_all().unwrap().tokens_added, 180);
+        assert_eq!(overview(&database).total_tokens, 180);
+
+        fs::write(
+            &source_path,
+            concat!(
+                r#"{"type":"event_msg","timestamp":"2026-08-14T00:00:00Z","payload":{"model":"gpt-5.4","info":{"last_token_usage":{"input_tokens":7,"output_tokens":1,"total_tokens":8},"event_id":"rewrite-1"}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let rewritten = engine.sync_all().unwrap();
+        assert_eq!(rewritten.events_inserted, 1);
+        assert_eq!(overview(&database).total_tokens, 8);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn sqlite_parser_version_change_rebuilds_source() {
+        let home = test_home("sqlite-rebuild");
+        let root = home.join(".local").join("share").join("opencode");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("opencode.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session_v2 (
+                    id TEXT PRIMARY KEY,
+                    directory TEXT NOT NULL,
+                    model TEXT,
+                    tokens_input INTEGER NOT NULL DEFAULT 0,
+                    tokens_output INTEGER NOT NULL DEFAULT 0,
+                    tokens_reasoning INTEGER NOT NULL DEFAULT 0,
+                    tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+                    tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL
+                );
+                INSERT INTO session_v2 VALUES
+                    ('s1', '/tmp/project', 'gpt-5.4', 10, 3, 1, 5, 2,
+                     1786700000000, 1786700001000);",
+            )
+            .unwrap();
+        drop(connection);
+        let path = path.canonicalize().unwrap();
+
+        let database = Database::open_in_memory().unwrap();
+        database
+            .insert_usage_events(&[UsageEvent {
+                id: "stale-sqlite".into(),
+                provider: Provider::OpenCode,
+                model: Some("old".into()),
+                session_id: Some("s1".into()),
+                project_path: Some(PathBuf::from("/tmp/project")),
+                project_name: Some("project".into()),
+                timestamp: Utc::now(),
+                input_tokens: 999,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                output_tokens: 0,
+                reasoning_tokens: 0,
+                total_tokens: 999,
+                reported_cost_usd: None,
+                estimated_cost_usd: None,
+                source_file: Some(path.clone()),
+                source_event_id: None,
+            }])
+            .unwrap();
+        database
+            .upsert_cursor(&FileCursor::new(path, Provider::OpenCode, 1))
+            .unwrap();
+
+        let engine = SyncEngine::with_adapters(
+            database.clone(),
+            vec![Box::new(OpenCodeAdapter::with_home(home.clone()))],
+        );
+        let result = engine.sync_all().unwrap();
+        assert_eq!(result.events_inserted, 1);
+        assert_eq!(overview(&database).total_tokens, 21);
         let _ = fs::remove_dir_all(home);
     }
 }

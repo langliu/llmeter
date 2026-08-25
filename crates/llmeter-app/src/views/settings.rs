@@ -16,6 +16,12 @@ use crate::{
     views::palette::Palette,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HookUiAction {
+    Install,
+    Uninstall,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SettingsSection {
     #[default]
@@ -279,7 +285,7 @@ fn data_card(view: &LLMeterView, p: Palette, cx: &mut Context<LLMeterView>) -> i
                     ProviderStatus::NotInstalled => t!("providers.not_detected"),
                     ProviderStatus::UnsupportedVersion => t!("providers.unsupported"),
                 };
-                format!("{} {status}", detection.provider)
+                format!("{} {status}", detection.provider.display_name())
             })
             .collect::<Vec<_>>()
             .join(" · ")
@@ -316,25 +322,20 @@ fn data_card(view: &LLMeterView, p: Palette, cx: &mut Context<LLMeterView>) -> i
         ))
         .child(setting_row(
             t!("settings.hooks").to_string(),
-            v_flex()
-                .gap_1()
-                .child(t!("settings.hooks_subtitle").to_string())
-                .child(hook_line(
-                    t!("settings.install").to_string(),
-                    "llmeter hook install --provider codex",
-                ))
-                .child(hook_line(
-                    t!("settings.status").to_string(),
-                    "llmeter hook status --provider codex",
-                ))
-                .child(hook_line(
-                    t!("settings.remove").to_string(),
-                    "llmeter hook uninstall --provider codex",
-                )),
+            hook_controls(p, cx),
             None,
             false,
             p,
         ))
+        .when(!snapshot.warnings.is_empty(), |this| {
+            this.child(setting_row(
+                t!("settings.warnings").to_string(),
+                snapshot.warnings.join("\n"),
+                None,
+                false,
+                p,
+            ))
+        })
         .child(setting_row(
             t!("settings.privacy").to_string(),
             t!("settings.privacy_subtitle").to_string(),
@@ -348,8 +349,75 @@ fn data_card(view: &LLMeterView, p: Palette, cx: &mut Context<LLMeterView>) -> i
         ))
 }
 
-fn hook_line(label: String, command: &str) -> gpui::Div {
-    div().text_xs().child(format!("{label}: {command}"))
+fn hook_controls(p: Palette, cx: &mut Context<LLMeterView>) -> gpui::Div {
+    let codex = llmeter_collector::hooks::codex_hook_status().ok();
+    let claude = llmeter_collector::hooks::claude_hook_status().ok();
+    v_flex()
+        .gap_2()
+        .child(t!("settings.hooks_subtitle").to_string())
+        .child(hook_provider_row(
+            llmeter_core::Provider::Codex,
+            codex.as_ref(),
+            p,
+            cx,
+        ))
+        .child(hook_provider_row(
+            llmeter_core::Provider::Claude,
+            claude.as_ref(),
+            p,
+            cx,
+        ))
+}
+
+fn hook_provider_row(
+    provider: llmeter_core::Provider,
+    status: Option<&llmeter_collector::hooks::HookStatus>,
+    _p: Palette,
+    cx: &mut Context<LLMeterView>,
+) -> gpui::Div {
+    let detail = status
+        .map(|item| {
+            if item.conflict {
+                t!("settings.hook_conflict").to_string()
+            } else if item.installed {
+                t!("settings.hook_installed").to_string()
+            } else {
+                t!("settings.hook_missing").to_string()
+            }
+        })
+        .unwrap_or_else(|| t!("settings.hook_missing").to_string());
+    h_flex()
+        .w_full()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .child(
+            div()
+                .text_xs()
+                .child(format!("{} · {detail}", provider.display_name())),
+        )
+        .child(
+            h_flex()
+                .gap_1()
+                .child(
+                    Button::new(format!("hook-install-{}", provider.as_str()))
+                        .ghost()
+                        .compact()
+                        .label(t!("settings.install").to_string())
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.hook_action(provider, HookUiAction::Install, cx);
+                        })),
+                )
+                .child(
+                    Button::new(format!("hook-remove-{}", provider.as_str()))
+                        .ghost()
+                        .compact()
+                        .label(t!("settings.remove").to_string())
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.hook_action(provider, HookUiAction::Uninstall, cx);
+                        })),
+                ),
+        )
 }
 
 fn footer(view: &LLMeterView, p: Palette) -> impl IntoElement {

@@ -38,6 +38,9 @@ impl ProviderAdapter for ClaudeAdapter {
     fn parser_version(&self) -> u32 {
         PARSER_VERSION
     }
+    fn watch_roots(&self) -> Vec<PathBuf> {
+        vec![self.projects_root()]
+    }
 
     fn detect(&self) -> Result<ProviderDetection> {
         let root = self.home.join(".claude");

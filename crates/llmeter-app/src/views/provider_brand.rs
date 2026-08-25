@@ -7,6 +7,7 @@ pub(crate) fn provider_logo(provider: Provider, size: f32) -> AnyElement {
         Provider::Claude => "providers/claude.svg",
         Provider::OpenCode => "providers/opencode.svg",
         Provider::Pi => "providers/pi.svg",
+        Provider::Omp => "providers/omp.svg",
         Provider::Zed => "providers/zed.svg",
         Provider::Grok => "providers/grok.svg",
         Provider::Hermes => "providers/hermes.svg",

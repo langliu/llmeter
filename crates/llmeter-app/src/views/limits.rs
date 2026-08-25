@@ -183,15 +183,15 @@ fn provider_card(
             )
         })
         .when_some(
-            limits.and_then(|item| item.last_error.as_ref()).cloned(),
-            |this, _| {
-                this.child(
-                    div()
-                        .pt_2()
-                        .text_xs()
-                        .text_color(rgb(0xd97706))
-                        .child(t!("limits.cached_warning").to_string()),
-                )
+            limits.and_then(|item| item.last_error.clone().or_else(|| item.error.clone())),
+            |this, error| {
+                this.child(div().pt_2().text_xs().text_color(rgb(0xd97706)).child(
+                    if limits.is_some_and(|item| item.stale) {
+                        format!("{} {error}", t!("limits.cached_warning"))
+                    } else {
+                        error
+                    },
+                ))
             },
         )
         .into_any_element()

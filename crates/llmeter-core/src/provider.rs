@@ -10,17 +10,19 @@ pub enum Provider {
     Claude,
     OpenCode,
     Pi,
+    Omp,
     Zed,
     Grok,
     Hermes,
 }
 
 impl Provider {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Codex,
         Self::Claude,
         Self::OpenCode,
         Self::Pi,
+        Self::Omp,
         Self::Zed,
         Self::Grok,
         Self::Hermes,
@@ -32,6 +34,7 @@ impl Provider {
             Self::Claude => "claude",
             Self::OpenCode => "opencode",
             Self::Pi => "pi",
+            Self::Omp => "omp",
             Self::Zed => "zed",
             Self::Grok => "grok",
             Self::Hermes => "hermes",
@@ -44,6 +47,7 @@ impl Provider {
             Self::Claude => "Claude Code",
             Self::OpenCode => "OpenCode",
             Self::Pi => "Pi",
+            Self::Omp => "Oh My Pi",
             Self::Zed => "Zed",
             Self::Grok => "Grok",
             Self::Hermes => "Hermes",
@@ -56,9 +60,10 @@ impl Provider {
             Self::Claude => Some(format!("claude --resume {session_ref}")),
             Self::OpenCode => Some(format!("opencode --session {session_ref}")),
             Self::Pi => Some(format!("pi --session {session_ref}")),
+            Self::Omp => Some(format!("omp --resume {session_ref}")),
+            Self::Zed => None,
             Self::Grok => Some(format!("grok --resume {session_ref}")),
             Self::Hermes => Some(format!("hermes --resume {session_ref}")),
-            Self::Zed => None,
         }
     }
 
@@ -125,6 +130,7 @@ impl FromStr for Provider {
             "claude" | "claude_code" | "claude-code" => Ok(Self::Claude),
             "opencode" | "open_code" | "open-code" => Ok(Self::OpenCode),
             "pi" | "pi-mono" => Ok(Self::Pi),
+            "omp" | "oh-my-pi" | "oh_my_pi" | "ohmypi" => Ok(Self::Omp),
             "zed" => Ok(Self::Zed),
             "grok" | "grok-build" | "grok_build" => Ok(Self::Grok),
             "hermes" | "hermes-agent" | "hermes_agent" => Ok(Self::Hermes),
@@ -288,6 +294,11 @@ mod tests {
             Some("hermes --resume session-id")
         );
         assert_eq!("hermes-agent".parse(), Ok(Provider::Hermes));
+        assert_eq!("oh-my-pi".parse(), Ok(Provider::Omp));
+        assert_eq!(
+            Provider::Omp.resume_command("session-id").as_deref(),
+            Some("omp --resume session-id")
+        );
     }
 
     #[test]

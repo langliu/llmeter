@@ -92,6 +92,9 @@ impl ProviderAdapter for OpenCodeAdapter {
     fn parser_version(&self) -> u32 {
         OPENCODE_PARSER_VERSION
     }
+    fn watch_roots(&self) -> Vec<PathBuf> {
+        self.roots()
+    }
 
     fn detect(&self) -> Result<ProviderDetection> {
         let roots = self.roots();

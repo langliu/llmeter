@@ -20,6 +20,7 @@ pub struct UiSnapshot {
     pub projects: Vec<ProjectUsage>,
     pub recent: Vec<RecentActivity>,
     pub sessions: Vec<SessionSummary>,
+    pub session_count: u64,
     pub detections: Vec<ProviderDetection>,
     pub database_path: PathBuf,
     pub last_sync: Option<DateTime<Utc>>,
@@ -54,18 +55,22 @@ impl UiSnapshot {
         repository: &UsageRepository,
         overview_start: DateTime<Utc>,
         overview_end: DateTime<Utc>,
+        include_sessions: bool,
     ) -> Result<Self, llmeter_storage::StorageError> {
         let now = Utc::now();
         let today_start = local_midnight(Local::now().date_naive());
         let seven_start = now - Duration::days(7);
         let thirty_start = now - Duration::days(30);
+        let sessions = if include_sessions {
+            repository.get_sessions()?
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             today: repository.get_today_usage(today_start, now + Duration::seconds(1))?,
             seven_days: repository.get_overview(seven_start, now + Duration::seconds(1))?,
             thirty_days: repository.get_overview(thirty_start, now + Duration::seconds(1))?,
             overview_range: OverviewRangeSnapshot::load(repository, overview_start, overview_end)?,
-            // Keep enough history for the overview calendar while the trend remains a
-            // compact 30-day view.
             heatmap_daily: repository
                 .get_daily_usage(now - Duration::days(147), now + Duration::seconds(1))?,
             heatmap_models: repository
@@ -74,7 +79,12 @@ impl UiSnapshot {
             models: repository.get_model_usage(thirty_start, now + Duration::seconds(1))?,
             projects: repository.get_project_usage(thirty_start, now + Duration::seconds(1))?,
             recent: repository.get_recent_activity(8)?,
-            sessions: repository.get_sessions()?,
+            session_count: if include_sessions {
+                sessions.len() as u64
+            } else {
+                repository.get_session_count()?
+            },
+            sessions,
             detections: Vec::new(),
             database_path: repository.database().path().to_path_buf(),
             last_sync: None,

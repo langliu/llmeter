@@ -110,7 +110,7 @@ impl SessionSummary {
             .as_deref()
             .filter(|value| !value.is_empty())
             .map(short_session_label)
-            .unwrap_or_else(|| "未命名会话".into())
+            .unwrap_or_default()
     }
 
     pub fn project_label(&self) -> Option<String> {
@@ -423,6 +423,25 @@ impl UsageRepository {
             .map_err(StorageError::from)
     }
 
+    pub fn get_session_count(&self) -> Result<u64, StorageError> {
+        let connection = self.database.lock()?;
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM (
+                    SELECT 1 FROM usage_events
+                    GROUP BY provider,
+                             COALESCE(session_id, source_file, id),
+                             COALESCE(source_file, ''),
+                             COALESCE(project_name, ''),
+                             COALESCE(project_path, '')
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(from_sqlite_u64)
+            .map_err(StorageError::from)
+    }
+
     pub fn get_sessions(&self) -> Result<Vec<SessionSummary>, StorageError> {
         let connection = self.database.lock()?;
         let mut statement = connection.prepare(
@@ -475,8 +494,28 @@ impl UsageRepository {
     }
 
     pub fn get_session_projects(&self) -> Result<Vec<String>, StorageError> {
-        let mut names = self
-            .get_sessions()?
+        let connection = self.database.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT project_name, project_path, source_file
+             FROM usage_events",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(SessionSummary {
+                provider: Provider::Codex,
+                session_id: None,
+                source_file: row.get(2)?,
+                project_name: row.get(0)?,
+                project_path: row.get(1)?,
+                model: None,
+                started_at: Utc::now(),
+                ended_at: Utc::now(),
+                turn_count: 0,
+                total_tokens: 0,
+                estimated_cost_usd: None,
+            })
+        })?;
+        let mut names = rows
+            .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .filter_map(|session| session.project_label())
             .collect::<Vec<_>>();

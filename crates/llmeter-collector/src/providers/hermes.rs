@@ -100,6 +100,9 @@ impl ProviderAdapter for HermesAdapter {
     fn parser_version(&self) -> u32 {
         HERMES_PARSER_VERSION
     }
+    fn watch_roots(&self) -> Vec<PathBuf> {
+        vec![self.root.clone()]
+    }
 
     fn detect(&self) -> Result<ProviderDetection> {
         let databases = self.databases()?;

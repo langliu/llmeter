@@ -1,8 +1,10 @@
 use std::{
-    path::PathBuf,
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread,
     time::Duration,
@@ -11,11 +13,11 @@ use std::{
 use anyhow::Result;
 use llmeter_core::{Provider, SyncResult};
 use llmeter_storage::Database;
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::warn;
 
 use crate::{
     hooks,
-    providers::home_dir,
     sync::{SyncEngine, SyncOptions},
     watcher,
 };
@@ -107,8 +109,8 @@ impl Collector {
                     Ok(_) => {}
                     Err(error) => warn!(error = %error, "pricing refresh failed"),
                 }
-                let roots = watch_roots();
-                let Ok((_watcher, receiver)) = watcher::start(&roots) else {
+
+                let Ok((mut watcher, receiver)) = watcher::start(&[]) else {
                     warn!(
                         "filesystem watcher could not be started; periodic rescan remains active"
                     );
@@ -119,20 +121,30 @@ impl Collector {
                     }
                 };
 
+                let mut watched = HashSet::new();
+                refresh_watches(&mut watcher, &mut watched, &collector.engine);
                 let _ = collector.sync_now();
                 loop {
                     match receiver.recv_timeout(Duration::from_secs(300)) {
-                        Ok(Ok(_event)) => {
-                            // Drain bursts and debounce before a single sync.
+                        Ok(Ok(event)) => {
                             thread::sleep(Duration::from_millis(500));
-                            while receiver.try_recv().is_ok() {}
-                            let _ = collector.sync_now();
+                            let mut events = vec![event];
+                            while let Ok(Ok(extra)) = receiver.try_recv() {
+                                events.push(extra);
+                            }
+                            refresh_watches(&mut watcher, &mut watched, &collector.engine);
+                            let options = options_for_events(&collector.engine, &events);
+                            if options.providers.as_ref().is_some_and(HashSet::is_empty) {
+                                continue;
+                            }
+                            let _ = collector.sync_with_options(options);
                         }
                         Ok(Err(error)) => warn!(error = %error, "filesystem watcher event failed"),
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                        Err(RecvTimeoutError::Timeout) => {
+                            refresh_watches(&mut watcher, &mut watched, &collector.engine);
                             let _ = collector.sync_now();
                         }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Disconnected) => break,
                     }
                 }
             })
@@ -140,44 +152,90 @@ impl Collector {
     }
 }
 
-fn watch_roots() -> Vec<PathBuf> {
-    let home = home_dir();
-    let grok_home = std::env::var_os("GROK_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".grok"));
-    let hermes_home = std::env::var_os("HERMES_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".hermes"));
-    // Watch the signal directory instead of the signal file itself. Hooks may
-    // create the signal file after the app has already started.
+fn refresh_watches(
+    watcher: &mut RecommendedWatcher,
+    watched: &mut HashSet<PathBuf>,
+    engine: &SyncEngine,
+) {
+    for path in watch_candidates(engine) {
+        if !path.exists() || !watched.insert(path.clone()) {
+            continue;
+        }
+        if let Err(error) = watcher.watch(&path, RecursiveMode::Recursive) {
+            warn!(path = %path.display(), error = %error, "failed to watch provider root");
+            watched.remove(&path);
+        }
+    }
+}
+
+fn watch_candidates(engine: &SyncEngine) -> Vec<PathBuf> {
+    let mut roots = engine
+        .watch_roots()
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect::<Vec<_>>();
+    if let Some(parent) = hooks::signal_path().parent() {
+        roots.push(parent.to_path_buf());
+    } else {
+        roots.push(hooks::data_dir());
+    }
+    roots
+}
+
+fn options_for_events(engine: &SyncEngine, events: &[Event]) -> SyncOptions {
     let signal_directory = hooks::signal_path()
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(hooks::data_dir);
-    vec![
-        home.join(".codex").join("sessions"),
-        home.join(".claude").join("projects"),
-        home.join(".pi").join("agent").join("sessions"),
-        home.join(".omp").join("agent").join("sessions"),
-        home.join(".local").join("share").join("opencode"),
-        home.join(".config").join("opencode"),
-        home.join("Library")
-            .join("Application Support")
-            .join("opencode"),
-        home.join(".opencode"),
-        home.join("Library")
-            .join("Application Support")
-            .join("Zed")
-            .join("threads"),
-        home.join(".local")
-            .join("share")
-            .join("zed")
-            .join("threads"),
-        grok_home.join("sessions"),
-        hermes_home,
-        signal_directory,
-    ]
-    .into_iter()
-    .filter(|path| path.exists())
-    .collect()
+    let mut providers = HashSet::new();
+    let mut saw_signal = false;
+    for event in events {
+        for path in &event.paths {
+            if path_is_under(path, &signal_directory) {
+                saw_signal = true;
+                if let Some(provider) = provider_from_signal(path) {
+                    providers.insert(provider);
+                }
+                continue;
+            }
+            for (provider, root) in engine.watch_roots() {
+                if path_is_under(path, &root) || path_is_under(&root, path) {
+                    providers.insert(provider);
+                }
+            }
+        }
+    }
+    if providers.is_empty() && saw_signal {
+        return SyncOptions::default();
+    }
+    SyncOptions::providers(providers)
+}
+
+fn path_is_under(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
+}
+
+fn provider_from_signal(path: &Path) -> Option<Provider> {
+    let contents = fs::read_to_string(path).ok()?;
+    contents
+        .lines()
+        .rev()
+        .find_map(|line| line.split_whitespace().nth(1)?.parse().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signal_path_maps_to_named_provider() {
+        let directory =
+            std::env::temp_dir().join(format!("llmeter-signal-{}-{}", std::process::id(), "map"));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("sync.signal");
+        fs::write(&path, "1 grok\n2 claude\n").unwrap();
+        assert_eq!(provider_from_signal(&path), Some(Provider::Claude));
+        let _ = fs::remove_dir_all(directory);
+    }
 }

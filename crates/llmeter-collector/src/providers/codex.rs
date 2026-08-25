@@ -31,6 +31,75 @@ impl CodexAdapter {
     fn codex_root(&self) -> PathBuf {
         self.home.join(".codex")
     }
+
+    fn apply_metadata(&self, value: &Value, metadata: &mut SourceMetadata) {
+        let payload = nested(value, &["payload"]).unwrap_or(value);
+        let record_type = nested(value, &["type"]).and_then(Value::as_str);
+        let direct_model = nested(payload, &["model"]).and_then(Value::as_str);
+
+        if !matches!(record_type, Some("session_meta" | "turn_context")) && direct_model.is_none() {
+            return;
+        }
+
+        if let Some(model) = direct_model {
+            metadata.model = Some(model.to_string());
+        }
+        if let Some(session_id) = session_id(payload).or_else(|| {
+            (record_type == Some("session_meta"))
+                .then(|| nested(payload, &["id"]).and_then(Value::as_str))
+                .flatten()
+                .map(str::to_string)
+        }) {
+            metadata.session_id = Some(session_id);
+        }
+        if let Some(path) = project_path(payload) {
+            metadata.project_name = project_name(Some(&path));
+            metadata.project_path = Some(path);
+        }
+    }
+
+    fn parse_value(&self, source: &SourceFile, value: &Value) -> Result<Option<ParsedUsage>> {
+        let payload = nested(value, &["payload"]).unwrap_or(value);
+        let info = nested(payload, &["info"]).unwrap_or(payload);
+
+        // Codex emits last_token_usage alongside total_token_usage. The last
+        // snapshot is already the per-turn delta and is preferred when both
+        // exist, avoiding a second cumulative-delta calculation.
+        let last_usage = nested(info, &["last_token_usage"])
+            .or_else(|| nested(info, &["last_usage"]))
+            .or_else(|| nested(payload, &["last_token_usage"]))
+            .or_else(|| nested(value, &["last_token_usage"]))
+            .and_then(|usage| counts_from_usage(usage, false));
+        let total_usage = nested(info, &["total_token_usage"])
+            .or_else(|| nested(info, &["total_usage"]))
+            .or_else(|| nested(payload, &["total_token_usage"]))
+            .or_else(|| nested(value, &["total_token_usage"]))
+            .and_then(usage_snapshot);
+        let generic_usage = super::object_with_usage(value);
+
+        let (counts, cumulative_snapshot) = if let Some(counts) = last_usage {
+            (counts, None)
+        } else if let Some(snapshot) = total_usage {
+            (snapshot.into(), Some(snapshot))
+        } else if let Some(usage) = generic_usage.and_then(counts_from_codex_usage) {
+            (usage.0, usage.1)
+        } else {
+            return Ok(None);
+        };
+
+        let project_path = project_path(value);
+        Ok(Some(ParsedUsage {
+            counts,
+            cumulative_snapshot,
+            timestamp: timestamp(value),
+            model: model(payload).or_else(|| model(value)),
+            session_id: session_id(value).or_else(|| source.session_id.clone()),
+            project_name: project_name(project_path.as_deref()),
+            project_path,
+            source_event_id: source_event_id(payload).or_else(|| source_event_id(value)),
+            reported_cost_usd: None,
+        }))
+    }
 }
 
 impl ProviderAdapter for CodexAdapter {
@@ -42,25 +111,31 @@ impl ProviderAdapter for CodexAdapter {
         CODEX_PARSER_VERSION
     }
 
+    fn watch_roots(&self) -> Vec<PathBuf> {
+        let root = self.codex_root();
+        vec![root.join("sessions"), root.join("archived_sessions")]
+    }
+
     fn detect(&self) -> Result<ProviderDetection> {
         let root = self.codex_root();
         let sessions = root.join("sessions");
         let archived = root.join("archived_sessions");
-        let files = walk_jsonl(&sessions)?;
-        let detail = archived.exists().then(|| {
-            "archived_sessions detected; first version reports it but does not parse it".to_string()
-        });
+        let mut files = walk_jsonl(&sessions)?;
+        files.extend(walk_jsonl(&archived)?);
         Ok(data_status(
             Provider::Codex,
             vec![root, sessions, archived],
             !files.is_empty(),
-            detail,
+            None,
         ))
     }
 
     fn discover_sources(&self) -> Result<Vec<SourceFile>> {
-        let root = self.codex_root().join("sessions");
-        Ok(walk_jsonl(&root)?
+        let root = self.codex_root();
+        let mut files = walk_jsonl(&root.join("sessions"))?;
+        files.extend(walk_jsonl(&root.join("archived_sessions"))?);
+        files.sort();
+        Ok(files
             .into_iter()
             .map(|path| {
                 let session_id = path
@@ -84,75 +159,23 @@ impl ProviderAdapter for CodexAdapter {
         line: &[u8],
         metadata: &mut SourceMetadata,
     ) -> Result<()> {
-        let value = json_value(line)?;
-        let payload = nested(&value, &["payload"]).unwrap_or(&value);
-        let record_type = nested(&value, &["type"]).and_then(Value::as_str);
-        let direct_model = nested(payload, &["model"]).and_then(Value::as_str);
-
-        if !matches!(record_type, Some("session_meta" | "turn_context")) && direct_model.is_none() {
-            return Ok(());
-        }
-
-        if let Some(model) = direct_model {
-            metadata.model = Some(model.to_string());
-        }
-        if let Some(session_id) = session_id(payload).or_else(|| {
-            (record_type == Some("session_meta"))
-                .then(|| nested(payload, &["id"]).and_then(Value::as_str))
-                .flatten()
-                .map(str::to_string)
-        }) {
-            metadata.session_id = Some(session_id);
-        }
-        if let Some(path) = project_path(payload) {
-            metadata.project_name = project_name(Some(&path));
-            metadata.project_path = Some(path);
-        }
+        self.apply_metadata(&json_value(line)?, metadata);
         Ok(())
     }
 
     fn parse_line(&self, source: &SourceFile, line: &[u8]) -> Result<Option<ParsedUsage>> {
+        self.parse_value(source, &json_value(line)?)
+    }
+
+    fn ingest_line(
+        &self,
+        source: &SourceFile,
+        line: &[u8],
+        metadata: &mut SourceMetadata,
+    ) -> Result<Option<ParsedUsage>> {
         let value = json_value(line)?;
-        let payload = nested(&value, &["payload"]).unwrap_or(&value);
-        let info = nested(payload, &["info"]).unwrap_or(payload);
-
-        // Codex emits last_token_usage alongside total_token_usage. The last
-        // snapshot is already the per-turn delta and is preferred when both
-        // exist, avoiding a second cumulative-delta calculation.
-        let last_usage = nested(info, &["last_token_usage"])
-            .or_else(|| nested(info, &["last_usage"]))
-            .or_else(|| nested(payload, &["last_token_usage"]))
-            .or_else(|| nested(&value, &["last_token_usage"]))
-            .and_then(|usage| counts_from_usage(usage, false));
-        let total_usage = nested(info, &["total_token_usage"])
-            .or_else(|| nested(info, &["total_usage"]))
-            .or_else(|| nested(payload, &["total_token_usage"]))
-            .or_else(|| nested(&value, &["total_token_usage"]))
-            .and_then(usage_snapshot);
-        let generic_usage = super::object_with_usage(&value);
-
-        let (counts, cumulative_snapshot) = if let Some(counts) = last_usage {
-            (counts, None)
-        } else if let Some(snapshot) = total_usage {
-            (snapshot.into(), Some(snapshot))
-        } else if let Some(usage) = generic_usage.and_then(counts_from_codex_usage) {
-            (usage.0, usage.1)
-        } else {
-            return Ok(None);
-        };
-
-        let project_path = project_path(&value);
-        Ok(Some(ParsedUsage {
-            counts,
-            cumulative_snapshot,
-            timestamp: timestamp(&value),
-            model: model(payload).or_else(|| model(&value)),
-            session_id: session_id(&value).or_else(|| source.session_id.clone()),
-            project_name: project_name(project_path.as_deref()),
-            project_path,
-            source_event_id: source_event_id(payload).or_else(|| source_event_id(&value)),
-            reported_cost_usd: None,
-        }))
+        self.apply_metadata(&value, metadata);
+        self.parse_value(source, &value)
     }
 }
 

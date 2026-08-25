@@ -35,6 +35,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         CREATE INDEX IF NOT EXISTS idx_usage_events_model ON usage_events(model);
         CREATE INDEX IF NOT EXISTS idx_usage_events_project_path ON usage_events(project_path);
         CREATE INDEX IF NOT EXISTS idx_usage_events_session_id ON usage_events(session_id);
+        CREATE INDEX IF NOT EXISTS idx_usage_events_source_file ON usage_events(source_file);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_provider_source_event
             ON usage_events(provider, source_event_id)
             WHERE source_event_id IS NOT NULL;
@@ -78,7 +79,11 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
             [],
         )?;
     }
-    connection.pragma_update(None, "user_version", 4)?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 7 {
+        reattribute_omp_sessions(connection)?;
+    }
+    connection.pragma_update(None, "user_version", 7)?;
     Ok(())
 }
 
@@ -89,6 +94,40 @@ fn has_column(connection: &Connection, table: &str, expected: &str) -> Result<bo
         .collect::<Result<Vec<_>, _>>()?
         .iter()
         .any(|column| column == expected))
+}
+
+fn reattribute_omp_sessions(connection: &Connection) -> Result<(), StorageError> {
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute(
+        "DELETE FROM usage_events
+         WHERE id IN (
+             SELECT pi.id
+             FROM usage_events AS pi
+             INNER JOIN usage_events AS keep
+               ON keep.provider = 'omp'
+              AND keep.source_event_id = pi.source_event_id
+             WHERE pi.provider = 'pi'
+               AND pi.source_event_id IS NOT NULL
+               AND replace(pi.source_file, '\\', '/') LIKE '%/.omp/%'
+         )",
+        [],
+    )?;
+    transaction.execute(
+        "UPDATE usage_events
+         SET provider = 'omp'
+         WHERE provider = 'pi'
+           AND replace(source_file, '\\', '/') LIKE '%/.omp/%'",
+        [],
+    )?;
+    transaction.execute(
+        "UPDATE file_cursors
+         SET provider = 'omp'
+         WHERE provider = 'pi'
+           AND replace(path, '\\', '/') LIKE '%/.omp/%'",
+        [],
+    )?;
+    transaction.commit()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -140,7 +179,125 @@ mod tests {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            7
         );
     }
+
+    #[test]
+    fn does_not_delete_omp_usage_on_later_opens() {
+        let connection = Connection::open_in_memory().unwrap();
+        run(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO usage_events (
+                    id, provider, timestamp, total_tokens, source_file, created_at
+                ) VALUES ('omp-1', 'omp', 1, 99, '/Users/me/.omp/agent/sessions/a.jsonl', 1)",
+                [],
+            )
+            .unwrap();
+
+        run(&connection).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM usage_events WHERE provider = 'omp'", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn reattributes_pi_omp_paths_without_deleting_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        run(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO usage_events (
+                    id, provider, timestamp, total_tokens, source_file, created_at
+                ) VALUES ('pi-omp', 'pi', 1, 11, '/Users/me/.omp/agent/sessions/a.jsonl', 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO file_cursors (
+                    path, provider, byte_offset, file_size, parser_version, updated_at
+                ) VALUES ('/Users/me/.omp/agent/sessions/a.jsonl', 'pi', 0, 0, 1, 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", 0)
+            .unwrap();
+
+        run(&connection).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT provider, total_tokens FROM usage_events WHERE id = 'pi-omp'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            ("omp".into(), 11)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT provider FROM file_cursors WHERE path LIKE '%a.jsonl'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "omp"
+        );
+    }
+
+    #[test]
+    fn reattribute_keeps_existing_omp_on_source_event_conflict() {
+        let connection = Connection::open_in_memory().unwrap();
+        run(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO usage_events (
+                    id, provider, timestamp, total_tokens, source_file, source_event_id, created_at
+                ) VALUES ('omp-keep', 'omp', 1, 7, '/Users/me/.omp/agent/sessions/a.jsonl', 'evt-1', 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO usage_events (
+                    id, provider, timestamp, total_tokens, source_file, source_event_id, created_at
+                ) VALUES ('pi-dup', 'pi', 1, 11, '/Users/me/.omp/agent/sessions/a.jsonl', 'evt-1', 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", 0)
+            .unwrap();
+
+        run(&connection).unwrap();
+
+        let rows = connection
+            .prepare("SELECT id, provider, total_tokens FROM usage_events ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![("omp-keep".into(), "omp".into(), 7)]);
+    }
+
+
+
 }
