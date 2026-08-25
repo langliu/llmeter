@@ -31,7 +31,7 @@ impl IncrementalJsonlReader {
     pub fn read(path: &Path, cursor: &FileCursor) -> io::Result<IncrementalRead> {
         let metadata = std::fs::metadata(path)?;
         let file_size = metadata.len();
-        let file_identity = file_identity(&metadata);
+        let file_identity = metadata_identity(&metadata);
         let identity_changed = cursor
             .file_identity
             .as_ref()
@@ -74,11 +74,7 @@ impl IncrementalJsonlReader {
         // incomplete JSON object and avoids advancing a cursor past a line
         // which the producer may still be writing.
         let next_offset = offset + line_start as u64;
-        let modified_at = metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-            .and_then(|value| i64::try_from(value.as_millis()).ok());
+        let modified_at = metadata_modified_at(&metadata);
 
         Ok(IncrementalRead {
             lines,
@@ -92,19 +88,14 @@ impl IncrementalJsonlReader {
 
     pub fn is_unchanged(path: &Path, cursor: &FileCursor) -> io::Result<bool> {
         let metadata = std::fs::metadata(path)?;
-        let identity = file_identity(&metadata);
-        let modified_at = metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-            .and_then(|value| i64::try_from(value.as_millis()).ok());
+        let identity = metadata_identity(&metadata);
         Ok(cursor.file_identity == identity
             && cursor.file_size == metadata.len()
-            && cursor.modified_at == modified_at)
+            && cursor.modified_at == metadata_modified_at(&metadata))
     }
 }
 
-fn file_identity(metadata: &std::fs::Metadata) -> Option<String> {
+pub fn metadata_identity(metadata: &std::fs::Metadata) -> Option<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -114,6 +105,14 @@ fn file_identity(metadata: &std::fs::Metadata) -> Option<String> {
     {
         Some(format!("{}:{:?}", metadata.len(), metadata.modified().ok()))
     }
+}
+
+pub fn metadata_modified_at(metadata: &std::fs::Metadata) -> Option<i64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .and_then(|value| i64::try_from(value.as_millis()).ok())
 }
 
 #[cfg(test)]

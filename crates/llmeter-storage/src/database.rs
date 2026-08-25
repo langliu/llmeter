@@ -1,12 +1,14 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
 
 use chrono::{DateTime, Utc};
 use llmeter_core::{FileCursor, Provider, TokenCounts, UsageEvent};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, params, params_from_iter, types::Value,
+};
 use thiserror::Error;
 
 use crate::migrations;
@@ -229,26 +231,9 @@ impl Database {
             }
             drop(statement);
 
-            let mut identity_statement = transaction.prepare(
-                "SELECT id, total_tokens FROM usage_events
-                 WHERE id = ?1
-                    OR (?3 IS NOT NULL AND provider = ?2 AND source_event_id = ?3
-                        AND (snapshot_scope = ?4 OR snapshot_scope IS NULL))
-                 LIMIT 1",
-            )?;
+            let identities = ExistingEventIndex::load(&transaction, events)?;
             for event in events {
-                let existing = identity_statement
-                    .query_row(
-                        params![
-                            event.id,
-                            event.provider.as_str(),
-                            event.source_event_id,
-                            event.snapshot_scope
-                        ],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-                    )
-                    .optional()?;
-                if let Some((database_id, total)) = existing {
+                if let Some((database_id, total)) = identities.get(event) {
                     event_ids.insert(event.id.clone());
                     if database_ids.insert(database_id) {
                         tokens = tokens.saturating_add(from_sqlite_u64(total));
@@ -510,17 +495,110 @@ impl Database {
     }
 }
 
+const IDENTITY_QUERY_CHUNK: usize = 400;
+
+struct ExistingEventIndex {
+    by_id: HashMap<String, (String, i64)>,
+    by_source: Vec<(String, String, Option<String>, String, i64)>,
+}
+
+impl ExistingEventIndex {
+    fn load(transaction: &Transaction<'_>, events: &[UsageEvent]) -> Result<Self, StorageError> {
+        let mut index = Self {
+            by_id: HashMap::new(),
+            by_source: Vec::new(),
+        };
+        if events.is_empty() {
+            return Ok(index);
+        }
+        let ids = events
+            .iter()
+            .map(|event| event.id.clone())
+            .collect::<Vec<_>>();
+        let source_ids = events
+            .iter()
+            .filter_map(|event| event.source_event_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for chunk in ids.chunks(IDENTITY_QUERY_CHUNK) {
+            index.extend_from_query(transaction, "id", chunk)?;
+        }
+        for chunk in source_ids.chunks(IDENTITY_QUERY_CHUNK) {
+            index.extend_from_query(transaction, "source_event_id", chunk)?;
+        }
+        Ok(index)
+    }
+
+    fn extend_from_query(
+        &mut self,
+        transaction: &Transaction<'_>,
+        column: &str,
+        values: &[String],
+    ) -> Result<(), StorageError> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        let sql = format!(
+            "SELECT id, provider, source_event_id, snapshot_scope, total_tokens
+             FROM usage_events WHERE {column} IN ({})",
+            placeholders(values.len()),
+        );
+        let values = values.iter().cloned().map(Value::Text).collect::<Vec<_>>();
+        let mut statement = transaction.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(values), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, provider, source_event_id, snapshot_scope, total) = row?;
+            self.by_id.insert(id.clone(), (id.clone(), total));
+            if let Some(source_event_id) = source_event_id {
+                self.by_source
+                    .push((provider, source_event_id, snapshot_scope, id, total));
+            }
+        }
+        Ok(())
+    }
+
+    fn get(&self, event: &UsageEvent) -> Option<(String, i64)> {
+        if let Some(existing) = self.by_id.get(&event.id) {
+            return Some(existing.clone());
+        }
+        let source_event_id = event.source_event_id.as_deref()?;
+        let provider = event.provider.as_str();
+        let mut null_scope = None;
+        for (candidate_provider, candidate_source, scope, id, tokens) in &self.by_source {
+            if candidate_provider != provider || candidate_source != source_event_id {
+                continue;
+            }
+            if scope.as_deref() == event.snapshot_scope.as_deref() {
+                return Some((id.clone(), *tokens));
+            }
+            if scope.is_none() {
+                null_scope = Some((id.clone(), *tokens));
+            }
+        }
+        null_scope
+    }
+}
+
+fn placeholders(count: usize) -> String {
+    std::iter::repeat_n("?", count)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn upsert_usage_events(
     transaction: &Transaction<'_>,
     events: &[UsageEvent],
 ) -> Result<UpsertSummary, StorageError> {
-    let mut existing_statement = transaction.prepare(
-        "SELECT id FROM usage_events
-         WHERE id = ?1
-            OR (?3 IS NOT NULL AND provider = ?2 AND source_event_id = ?3
-                AND (snapshot_scope = ?4 OR snapshot_scope IS NULL))
-         LIMIT 1",
-    )?;
+    let existing = ExistingEventIndex::load(transaction, events)?;
     let mut statement = transaction.prepare(
         "INSERT INTO usage_events (
             id, provider, model, session_id, project_path, project_name, timestamp,
@@ -550,17 +628,7 @@ fn upsert_usage_events(
     )?;
     let mut summary = UpsertSummary::default();
     for event in events {
-        let existing_id = existing_statement
-            .query_row(
-                params![
-                    event.id,
-                    event.provider.as_str(),
-                    event.source_event_id,
-                    event.snapshot_scope
-                ],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
+        let existing_id = existing.get(event).map(|(id, _)| id);
         // Rekey NULL-scope official IDs so the scoped unique index updates in place.
         if let Some(existing_id) = existing_id.as_deref()
             && existing_id != event.id
@@ -616,7 +684,6 @@ pub struct UsagePricingInput {
     pub estimated_cost_usd: Option<f64>,
 }
 
-
 fn to_sqlite_i64(value: u64) -> Result<i64, StorageError> {
     i64::try_from(value).map_err(|_| StorageError::NumericOverflow)
 }
@@ -633,7 +700,7 @@ mod tests {
     use llmeter_core::{Provider, UsageEvent, UsageSnapshot};
 
     use super::*;
-    use crate::UsageRepository;
+    use crate::{DashboardQuery, SessionQuery, UsageRepository};
 
     fn event(id: &str, source_event_id: Option<&str>, total: u64) -> UsageEvent {
         UsageEvent {
@@ -1051,5 +1118,123 @@ mod tests {
         assert_eq!(projects[0].total_tokens, 150);
         assert_eq!(projects[1].project_name, "llmeter");
         assert_eq!(projects[1].total_tokens, 25);
+    }
+
+    #[test]
+    fn dashboard_load_matches_individual_queries() {
+        let database = Database::open_in_memory().unwrap();
+        let now = Utc::now();
+        let mut today = event("today", Some("t"), 10);
+        today.timestamp = now;
+        let mut week = event("week", Some("w"), 20);
+        week.timestamp = now - chrono::Duration::days(3);
+        week.provider = Provider::Claude;
+        let mut month = event("month", Some("m"), 30);
+        month.timestamp = now - chrono::Duration::days(20);
+        month.provider = Provider::Pi;
+        database.insert_usage_events(&[today, week, month]).unwrap();
+
+        let repository = UsageRepository::new(database);
+        let end = now + chrono::Duration::seconds(1);
+        let today_start = now - chrono::Duration::hours(1);
+        let seven_start = now - chrono::Duration::days(7);
+        let thirty_start = now - chrono::Duration::days(30);
+        let loaded = repository
+            .load_dashboard(DashboardQuery {
+                today_start,
+                seven_start,
+                thirty_start,
+                heatmap_start: now - chrono::Duration::days(147),
+                overview_start: thirty_start,
+                overview_end: end,
+                now_end: end,
+                sessions: Some(SessionQuery::default()),
+            })
+            .unwrap();
+
+        assert_eq!(
+            loaded.today.total_tokens,
+            repository
+                .get_overview(today_start, end)
+                .unwrap()
+                .total_tokens
+        );
+        assert_eq!(
+            loaded.seven_days.total_tokens,
+            repository
+                .get_overview(seven_start, end)
+                .unwrap()
+                .total_tokens
+        );
+        assert_eq!(
+            loaded.thirty_days.total_tokens,
+            repository
+                .get_overview(thirty_start, end)
+                .unwrap()
+                .total_tokens
+        );
+        assert_eq!(loaded.session_count, 3);
+        assert_eq!(loaded.sessions.len(), 3);
+        assert_eq!(loaded.providers.len(), 3);
+    }
+
+    #[test]
+    fn sessions_can_be_filtered_by_provider_and_end_time() {
+        let database = Database::open_in_memory().unwrap();
+        let now = Utc::now();
+        let mut recent_codex = event("recent-codex", Some("a"), 10);
+        recent_codex.timestamp = now;
+        recent_codex.session_id = Some("codex-new".into());
+        let mut old_codex = event("old-codex", Some("b"), 20);
+        old_codex.timestamp = now - chrono::Duration::days(40);
+        old_codex.session_id = Some("codex-old".into());
+        let mut recent_claude = event("recent-claude", Some("c"), 30);
+        recent_claude.provider = Provider::Claude;
+        recent_claude.timestamp = now - chrono::Duration::days(2);
+        recent_claude.session_id = Some("claude-new".into());
+        database
+            .insert_usage_events(&[recent_codex, old_codex, recent_claude])
+            .unwrap();
+
+        let repository = UsageRepository::new(database);
+        assert_eq!(repository.get_sessions().unwrap().len(), 3);
+        assert_eq!(
+            repository
+                .get_sessions_matching(SessionQuery {
+                    provider: Some(Provider::Codex),
+                    ended_after: None,
+                })
+                .unwrap()
+                .len(),
+            2
+        );
+        let recent = repository
+            .get_sessions_matching(SessionQuery {
+                provider: Some(Provider::Codex),
+                ended_after: Some(now - chrono::Duration::days(7)),
+            })
+            .unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].session_id.as_deref(), Some("codex-new"));
+        assert_eq!(
+            repository
+                .load_dashboard(DashboardQuery {
+                    today_start: now - chrono::Duration::hours(1),
+                    seven_start: now - chrono::Duration::days(7),
+                    thirty_start: now - chrono::Duration::days(30),
+                    heatmap_start: now - chrono::Duration::days(147),
+                    overview_start: now - chrono::Duration::days(30),
+                    overview_end: now + chrono::Duration::seconds(1),
+                    now_end: now + chrono::Duration::seconds(1),
+                    sessions: Some(SessionQuery {
+                        provider: Some(Provider::Claude),
+                        ended_after: None,
+                    }),
+                })
+                .unwrap()
+                .session_count,
+            3,
+            "overview conversation count stays unfiltered"
+        );
     }
 }

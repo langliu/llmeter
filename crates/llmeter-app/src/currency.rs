@@ -75,11 +75,7 @@ pub fn format_amount(usd: f64, currency: DisplayCurrency, rates: &ExchangeRates)
     }
 }
 
-pub fn format_cost(
-    usd: Option<f64>,
-    currency: DisplayCurrency,
-    rates: &ExchangeRates,
-) -> String {
+pub fn format_cost(usd: Option<f64>, currency: DisplayCurrency, rates: &ExchangeRates) -> String {
     match usd {
         Some(value) => format_amount(value, currency, rates),
         None => t!("overview.unpriced").to_string(),
@@ -104,7 +100,10 @@ mod tests {
 
     #[test]
     fn usd_keeps_dollar_format() {
-        assert_eq!(format_amount(1.23, DisplayCurrency::Usd, &rates()), "$ 1.23");
+        assert_eq!(
+            format_amount(1.23, DisplayCurrency::Usd, &rates()),
+            "$ 1.23"
+        );
     }
 
     #[test]

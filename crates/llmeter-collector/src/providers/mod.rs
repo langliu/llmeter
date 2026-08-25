@@ -424,6 +424,13 @@ pub(crate) fn walk_jsonl(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+pub(crate) fn jsonl_exists(root: &Path) -> std::io::Result<bool> {
+    if !root.exists() {
+        return Ok(false);
+    }
+    jsonl_exists_inner(root)
+}
+
 fn walk_jsonl_inner(path: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
@@ -445,6 +452,27 @@ fn walk_jsonl_inner(path: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()
         walk_jsonl_inner(&entry?.path(), files)?;
     }
     Ok(())
+}
+
+fn jsonl_exists_inner(path: &Path) -> std::io::Result<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    if metadata.is_file() {
+        return Ok(path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl"));
+    }
+    if !metadata.is_dir() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(path)? {
+        if jsonl_exists_inner(&entry?.path())? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn deduplicate_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {

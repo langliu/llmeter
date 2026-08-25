@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Utc};
 use llmeter_core::ProviderDetection;
 use llmeter_storage::{
-    DailyModelUsage, DailyUsage, ModelUsage, Overview, ProjectUsage, ProviderUsage, RecentActivity,
-    SessionSummary, UsageRepository,
+    DailyModelUsage, DailyUsage, DashboardQuery, ModelUsage, Overview, ProjectUsage, ProviderUsage,
+    RecentActivity, SessionQuery, SessionSummary, UsageRepository,
 };
 
 #[derive(Clone, Debug)]
@@ -41,11 +41,12 @@ impl OverviewRangeSnapshot {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Self, llmeter_storage::StorageError> {
+        let (overview, daily, providers, models) = repository.load_overview_range(start, end)?;
         Ok(Self {
-            overview: repository.get_overview(start, end)?,
-            daily: repository.get_daily_usage(start, end)?,
-            providers: repository.get_provider_usage(start, end)?,
-            models: repository.get_model_usage(start, end)?,
+            overview,
+            daily,
+            providers,
+            models,
         })
     }
 }
@@ -55,36 +56,41 @@ impl UiSnapshot {
         repository: &UsageRepository,
         overview_start: DateTime<Utc>,
         overview_end: DateTime<Utc>,
-        include_sessions: bool,
+        sessions: Option<SessionQuery>,
     ) -> Result<Self, llmeter_storage::StorageError> {
         let now = Utc::now();
         let today_start = local_midnight(Local::now().date_naive());
         let seven_start = now - Duration::days(7);
         let thirty_start = now - Duration::days(30);
-        let sessions = if include_sessions {
-            repository.get_sessions()?
-        } else {
-            Vec::new()
-        };
-        Ok(Self {
-            today: repository.get_today_usage(today_start, now + Duration::seconds(1))?,
-            seven_days: repository.get_overview(seven_start, now + Duration::seconds(1))?,
-            thirty_days: repository.get_overview(thirty_start, now + Duration::seconds(1))?,
-            overview_range: OverviewRangeSnapshot::load(repository, overview_start, overview_end)?,
-            heatmap_daily: repository
-                .get_daily_usage(now - Duration::days(147), now + Duration::seconds(1))?,
-            heatmap_models: repository
-                .get_daily_model_usage(now - Duration::days(147), now + Duration::seconds(1))?,
-            providers: repository.get_provider_usage(thirty_start, now + Duration::seconds(1))?,
-            models: repository.get_model_usage(thirty_start, now + Duration::seconds(1))?,
-            projects: repository.get_project_usage(thirty_start, now + Duration::seconds(1))?,
-            recent: repository.get_recent_activity(8)?,
-            session_count: if include_sessions {
-                sessions.len() as u64
-            } else {
-                repository.get_session_count()?
-            },
+        let now_end = now + Duration::seconds(1);
+        let data = repository.load_dashboard(DashboardQuery {
+            today_start,
+            seven_start,
+            thirty_start,
+            heatmap_start: now - Duration::days(147),
+            overview_start,
+            overview_end,
+            now_end,
             sessions,
+        })?;
+        Ok(Self {
+            today: data.today,
+            seven_days: data.seven_days,
+            thirty_days: data.thirty_days,
+            overview_range: OverviewRangeSnapshot {
+                overview: data.overview,
+                daily: data.overview_daily,
+                providers: data.overview_providers,
+                models: data.overview_models,
+            },
+            heatmap_daily: data.heatmap_daily,
+            heatmap_models: data.heatmap_models,
+            providers: data.providers,
+            models: data.models,
+            projects: data.projects,
+            recent: data.recent,
+            session_count: data.session_count,
+            sessions: data.sessions,
             detections: Vec::new(),
             database_path: repository.database().path().to_path_buf(),
             last_sync: None,

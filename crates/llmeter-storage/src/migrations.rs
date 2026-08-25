@@ -105,7 +105,19 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         )?;
         reattribute_omp_sessions(connection)?;
     }
-    connection.pragma_update(None, "user_version", 8)?;
+    if version < 9 {
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_usage_events_provider_timestamp
+             ON usage_events(provider, timestamp)",
+            [],
+        )?;
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_usage_events_provider_source_file
+             ON usage_events(provider, source_file)",
+            [],
+        )?;
+    }
+    connection.pragma_update(None, "user_version", 9)?;
     Ok(())
 }
 
@@ -206,7 +218,7 @@ mod tests {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            8
+            9
         );
     }
 
@@ -321,5 +333,28 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(rows, vec![("omp-keep".into(), "omp".into(), 7)]);
+    }
+
+    #[test]
+    fn creates_composite_read_indexes() {
+        let connection = Connection::open_in_memory().unwrap();
+        run(&connection).unwrap();
+        let names = connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "idx_usage_events_provider_timestamp")
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "idx_usage_events_provider_source_file")
+        );
     }
 }

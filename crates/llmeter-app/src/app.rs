@@ -13,7 +13,7 @@ use llmeter_collector::{
     Collector, CollectorEvent, LimitCollector, providers::TRAE_CN_USAGE_SETTING,
 };
 use llmeter_core::LimitsSnapshot;
-use llmeter_storage::{SessionSummary, UsageRepository};
+use llmeter_storage::{SessionQuery, SessionSummary, UsageRepository};
 use rust_i18n::t;
 
 use crate::{
@@ -144,6 +144,21 @@ struct SnapshotUpdate {
     period: OverviewPeriod,
     custom_range: (NaiveDate, NaiveDate),
     generation: u64,
+    overview_generation: u64,
+}
+
+struct OverviewRangeUpdate {
+    range: Result<OverviewRangeSnapshot, String>,
+    period: OverviewPeriod,
+    custom_range: (NaiveDate, NaiveDate),
+    generation: u64,
+}
+
+struct SessionsUpdate {
+    sessions: Result<Vec<SessionSummary>, String>,
+    provider: SessionProviderFilter,
+    range: SessionRangeFilter,
+    generation: u64,
 }
 
 pub struct LLMeterView {
@@ -153,6 +168,10 @@ pub struct LLMeterView {
     limit_receiver: std::sync::mpsc::Receiver<LimitsSnapshot>,
     snapshot_sender: std::sync::mpsc::Sender<SnapshotUpdate>,
     snapshot_receiver: std::sync::mpsc::Receiver<SnapshotUpdate>,
+    overview_sender: std::sync::mpsc::Sender<OverviewRangeUpdate>,
+    overview_receiver: std::sync::mpsc::Receiver<OverviewRangeUpdate>,
+    sessions_sender: std::sync::mpsc::Sender<SessionsUpdate>,
+    sessions_receiver: std::sync::mpsc::Receiver<SessionsUpdate>,
     limit_refresh_started_at: Option<Instant>,
     pub(crate) limits: LimitsSnapshot,
     pub(crate) limits_refreshing: bool,
@@ -179,6 +198,10 @@ pub struct LLMeterView {
     pub(crate) overview_cards_width: f32,
     snapshot_generation: u64,
     applied_snapshot_generation: u64,
+    overview_generation: u64,
+    applied_overview_generation: u64,
+    sessions_generation: u64,
+    applied_sessions_generation: u64,
     _search_subscription: Subscription,
     _overview_date_subscription: Subscription,
     _appearance_subscription: Subscription,
@@ -192,6 +215,8 @@ impl LLMeterView {
         let limits = limit_collector.cached_snapshot();
         let (limit_sender, limit_receiver) = std::sync::mpsc::channel();
         let (snapshot_sender, snapshot_receiver) = std::sync::mpsc::channel();
+        let (overview_sender, overview_receiver) = std::sync::mpsc::channel();
+        let (sessions_sender, sessions_receiver) = std::sync::mpsc::channel();
         let theme_pref = ThemePreference::from_setting(
             repository.database().get_setting("theme").ok().flatten(),
         );
@@ -205,7 +230,11 @@ impl LLMeterView {
             .flatten()
             .is_some_and(|value| matches!(value.trim(), "1" | "true"));
         let currency = DisplayCurrency::from_setting(
-            repository.database().get_setting(CURRENCY_SETTING).ok().flatten(),
+            repository
+                .database()
+                .get_setting(CURRENCY_SETTING)
+                .ok()
+                .flatten(),
         );
         let fx_rates = llmeter_collector::fx::load_cached_exchange_rates(
             llmeter_collector::hooks::data_dir().join("cache"),
@@ -217,7 +246,7 @@ impl LLMeterView {
         let overview_custom_range = (today, today);
         let (overview_start, overview_end) =
             overview_period.bounds(Local::now(), overview_custom_range);
-        let snapshot = UiSnapshot::load(&repository, overview_start, overview_end, false)
+        let snapshot = UiSnapshot::load(&repository, overview_start, overview_end, None)
             .map(|snapshot| snapshot.with_detections(detections.clone()))
             .unwrap_or_else(|error| UiSnapshot {
                 today: Default::default(),
@@ -273,6 +302,10 @@ impl LLMeterView {
             limit_receiver,
             snapshot_sender,
             snapshot_receiver,
+            overview_sender,
+            overview_receiver,
+            sessions_sender,
+            sessions_receiver,
             limit_refresh_started_at: None,
             limits,
             limits_refreshing: false,
@@ -299,6 +332,10 @@ impl LLMeterView {
             overview_cards_width: 0.0,
             snapshot_generation: 0,
             applied_snapshot_generation: 0,
+            overview_generation: 0,
+            applied_overview_generation: 0,
+            sessions_generation: 0,
+            applied_sessions_generation: 0,
             _search_subscription,
             _overview_date_subscription,
             _appearance_subscription,
@@ -369,7 +406,6 @@ impl LLMeterView {
     pub(crate) fn format_amount(&self, usd: f64) -> String {
         currency::format_amount(usd, self.currency, &self.fx_rates)
     }
-
 
     pub(crate) fn set_locale_preference(
         &mut self,
@@ -480,9 +516,56 @@ impl LLMeterView {
         custom: (NaiveDate, NaiveDate),
         cx: &mut Context<Self>,
     ) {
-        let repository = UsageRepository::new(self.collector.engine().database().clone());
-        let (start, end) = period.bounds(Local::now(), custom);
-        match OverviewRangeSnapshot::load(&repository, start, end) {
+        self.overview_period = period;
+        // Period changes do not advance applied_snapshot_generation. An in-flight
+        // full snapshot must still be able to land today/heatmap/session fields.
+        self.snapshot_generation = self.snapshot_generation.wrapping_add(1);
+        self.overview_generation = self.overview_generation.wrapping_add(1);
+        let generation = self.overview_generation;
+        if cfg!(test) {
+            let repository = UsageRepository::new(self.collector.engine().database().clone());
+            let (start, end) = period.bounds(Local::now(), custom);
+            let update = OverviewRangeUpdate {
+                range: OverviewRangeSnapshot::load(&repository, start, end)
+                    .map_err(|error| format!("overview query failed: {error}")),
+                period,
+                custom_range: custom,
+                generation,
+            };
+            self.apply_overview_range(update);
+            cx.notify();
+            return;
+        }
+        let collector = self.collector.clone();
+        let sender = self.overview_sender.clone();
+        std::thread::Builder::new()
+            .name("llmeter-overview".into())
+            .spawn(move || {
+                let repository = UsageRepository::new(collector.engine().database().clone());
+                let (start, end) = period.bounds(Local::now(), custom);
+                let _ = sender.send(OverviewRangeUpdate {
+                    range: OverviewRangeSnapshot::load(&repository, start, end)
+                        .map_err(|error| format!("overview query failed: {error}")),
+                    period,
+                    custom_range: custom,
+                    generation,
+                });
+            })
+            .ok();
+        cx.notify();
+    }
+
+    fn apply_overview_range(&mut self, update: OverviewRangeUpdate) -> bool {
+        if update.generation < self.applied_overview_generation {
+            return false;
+        }
+        let range_matches = update.period == self.overview_period
+            && (update.period != OverviewPeriod::Custom
+                || update.custom_range == self.overview_custom_range);
+        if !range_matches {
+            return false;
+        }
+        match update.range {
             Ok(snapshot) => {
                 if matches!(
                     self.overview_provider,
@@ -491,16 +574,20 @@ impl LLMeterView {
                 ) {
                     self.overview_provider = OverviewProviderFilter::None;
                 }
-                self.snapshot_generation = self.snapshot_generation.wrapping_add(1);
-                self.overview_period = period;
+                self.applied_overview_generation = update.generation;
                 self.snapshot.overview_range = snapshot;
-                cx.notify();
+                true
             }
             Err(error) => {
-                self.snapshot
+                if !self
+                    .snapshot
                     .warnings
-                    .push(format!("overview query failed: {error}"));
-                cx.notify();
+                    .iter()
+                    .any(|warning| warning == &error)
+                {
+                    self.snapshot.warnings.push(error);
+                }
+                true
             }
         }
     }
@@ -510,15 +597,96 @@ impl LLMeterView {
         filter: SessionProviderFilter,
         cx: &mut Context<Self>,
     ) {
+        if self.session_provider == filter {
+            return;
+        }
         self.session_provider = filter;
         self.reset_session_scroll();
+        self.reload_filtered_sessions();
         cx.notify();
     }
 
     pub(crate) fn set_session_range(&mut self, filter: SessionRangeFilter, cx: &mut Context<Self>) {
+        if self.session_range == filter {
+            return;
+        }
         self.session_range = filter;
         self.reset_session_scroll();
+        self.reload_filtered_sessions();
         cx.notify();
+    }
+
+    fn session_query(&self) -> SessionQuery {
+        SessionQuery {
+            provider: match self.session_provider {
+                SessionProviderFilter::All => None,
+                SessionProviderFilter::Provider(provider) => Some(provider),
+            },
+            ended_after: self.session_range.start(Utc::now()),
+        }
+    }
+
+    fn reload_filtered_sessions(&mut self) {
+        if cfg!(test) || self.active_page != DashboardPage::Sessions {
+            return;
+        }
+        self.sessions_generation = self.sessions_generation.wrapping_add(1);
+        let update = (
+            self.session_provider,
+            self.session_range,
+            self.sessions_generation,
+        );
+        let collector = self.collector.clone();
+        let sender = self.sessions_sender.clone();
+        let query = self.session_query();
+        std::thread::Builder::new()
+            .name("llmeter-sessions".into())
+            .spawn(move || {
+                let repository = UsageRepository::new(collector.engine().database().clone());
+                let _ = sender.send(SessionsUpdate {
+                    sessions: repository
+                        .get_sessions_matching(query)
+                        .map_err(|error| format!("session query failed: {error}")),
+                    provider: update.0,
+                    range: update.1,
+                    generation: update.2,
+                });
+            })
+            .ok();
+    }
+
+    fn apply_sessions(&mut self, update: SessionsUpdate) -> bool {
+        if update.generation < self.applied_sessions_generation {
+            return false;
+        }
+        if update.provider != self.session_provider || update.range != self.session_range {
+            return false;
+        }
+        match update.sessions {
+            Ok(sessions) => {
+                if let Some(project) = self.session_project.as_deref()
+                    && !sessions
+                        .iter()
+                        .any(|session| session.project_label().as_deref() == Some(project))
+                {
+                    self.session_project = None;
+                }
+                self.applied_sessions_generation = update.generation;
+                self.snapshot.sessions = sessions;
+                true
+            }
+            Err(error) => {
+                if !self
+                    .snapshot
+                    .warnings
+                    .iter()
+                    .any(|warning| warning == &error)
+                {
+                    self.snapshot.warnings.push(error);
+                }
+                true
+            }
+        }
     }
 
     pub(crate) fn set_session_project(&mut self, project: Option<String>, cx: &mut Context<Self>) {
@@ -660,6 +828,16 @@ impl LLMeterView {
                 changed = true;
             }
         }
+        while let Ok(update) = self.overview_receiver.try_recv() {
+            if self.apply_overview_range(update) {
+                changed = true;
+            }
+        }
+        while let Ok(update) = self.sessions_receiver.try_recv() {
+            if self.apply_sessions(update) {
+                changed = true;
+            }
+        }
         while let Ok(snapshot) = self.limit_receiver.try_recv() {
             self.limits = snapshot;
             self.limits_refreshing = false;
@@ -698,15 +876,18 @@ impl LLMeterView {
     }
 
     fn reload_snapshot(&mut self, sync: Option<(chrono::DateTime<Utc>, Vec<String>)>) {
-        let include_sessions = self.active_page == DashboardPage::Sessions;
+        let session_query =
+            (self.active_page == DashboardPage::Sessions).then(|| self.session_query());
+        let include_sessions = session_query.is_some();
         self.snapshot_generation = self.snapshot_generation.wrapping_add(1);
         let update_meta = (
             self.overview_period,
             self.overview_custom_range,
             self.snapshot_generation,
+            self.overview_generation,
         );
         if cfg!(test) {
-            if let Some(snapshot) = self.load_snapshot(include_sessions) {
+            if let Some(snapshot) = self.load_snapshot(session_query) {
                 self.apply_snapshot(SnapshotUpdate {
                     snapshot: Some(snapshot),
                     load_error: None,
@@ -715,6 +896,7 @@ impl LLMeterView {
                     period: update_meta.0,
                     custom_range: update_meta.1,
                     generation: update_meta.2,
+                    overview_generation: update_meta.3,
                 });
             }
             return;
@@ -728,20 +910,26 @@ impl LLMeterView {
             .name("llmeter-snapshot".into())
             .spawn(move || {
                 let repository = UsageRepository::new(collector.engine().database().clone());
+                let refresh_detections = sync.is_some();
                 let update = match UiSnapshot::load(
                     &repository,
                     overview_start,
                     overview_end,
-                    include_sessions,
+                    session_query,
                 ) {
                     Ok(snapshot) => SnapshotUpdate {
-                        snapshot: Some(snapshot.with_detections(collector.detect_all())),
+                        snapshot: Some(snapshot.with_detections(if refresh_detections {
+                            collector.refresh_detections()
+                        } else {
+                            collector.cached_detections()
+                        })),
                         load_error: None,
                         sync,
                         include_sessions,
                         period: update_meta.0,
                         custom_range: update_meta.1,
                         generation: update_meta.2,
+                        overview_generation: update_meta.3,
                     },
                     Err(error) => {
                         tracing::warn!(error = %error, "snapshot query failed");
@@ -753,6 +941,7 @@ impl LLMeterView {
                             period: update_meta.0,
                             custom_range: update_meta.1,
                             generation: update_meta.2,
+                            overview_generation: update_meta.3,
                         }
                     }
                 };
@@ -761,14 +950,14 @@ impl LLMeterView {
             .ok();
     }
 
-    fn load_snapshot(&self, include_sessions: bool) -> Option<UiSnapshot> {
+    fn load_snapshot(&self, sessions: Option<SessionQuery>) -> Option<UiSnapshot> {
         let repository = UsageRepository::new(self.collector.engine().database().clone());
         let (overview_start, overview_end) = self
             .overview_period
             .bounds(Local::now(), self.overview_custom_range);
         let snapshot =
-            UiSnapshot::load(&repository, overview_start, overview_end, include_sessions).ok()?;
-        Some(snapshot.with_detections(self.collector.detect_all()))
+            UiSnapshot::load(&repository, overview_start, overview_end, sessions).ok()?;
+        Some(snapshot.with_detections(self.collector.cached_detections()))
     }
 
     fn apply_snapshot(&mut self, update: SnapshotUpdate) -> bool {
@@ -808,6 +997,7 @@ impl LLMeterView {
             include_sessions,
             period,
             custom_range,
+            overview_generation,
             ..
         } = update
         else {
@@ -833,7 +1023,8 @@ impl LLMeterView {
 
         let range_matches = period == self.overview_period
             && (period != OverviewPeriod::Custom || custom_range == self.overview_custom_range);
-        if range_matches {
+        let overview_is_current = overview_generation >= self.applied_overview_generation;
+        if range_matches && overview_is_current {
             if matches!(
                 self.overview_provider,
                 OverviewProviderFilter::Provider(selected)
@@ -1079,7 +1270,6 @@ mod tests {
         });
     }
 
-
     #[test]
     fn locale_preference_from_setting_parses_values() {
         assert_eq!(
@@ -1171,6 +1361,66 @@ mod tests {
     }
 
     #[gpui::test]
+    fn overview_period_change_does_not_drop_in_flight_snapshot(cx: &mut TestAppContext) {
+        let (view, cx) = setup_sessions_page(cx);
+        view.update(cx, |view, cx| {
+            view.snapshot.today.total_tokens = 1;
+            view.snapshot.overview_range.overview.total_tokens = 10;
+            view.snapshot_generation = 1;
+            view.applied_snapshot_generation = 1;
+
+            view.set_overview_period(OverviewPeriod::Week, cx);
+            view.snapshot.overview_range.overview.total_tokens = 65;
+
+            let mut inflight = view.snapshot.clone();
+            inflight.today.total_tokens = 99;
+            inflight.overview_range.overview.total_tokens = 48;
+            assert!(
+                view.apply_snapshot(SnapshotUpdate {
+                    snapshot: Some(inflight),
+                    load_error: None,
+                    sync: None,
+                    include_sessions: false,
+                    period: OverviewPeriod::Day,
+                    custom_range: view.overview_custom_range,
+                    overview_generation: view.overview_generation,
+                    generation: 1,
+                }),
+                "an in-flight full snapshot must still apply after a period change"
+            );
+            assert_eq!(view.overview_period, OverviewPeriod::Week);
+            assert_eq!(view.snapshot.overview_range.overview.total_tokens, 65);
+            assert_eq!(view.snapshot.today.total_tokens, 99);
+        });
+    }
+
+    #[gpui::test]
+    fn older_same_period_snapshot_does_not_replace_newer_overview(cx: &mut TestAppContext) {
+        let (view, cx) = setup_sessions_page(cx);
+        view.update(cx, |view, cx| {
+            view.set_overview_period(OverviewPeriod::Week, cx);
+            view.snapshot.overview_range.overview.total_tokens = 65;
+            view.snapshot.today.total_tokens = 1;
+
+            let mut stale = view.snapshot.clone();
+            stale.today.total_tokens = 99;
+            stale.overview_range.overview.total_tokens = 48;
+            assert!(view.apply_snapshot(SnapshotUpdate {
+                snapshot: Some(stale),
+                load_error: None,
+                sync: None,
+                include_sessions: false,
+                period: OverviewPeriod::Week,
+                custom_range: view.overview_custom_range,
+                overview_generation: view.applied_overview_generation.saturating_sub(1),
+                generation: view.snapshot_generation,
+            }));
+            assert_eq!(view.snapshot.today.total_tokens, 99);
+            assert_eq!(view.snapshot.overview_range.overview.total_tokens, 65);
+        });
+    }
+
+    #[gpui::test]
     fn stale_snapshot_does_not_clobber_overview_period(cx: &mut TestAppContext) {
         let (view, cx) = setup_sessions_page(cx);
         view.update(cx, |view, cx| {
@@ -1189,6 +1439,7 @@ mod tests {
                     include_sessions: false,
                     period: OverviewPeriod::Day,
                     custom_range: view.overview_custom_range,
+                    overview_generation: view.overview_generation,
                     generation: view.snapshot_generation,
                 }),
                 "current generation should still apply non-range fields"
@@ -1212,6 +1463,7 @@ mod tests {
                     include_sessions: false,
                     period: OverviewPeriod::Week,
                     custom_range: view.overview_custom_range,
+                    overview_generation: view.overview_generation,
                     generation: completed,
                 }),
                 "a finished load must apply even if a newer reload already started"
@@ -1233,6 +1485,7 @@ mod tests {
                     include_sessions: false,
                     period: OverviewPeriod::Week,
                     custom_range: view.overview_custom_range,
+                    overview_generation: view.overview_generation,
                     generation: completed.wrapping_sub(1),
                 }),
                 "older snapshot generation must be ignored"
@@ -1251,6 +1504,7 @@ mod tests {
                 include_sessions: false,
                 period: OverviewPeriod::Week,
                 custom_range: view.overview_custom_range,
+                overview_generation: view.overview_generation,
                 generation: view.snapshot_generation,
             }));
             assert_eq!(view.snapshot.last_sync, Some(synced_at));
@@ -1280,6 +1534,7 @@ mod tests {
                 include_sessions: false,
                 period: OverviewPeriod::Week,
                 custom_range: view.overview_custom_range,
+                overview_generation: view.overview_generation,
                 generation: view.snapshot_generation,
             }));
             assert_eq!(

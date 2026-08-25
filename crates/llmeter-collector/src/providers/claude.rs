@@ -5,7 +5,7 @@ use llmeter_core::{Provider, ProviderDetection, SourceFile, SourceFormat};
 
 use super::{
     PARSER_VERSION, ParsedUsage, ProviderAdapter, counts_from_usage, data_status, home_dir,
-    json_value, model, object_for_key, object_with_usage, project_name, project_path, session_id,
+    json_value, jsonl_exists, model, object_for_key, project_name, project_path, session_id,
     source_event_id, timestamp, walk_jsonl,
 };
 
@@ -45,11 +45,10 @@ impl ProviderAdapter for ClaudeAdapter {
     fn detect(&self) -> Result<ProviderDetection> {
         let root = self.home.join(".claude");
         let projects = self.projects_root();
-        let files = walk_jsonl(&projects)?;
         Ok(data_status(
             Provider::Claude,
-            vec![root, projects],
-            !files.is_empty(),
+            vec![root, projects.clone()],
+            jsonl_exists(&projects)?,
             None,
         ))
     }
@@ -79,7 +78,11 @@ impl ProviderAdapter for ClaudeAdapter {
 
     fn parse_line(&self, source: &SourceFile, line: &[u8]) -> Result<Option<ParsedUsage>> {
         let value = json_value(line)?;
-        let usage = object_for_key(&value, "usage").or_else(|| object_with_usage(&value));
+        let usage = value
+            .get("message")
+            .and_then(|message| message.get("usage"))
+            .or_else(|| value.get("usage"))
+            .or_else(|| object_for_key(&value, "usage"));
         let Some(usage) = usage else {
             return Ok(None);
         };

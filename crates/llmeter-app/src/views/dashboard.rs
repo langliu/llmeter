@@ -74,42 +74,18 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
     let active_page = view.active_page;
     let p = Palette::from_app(cx);
 
-    let mut provider_rows = div().flex().flex_col().gap_2();
-    for provider in &snapshot.providers {
-        provider_rows = provider_rows.child(provider_row(provider, view, p));
-    }
-    if snapshot.providers.is_empty() {
-        provider_rows = provider_rows.child(empty_state(t!("overview.no_usage").to_string(), p));
-    }
-
-    let mut model_rows = div().flex().flex_col().gap_2();
-    for model in &snapshot.models {
-        model_rows = model_rows.child(model_row(model, view, p));
-    }
-    if snapshot.models.is_empty() {
-        model_rows = model_rows.child(empty_state(t!("overview.models_pending").to_string(), p));
-    }
-
-    let mut activity_rows = div().flex().flex_col();
-    for activity in snapshot.recent.iter().take(6) {
-        activity_rows = activity_rows.child(activity_row(activity, p));
-    }
-    if snapshot.recent.is_empty() {
-        activity_rows =
-            activity_rows.child(empty_state(t!("overview.waiting_logs").to_string(), p));
-    }
-
-    let mut project_rows = div().flex().flex_col();
-    for project in &snapshot.projects {
-        project_rows = project_rows.child(project_row(project, view, p));
-    }
-    if snapshot.projects.is_empty() {
-        project_rows =
-            project_rows.child(empty_state(t!("overview.projects_pending").to_string(), p));
-    }
-
     let content = match active_page {
-        DashboardPage::Overview => overview_page(view, snapshot, activity_rows, p, cx),
+        DashboardPage::Overview => {
+            let mut activity_rows = div().flex().flex_col();
+            for activity in snapshot.recent.iter().take(6) {
+                activity_rows = activity_rows.child(activity_row(activity, p));
+            }
+            if snapshot.recent.is_empty() {
+                activity_rows =
+                    activity_rows.child(empty_state(t!("overview.waiting_logs").to_string(), p));
+            }
+            overview_page(view, snapshot, activity_rows, p, cx)
+        }
         DashboardPage::Sessions => div()
             .size_full()
             .child(sessions_page(view, cx))
@@ -118,47 +94,8 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
             .w_full()
             .child(limits_page(view, cx))
             .into_any_element(),
-        DashboardPage::Providers => div()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .px_4()
-            .py_1()
-            .child(page_heading(
-                t!("providers.title").to_string(),
-                t!("providers.subtitle").to_string(),
-                p,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .gap_4()
-                    .child(panel(
-                        t!("providers.usage_30").to_string(),
-                        provider_rows,
-                        p,
-                    ))
-                    .child(panel(t!("providers.model_30").to_string(), model_rows, p)),
-            )
-            .child(panel(
-                t!("providers.status").to_string(),
-                provider_statuses(snapshot, p),
-                p,
-            ))
-            .into_any_element(),
-        DashboardPage::Projects => div()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .px_4()
-            .py_1()
-            .child(page_heading(
-                t!("projects.title").to_string(),
-                t!("projects.subtitle").to_string(),
-                p,
-            ))
-            .child(panel(t!("projects.usage_30").to_string(), project_rows, p))
-            .into_any_element(),
+        DashboardPage::Providers => providers_page(view, snapshot, p),
+        DashboardPage::Projects => projects_page(view, snapshot, p),
         DashboardPage::Settings => div()
             .size_full()
             .child(settings_page(view, cx))
@@ -198,6 +135,78 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
         .bg(p.background.opacity(0.55))
         .child(sidebar(active_page, cx))
         .child(main)
+}
+
+fn providers_page(view: &LLMeterView, snapshot: &UiSnapshot, p: Palette) -> gpui::AnyElement {
+    let mut provider_rows = div().flex().flex_col().gap_2();
+    for provider in &snapshot.providers {
+        provider_rows = provider_rows.child(provider_row(provider, view, p));
+    }
+    if snapshot.providers.is_empty() {
+        provider_rows = provider_rows.child(empty_state(t!("overview.no_usage").to_string(), p));
+    }
+
+    let mut model_rows = div().flex().flex_col().gap_2();
+    for model in &snapshot.models {
+        model_rows = model_rows.child(model_row(model, view, p));
+    }
+    if snapshot.models.is_empty() {
+        model_rows = model_rows.child(empty_state(t!("overview.models_pending").to_string(), p));
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_4()
+        .px_4()
+        .py_1()
+        .child(page_heading(
+            t!("providers.title").to_string(),
+            t!("providers.subtitle").to_string(),
+            p,
+        ))
+        .child(
+            div()
+                .flex()
+                .gap_4()
+                .child(panel(
+                    t!("providers.usage_30").to_string(),
+                    provider_rows,
+                    p,
+                ))
+                .child(panel(t!("providers.model_30").to_string(), model_rows, p)),
+        )
+        .child(panel(
+            t!("providers.status").to_string(),
+            provider_statuses(snapshot, p),
+            p,
+        ))
+        .into_any_element()
+}
+
+fn projects_page(view: &LLMeterView, snapshot: &UiSnapshot, p: Palette) -> gpui::AnyElement {
+    let mut project_rows = div().flex().flex_col();
+    for project in &snapshot.projects {
+        project_rows = project_rows.child(project_row(project, view, p));
+    }
+    if snapshot.projects.is_empty() {
+        project_rows =
+            project_rows.child(empty_state(t!("overview.projects_pending").to_string(), p));
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_4()
+        .px_4()
+        .py_1()
+        .child(page_heading(
+            t!("projects.title").to_string(),
+            t!("projects.subtitle").to_string(),
+            p,
+        ))
+        .child(panel(t!("projects.usage_30").to_string(), project_rows, p))
+        .into_any_element()
 }
 
 fn overview_page(
@@ -398,7 +407,7 @@ fn overview_page(
                     }
                     let view_entity = view_entity.clone();
                     window.on_next_frame(move |_, app| {
-                        let _ = view_entity.update(app, |view, cx| {
+                        view_entity.update(app, |view, cx| {
                             if view.set_overview_cards_width(width) {
                                 cx.notify();
                             }
@@ -734,11 +743,13 @@ fn all_model_detail(
                 .text_color(p.muted_foreground)
                 .child(t!("overview.all_models_description").to_string()),
         )
-        .child(
-            div()
-                .pt_2()
-                .child(model_detail_rows(models, total_tokens, rgb(0x16a34a), view, p)),
-        )
+        .child(div().pt_2().child(model_detail_rows(
+            models,
+            total_tokens,
+            rgb(0x16a34a),
+            view,
+            p,
+        )))
         .into_any_element()
 }
 
@@ -1745,7 +1756,11 @@ fn heatmap_level_color(level: usize, p: Palette) -> gpui::Hsla {
     }
 }
 
-fn trend(daily: &[llmeter_storage::DailyUsage], view: &LLMeterView, p: Palette) -> gpui::AnyElement {
+fn trend(
+    daily: &[llmeter_storage::DailyUsage],
+    view: &LLMeterView,
+    p: Palette,
+) -> gpui::AnyElement {
     if daily.is_empty() {
         return div()
             .size_full()
@@ -2013,8 +2028,6 @@ fn format_heatmap_tokens(value: u64) -> String {
         value.to_string()
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

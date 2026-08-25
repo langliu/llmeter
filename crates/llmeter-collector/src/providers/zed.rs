@@ -18,20 +18,24 @@ const ZED_PARSER_VERSION: u32 = 6;
 const REQUIRED_COLUMNS: &[&str] = &["id", "updated_at", "data_type", "data", "folder_paths"];
 const TELEMETRY_USAGE_MARKER: &str = "Agent Thread Completion Usage Updated";
 
-#[derive(Clone)]
+type PromptTimes = HashMap<String, Vec<DateTime<Utc>>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PromptLogFingerprint {
     path: PathBuf,
     identity: Option<String>,
     size: u64,
+    modified_at: Option<i64>,
 }
 
 pub struct ZedAdapter {
     databases: Vec<PathBuf>,
     telemetry_logs: Vec<PathBuf>,
-    prompt_times: Mutex<Option<Arc<HashMap<String, Vec<DateTime<Utc>>>>>>,
+    prompt_times: Mutex<Option<Arc<PromptTimes>>>,
     prompt_logs: Mutex<Vec<PromptLogFingerprint>>,
     prompt_index: Mutex<HashMap<PathBuf, HashMap<String, usize>>>,
     prompt_stamps: Mutex<HashMap<(PathBuf, String, String), DateTime<Utc>>>,
+    telemetry_ids: Mutex<Option<(Vec<PromptLogFingerprint>, HashSet<String>)>>,
 }
 
 impl Default for ZedAdapter {
@@ -74,6 +78,7 @@ impl ZedAdapter {
             prompt_logs: Mutex::new(Vec::new()),
             prompt_index: Mutex::new(HashMap::new()),
             prompt_stamps: Mutex::new(HashMap::new()),
+            telemetry_ids: Mutex::new(None),
         }
     }
 
@@ -107,8 +112,19 @@ impl ZedAdapter {
     }
 
     fn telemetry_usage_thread_ids(&self) -> HashSet<String> {
+        let logs = self.existing_telemetry();
+        let fingerprint = prompt_log_fingerprints(&logs);
+        if let Some((previous, ids)) = self
+            .telemetry_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            && previous == &fingerprint
+        {
+            return ids.clone();
+        }
         let mut ids = HashSet::new();
-        for path in self.existing_telemetry() {
+        for path in logs {
             let Ok(text) = std::fs::read_to_string(path) else {
                 continue;
             };
@@ -128,6 +144,10 @@ impl ZedAdapter {
                 }
             }
         }
+        *self
+            .telemetry_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((fingerprint, ids.clone()));
         ids
     }
 
@@ -139,18 +159,26 @@ impl ZedAdapter {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
+        let cached = self
+            .prompt_times
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some();
+        if cached && previous == fingerprint {
+            return;
+        }
         *self
             .prompt_times
             .lock()
             .unwrap_or_else(|error| error.into_inner()) =
             Some(Arc::new(all_prompt_request_times(&logs)));
-        *self
-            .prompt_logs
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = fingerprint.clone();
         if prompt_logs_rewound(&previous, &fingerprint) {
             self.reset_prompt_indexes(None);
         }
+        *self
+            .prompt_logs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = fingerprint;
     }
 
     fn prompt_times(&self) -> Arc<HashMap<String, Vec<DateTime<Utc>>>> {
@@ -663,6 +691,14 @@ fn log_identity(metadata: &std::fs::Metadata) -> Option<String> {
     }
 }
 
+fn log_modified_at(metadata: &std::fs::Metadata) -> Option<i64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+}
+
 fn prompt_log_fingerprints(logs: &[PathBuf]) -> Vec<PromptLogFingerprint> {
     logs.iter()
         .map(|path| {
@@ -671,6 +707,7 @@ fn prompt_log_fingerprints(logs: &[PathBuf]) -> Vec<PromptLogFingerprint> {
                 path: path.clone(),
                 identity: meta.as_ref().and_then(log_identity),
                 size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                modified_at: meta.as_ref().and_then(log_modified_at),
             }
         })
         .collect()
@@ -683,7 +720,11 @@ fn prompt_logs_rewound(old: &[PromptLogFingerprint], new: &[PromptLogFingerprint
     old.iter().any(
         |previous| match new.iter().find(|next| next.path == previous.path) {
             None => true,
-            Some(next) => next.identity != previous.identity || next.size < previous.size,
+            Some(next) => {
+                next.identity != previous.identity
+                    || next.size < previous.size
+                    || (next.size == previous.size && next.modified_at != previous.modified_at)
+            }
         },
     )
 }
@@ -1266,23 +1307,34 @@ mod tests {
             path: path.clone(),
             identity: Some("1:2".into()),
             size: 10,
+            modified_at: Some(1),
         }];
         let appended = vec![PromptLogFingerprint {
             path: path.clone(),
             identity: Some("1:2".into()),
             size: 40,
+            modified_at: Some(2),
+        }];
+        let rewritten = vec![PromptLogFingerprint {
+            path: path.clone(),
+            identity: Some("1:2".into()),
+            size: 10,
+            modified_at: Some(3),
         }];
         let shrunk = vec![PromptLogFingerprint {
             path: path.clone(),
             identity: Some("1:2".into()),
             size: 8,
+            modified_at: Some(4),
         }];
         let replaced = vec![PromptLogFingerprint {
             path,
             identity: Some("1:9".into()),
             size: 40,
+            modified_at: Some(5),
         }];
         assert!(!prompt_logs_rewound(&old, &appended));
+        assert!(prompt_logs_rewound(&old, &rewritten));
         assert!(prompt_logs_rewound(&old, &shrunk));
         assert!(prompt_logs_rewound(&old, &replaced));
         assert!(prompt_logs_rewound(&old, &[]));

@@ -11,8 +11,8 @@ use serde_json::Value;
 
 use super::{
     ParsedUsage, ProviderAdapter, counts_from_usage, data_status, deduplicate_paths, home_dir,
-    json_value, model, object_for_key, object_with_usage, project_name, project_path, session_id,
-    source_event_id, timestamp, walk_jsonl,
+    json_value, jsonl_exists, model, object_for_key, object_with_usage, project_name, project_path,
+    session_id, source_event_id, timestamp, walk_jsonl,
 };
 
 const OPENCODE_PARSER_VERSION: u32 = 2;
@@ -98,8 +98,6 @@ impl ProviderAdapter for OpenCodeAdapter {
 
     fn detect(&self) -> Result<ProviderDetection> {
         let roots = self.roots();
-        let jsonl = self.jsonl_files()?;
-        let sqlite = self.sqlite_files()?;
         if let Some((path, table)) = self.supported_sqlite_source()? {
             return Ok(data_status(
                 Provider::OpenCode,
@@ -111,9 +109,17 @@ impl ProviderAdapter for OpenCodeAdapter {
                 )),
             ));
         }
-        if !jsonl.is_empty() {
+        let mut has_jsonl = false;
+        for root in &roots {
+            if jsonl_exists(root)? {
+                has_jsonl = true;
+                break;
+            }
+        }
+        if has_jsonl {
             return Ok(data_status(Provider::OpenCode, roots, true, None));
         }
+        let sqlite = self.sqlite_files()?;
         if let Some(path) = sqlite.first() {
             return Ok(ProviderDetection {
                 provider: Provider::OpenCode,

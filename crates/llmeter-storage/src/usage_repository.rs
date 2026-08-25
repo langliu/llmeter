@@ -2,7 +2,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use llmeter_core::Provider;
-use rusqlite::params;
+use rusqlite::{Connection, params, params_from_iter, types::Value};
 
 use crate::{Database, StorageError, database::from_sqlite_u64};
 
@@ -199,6 +199,56 @@ pub struct UsageRepository {
     database: Database,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct DashboardQuery {
+    pub today_start: DateTime<Utc>,
+    pub seven_start: DateTime<Utc>,
+    pub thirty_start: DateTime<Utc>,
+    pub heatmap_start: DateTime<Utc>,
+    pub overview_start: DateTime<Utc>,
+    pub overview_end: DateTime<Utc>,
+    pub now_end: DateTime<Utc>,
+    pub sessions: Option<SessionQuery>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionQuery {
+    pub provider: Option<Provider>,
+    pub ended_after: Option<DateTime<Utc>>,
+}
+
+impl SessionQuery {
+    pub fn is_unfiltered(self) -> bool {
+        self.provider.is_none() && self.ended_after.is_none()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DashboardSnapshot {
+    pub today: Overview,
+    pub seven_days: Overview,
+    pub thirty_days: Overview,
+    pub overview: Overview,
+    pub overview_daily: Vec<DailyUsage>,
+    pub overview_providers: Vec<ProviderUsage>,
+    pub overview_models: Vec<ModelUsage>,
+    pub heatmap_daily: Vec<DailyUsage>,
+    pub heatmap_models: Vec<DailyModelUsage>,
+    pub providers: Vec<ProviderUsage>,
+    pub models: Vec<ModelUsage>,
+    pub projects: Vec<ProjectUsage>,
+    pub recent: Vec<RecentActivity>,
+    pub sessions: Vec<SessionSummary>,
+    pub session_count: u64,
+}
+
+pub type OverviewRangeData = (
+    Overview,
+    Vec<DailyUsage>,
+    Vec<ProviderUsage>,
+    Vec<ModelUsage>,
+);
+
 impl UsageRepository {
     pub fn new(database: Database) -> Self {
         Self { database }
@@ -208,34 +258,116 @@ impl UsageRepository {
         &self.database
     }
 
+    pub fn load_dashboard(&self, query: DashboardQuery) -> Result<DashboardSnapshot, StorageError> {
+        let aggregates = {
+            let connection = self.database.lock()?;
+            let (today, seven_days, thirty_days) = query_windowed_overviews(
+                &connection,
+                query.today_start,
+                query.seven_start,
+                query.thirty_start,
+                query.now_end,
+            )?;
+            let overview = query_overview(&connection, query.overview_start, query.overview_end)?;
+            let overview_daily =
+                query_daily_usage(&connection, query.overview_start, query.overview_end)?;
+            let overview_providers =
+                query_provider_usage(&connection, query.overview_start, query.overview_end)?;
+            let overview_models =
+                query_model_usage(&connection, query.overview_start, query.overview_end)?;
+            let heatmap_daily = query_daily_usage(&connection, query.heatmap_start, query.now_end)?;
+            let heatmap_models =
+                query_daily_model_usage(&connection, query.heatmap_start, query.now_end)?;
+            let providers = query_provider_usage(&connection, query.thirty_start, query.now_end)?;
+            let models = query_model_usage(&connection, query.thirty_start, query.now_end)?;
+            let projects = query_project_usage(&connection, query.thirty_start, query.now_end)?;
+            let recent = query_recent_activity(&connection, 8)?;
+            (
+                today,
+                seven_days,
+                thirty_days,
+                overview,
+                overview_daily,
+                overview_providers,
+                overview_models,
+                heatmap_daily,
+                heatmap_models,
+                providers,
+                models,
+                projects,
+                recent,
+            )
+        };
+        let (
+            today,
+            seven_days,
+            thirty_days,
+            overview,
+            overview_daily,
+            overview_providers,
+            overview_models,
+            heatmap_daily,
+            heatmap_models,
+            providers,
+            models,
+            projects,
+            recent,
+        ) = aggregates;
+        let (sessions, session_count) = {
+            let connection = self.database.lock()?;
+            match query.sessions {
+                Some(filter) => {
+                    let sessions = query_sessions(&connection, filter)?;
+                    let session_count = if filter.is_unfiltered() {
+                        sessions.len() as u64
+                    } else {
+                        query_session_count(&connection)?
+                    };
+                    (sessions, session_count)
+                }
+                None => (Vec::new(), query_session_count(&connection)?),
+            }
+        };
+        Ok(DashboardSnapshot {
+            today,
+            seven_days,
+            thirty_days,
+            overview,
+            overview_daily,
+            overview_providers,
+            overview_models,
+            heatmap_daily,
+            heatmap_models,
+            providers,
+            models,
+            projects,
+            recent,
+            sessions,
+            session_count,
+        })
+    }
+
+    pub fn load_overview_range(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<OverviewRangeData, StorageError> {
+        let connection = self.database.lock()?;
+        Ok((
+            query_overview(&connection, start, end)?,
+            query_daily_usage(&connection, start, end)?,
+            query_provider_usage(&connection, start, end)?,
+            query_model_usage(&connection, start, end)?,
+        ))
+    }
+
     pub fn get_overview(
         &self,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Overview, StorageError> {
         let connection = self.database.lock()?;
-        connection
-            .query_row(
-                "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(cached_input_tokens), 0),
-                        COALESCE(SUM(cache_creation_input_tokens), 0), COALESCE(SUM(output_tokens), 0),
-                        COALESCE(SUM(reasoning_tokens), 0), COALESCE(SUM(total_tokens), 0),
-                        SUM(COALESCE(reported_cost_usd, estimated_cost_usd))
-                 FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2",
-                params![start.timestamp(), end.timestamp()],
-                |row| {
-                    Ok(Overview {
-                        event_count: from_sqlite_u64(row.get::<_, i64>(0)?),
-                        input_tokens: from_sqlite_u64(row.get(1)?),
-                        cached_input_tokens: from_sqlite_u64(row.get(2)?),
-                        cache_creation_input_tokens: from_sqlite_u64(row.get(3)?),
-                        output_tokens: from_sqlite_u64(row.get(4)?),
-                        reasoning_tokens: from_sqlite_u64(row.get(5)?),
-                        total_tokens: from_sqlite_u64(row.get(6)?),
-                        estimated_cost_usd: row.get(7)?,
-                    })
-                },
-            )
-            .map_err(StorageError::from)
+        query_overview(&connection, start, end)
     }
 
     pub fn get_today_usage(
@@ -252,22 +384,7 @@ impl UsageRepository {
         end: DateTime<Utc>,
     ) -> Result<Vec<DailyUsage>, StorageError> {
         let connection = self.database.lock()?;
-        let mut statement = connection.prepare(
-            "SELECT strftime('%Y-%m-%d', timestamp, 'unixepoch', 'localtime') AS day,
-                    COALESCE(SUM(total_tokens), 0),
-                    SUM(COALESCE(reported_cost_usd, estimated_cost_usd))
-             FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
-             GROUP BY day ORDER BY day",
-        )?;
-        let rows = statement.query_map(params![start.timestamp(), end.timestamp()], |row| {
-            Ok(DailyUsage {
-                day: row.get(0)?,
-                total_tokens: from_sqlite_u64(row.get(1)?),
-                estimated_cost_usd: row.get(2)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StorageError::from)
+        query_daily_usage(&connection, start, end)
     }
 
     pub fn get_daily_model_usage(
@@ -276,21 +393,7 @@ impl UsageRepository {
         end: DateTime<Utc>,
     ) -> Result<Vec<DailyModelUsage>, StorageError> {
         let connection = self.database.lock()?;
-        let mut statement = connection.prepare(
-            "SELECT strftime('%Y-%m-%d', timestamp, 'unixepoch', 'localtime') AS day,
-                    COALESCE(model, 'Unknown'), COALESCE(SUM(total_tokens), 0)
-             FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
-             GROUP BY day, model ORDER BY day, 3 DESC",
-        )?;
-        let rows = statement.query_map(params![start.timestamp(), end.timestamp()], |row| {
-            Ok(DailyModelUsage {
-                day: row.get(0)?,
-                model: row.get(1)?,
-                total_tokens: from_sqlite_u64(row.get(2)?),
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StorageError::from)
+        query_daily_model_usage(&connection, start, end)
     }
 
     pub fn get_provider_usage(
@@ -299,38 +402,7 @@ impl UsageRepository {
         end: DateTime<Utc>,
     ) -> Result<Vec<ProviderUsage>, StorageError> {
         let connection = self.database.lock()?;
-        let mut statement = connection.prepare(
-            "SELECT provider, COALESCE(SUM(total_tokens), 0), COALESCE(SUM(input_tokens), 0),
-                    COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_input_tokens), 0),
-                    COALESCE(SUM(cache_creation_input_tokens), 0),
-                    SUM(COALESCE(reported_cost_usd, estimated_cost_usd)), MAX(timestamp)
-             FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
-             GROUP BY provider ORDER BY 2 DESC",
-        )?;
-        let rows = statement.query_map(params![start.timestamp(), end.timestamp()], |row| {
-            let provider_text: String = row.get(0)?;
-            let provider = provider_text.parse::<Provider>().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
-                )
-            })?;
-            let last_activity: Option<i64> = row.get(7)?;
-            Ok(ProviderUsage {
-                provider,
-                total_tokens: from_sqlite_u64(row.get(1)?),
-                input_tokens: from_sqlite_u64(row.get(2)?),
-                output_tokens: from_sqlite_u64(row.get(3)?),
-                cached_input_tokens: from_sqlite_u64(row.get(4)?),
-                cache_creation_input_tokens: from_sqlite_u64(row.get(5)?),
-                estimated_cost_usd: row.get(6)?,
-                last_activity: last_activity
-                    .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0)),
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StorageError::from)
+        query_provider_usage(&connection, start, end)
     }
 
     pub fn get_model_usage(
@@ -339,30 +411,7 @@ impl UsageRepository {
         end: DateTime<Utc>,
     ) -> Result<Vec<ModelUsage>, StorageError> {
         let connection = self.database.lock()?;
-        let mut statement = connection.prepare(
-            "SELECT provider, COALESCE(model, 'Unknown'), COALESCE(SUM(total_tokens), 0),
-                    SUM(COALESCE(reported_cost_usd, estimated_cost_usd))
-             FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
-             GROUP BY provider, model ORDER BY 3 DESC",
-        )?;
-        let rows = statement.query_map(params![start.timestamp(), end.timestamp()], |row| {
-            let provider_text: String = row.get(0)?;
-            let provider = provider_text.parse::<Provider>().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
-                )
-            })?;
-            Ok(ModelUsage {
-                provider,
-                model: row.get(1)?,
-                total_tokens: from_sqlite_u64(row.get(2)?),
-                estimated_cost_usd: row.get(3)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StorageError::from)
+        query_model_usage(&connection, start, end)
     }
 
     pub fn get_project_usage(
@@ -371,126 +420,29 @@ impl UsageRepository {
         end: DateTime<Utc>,
     ) -> Result<Vec<ProjectUsage>, StorageError> {
         let connection = self.database.lock()?;
-        let mut statement = connection.prepare(
-            "SELECT COALESCE(project_name, 'Unknown project'), MAX(project_path),
-                    COALESCE(SUM(total_tokens), 0),
-                    SUM(COALESCE(reported_cost_usd, estimated_cost_usd)), MAX(timestamp)
-             FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
-             GROUP BY 1 ORDER BY 3 DESC",
-        )?;
-        let rows = statement.query_map(params![start.timestamp(), end.timestamp()], |row| {
-            let last_activity: Option<i64> = row.get(4)?;
-            Ok(ProjectUsage {
-                project_name: row.get(0)?,
-                project_path: row.get(1)?,
-                total_tokens: from_sqlite_u64(row.get(2)?),
-                estimated_cost_usd: row.get(3)?,
-                last_activity: last_activity
-                    .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0)),
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StorageError::from)
+        query_project_usage(&connection, start, end)
     }
 
     pub fn get_recent_activity(&self, limit: usize) -> Result<Vec<RecentActivity>, StorageError> {
         let connection = self.database.lock()?;
-        let mut statement = connection.prepare(
-            "SELECT provider, model, session_id, total_tokens, timestamp
-             FROM usage_events ORDER BY timestamp DESC LIMIT ?1",
-        )?;
-        let rows =
-            statement.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-                let provider_text: String = row.get(0)?;
-                let provider = provider_text.parse::<Provider>().map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
-                    )
-                })?;
-                let timestamp: i64 = row.get(4)?;
-                Ok(RecentActivity {
-                    provider,
-                    model: row.get(1)?,
-                    session_id: row.get(2)?,
-                    total_tokens: from_sqlite_u64(row.get(3)?),
-                    timestamp: DateTime::<Utc>::from_timestamp(timestamp, 0)
-                        .unwrap_or_else(Utc::now),
-                })
-            })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StorageError::from)
+        query_recent_activity(&connection, limit)
     }
 
     pub fn get_session_count(&self) -> Result<u64, StorageError> {
         let connection = self.database.lock()?;
-        connection
-            .query_row(
-                "SELECT COUNT(*) FROM (
-                    SELECT 1 FROM usage_events
-                    GROUP BY provider,
-                             COALESCE(session_id, source_file, id),
-                             COALESCE(source_file, ''),
-                             COALESCE(project_name, ''),
-                             COALESCE(project_path, '')
-                 )",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(from_sqlite_u64)
-            .map_err(StorageError::from)
+        query_session_count(&connection)
     }
 
     pub fn get_sessions(&self) -> Result<Vec<SessionSummary>, StorageError> {
+        self.get_sessions_matching(SessionQuery::default())
+    }
+
+    pub fn get_sessions_matching(
+        &self,
+        query: SessionQuery,
+    ) -> Result<Vec<SessionSummary>, StorageError> {
         let connection = self.database.lock()?;
-        let mut statement = connection.prepare(
-            "SELECT provider,
-                    session_id,
-                    source_file,
-                    project_name,
-                    project_path,
-                    MAX(model),
-                    MIN(timestamp),
-                    MAX(timestamp),
-                    COUNT(*),
-                    COALESCE(SUM(total_tokens), 0),
-                    SUM(COALESCE(reported_cost_usd, estimated_cost_usd))
-             FROM usage_events
-             GROUP BY provider,
-                      COALESCE(session_id, source_file, id),
-                      COALESCE(source_file, ''),
-                      COALESCE(project_name, ''),
-                      COALESCE(project_path, '')
-             ORDER BY MAX(timestamp) DESC",
-        )?;
-        let rows = statement.query_map([], |row| {
-            let provider_text: String = row.get(0)?;
-            let provider = provider_text.parse::<Provider>().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
-                )
-            })?;
-            let started_at: i64 = row.get(6)?;
-            let ended_at: i64 = row.get(7)?;
-            Ok(SessionSummary {
-                provider,
-                session_id: row.get(1)?,
-                source_file: row.get(2)?,
-                project_name: row.get(3)?,
-                project_path: row.get(4)?,
-                model: row.get(5)?,
-                started_at: DateTime::<Utc>::from_timestamp(started_at, 0).unwrap_or_else(Utc::now),
-                ended_at: DateTime::<Utc>::from_timestamp(ended_at, 0).unwrap_or_else(Utc::now),
-                turn_count: from_sqlite_u64(row.get(8)?),
-                total_tokens: from_sqlite_u64(row.get(9)?),
-                estimated_cost_usd: row.get(10)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StorageError::from)
+        query_sessions(&connection, query)
     }
 
     pub fn get_session_projects(&self) -> Result<Vec<String>, StorageError> {
@@ -523,4 +475,322 @@ impl UsageRepository {
         names.dedup();
         Ok(names)
     }
+}
+
+fn parse_provider(value: String, column: usize) -> rusqlite::Result<Provider> {
+    value.parse::<Provider>().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        )
+    })
+}
+
+fn overview_from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Overview> {
+    Ok(Overview {
+        event_count: from_sqlite_u64(row.get(offset)?),
+        input_tokens: from_sqlite_u64(row.get(offset + 1)?),
+        cached_input_tokens: from_sqlite_u64(row.get(offset + 2)?),
+        cache_creation_input_tokens: from_sqlite_u64(row.get(offset + 3)?),
+        output_tokens: from_sqlite_u64(row.get(offset + 4)?),
+        reasoning_tokens: from_sqlite_u64(row.get(offset + 5)?),
+        total_tokens: from_sqlite_u64(row.get(offset + 6)?),
+        estimated_cost_usd: row.get(offset + 7)?,
+    })
+}
+
+fn query_overview(
+    connection: &Connection,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Overview, StorageError> {
+    connection
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(cached_input_tokens), 0),
+                    COALESCE(SUM(cache_creation_input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(reasoning_tokens), 0), COALESCE(SUM(total_tokens), 0),
+                    SUM(COALESCE(reported_cost_usd, estimated_cost_usd))
+             FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2",
+            params![start.timestamp(), end.timestamp()],
+            |row| overview_from_row(row, 0),
+        )
+        .map_err(StorageError::from)
+}
+
+fn query_windowed_overviews(
+    connection: &Connection,
+    today_start: DateTime<Utc>,
+    seven_start: DateTime<Utc>,
+    thirty_start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<(Overview, Overview, Overview), StorageError> {
+    let scan_start = today_start.min(seven_start).min(thirty_start);
+    connection
+        .query_row(
+            "SELECT
+                COUNT(*) FILTER (WHERE timestamp >= ?1),
+                COALESCE(SUM(input_tokens) FILTER (WHERE timestamp >= ?1), 0),
+                COALESCE(SUM(cached_input_tokens) FILTER (WHERE timestamp >= ?1), 0),
+                COALESCE(SUM(cache_creation_input_tokens) FILTER (WHERE timestamp >= ?1), 0),
+                COALESCE(SUM(output_tokens) FILTER (WHERE timestamp >= ?1), 0),
+                COALESCE(SUM(reasoning_tokens) FILTER (WHERE timestamp >= ?1), 0),
+                COALESCE(SUM(total_tokens) FILTER (WHERE timestamp >= ?1), 0),
+                SUM(COALESCE(reported_cost_usd, estimated_cost_usd)) FILTER (WHERE timestamp >= ?1),
+                COUNT(*) FILTER (WHERE timestamp >= ?2),
+                COALESCE(SUM(input_tokens) FILTER (WHERE timestamp >= ?2), 0),
+                COALESCE(SUM(cached_input_tokens) FILTER (WHERE timestamp >= ?2), 0),
+                COALESCE(SUM(cache_creation_input_tokens) FILTER (WHERE timestamp >= ?2), 0),
+                COALESCE(SUM(output_tokens) FILTER (WHERE timestamp >= ?2), 0),
+                COALESCE(SUM(reasoning_tokens) FILTER (WHERE timestamp >= ?2), 0),
+                COALESCE(SUM(total_tokens) FILTER (WHERE timestamp >= ?2), 0),
+                SUM(COALESCE(reported_cost_usd, estimated_cost_usd)) FILTER (WHERE timestamp >= ?2),
+                COUNT(*) FILTER (WHERE timestamp >= ?3),
+                COALESCE(SUM(input_tokens) FILTER (WHERE timestamp >= ?3), 0),
+                COALESCE(SUM(cached_input_tokens) FILTER (WHERE timestamp >= ?3), 0),
+                COALESCE(SUM(cache_creation_input_tokens) FILTER (WHERE timestamp >= ?3), 0),
+                COALESCE(SUM(output_tokens) FILTER (WHERE timestamp >= ?3), 0),
+                COALESCE(SUM(reasoning_tokens) FILTER (WHERE timestamp >= ?3), 0),
+                COALESCE(SUM(total_tokens) FILTER (WHERE timestamp >= ?3), 0),
+                SUM(COALESCE(reported_cost_usd, estimated_cost_usd)) FILTER (WHERE timestamp >= ?3)
+             FROM usage_events WHERE timestamp >= ?4 AND timestamp < ?5",
+            params![
+                today_start.timestamp(),
+                seven_start.timestamp(),
+                thirty_start.timestamp(),
+                scan_start.timestamp(),
+                end.timestamp()
+            ],
+            |row| {
+                Ok((
+                    overview_from_row(row, 0)?,
+                    overview_from_row(row, 8)?,
+                    overview_from_row(row, 16)?,
+                ))
+            },
+        )
+        .map_err(StorageError::from)
+}
+
+fn query_daily_usage(
+    connection: &Connection,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<DailyUsage>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT strftime('%Y-%m-%d', timestamp, 'unixepoch', 'localtime') AS day,
+                COALESCE(SUM(total_tokens), 0),
+                SUM(COALESCE(reported_cost_usd, estimated_cost_usd))
+         FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
+         GROUP BY day ORDER BY day",
+    )?;
+    let rows = statement.query_map(params![start.timestamp(), end.timestamp()], |row| {
+        Ok(DailyUsage {
+            day: row.get(0)?,
+            total_tokens: from_sqlite_u64(row.get(1)?),
+            estimated_cost_usd: row.get(2)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+fn query_daily_model_usage(
+    connection: &Connection,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<DailyModelUsage>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT strftime('%Y-%m-%d', timestamp, 'unixepoch', 'localtime') AS day,
+                COALESCE(model, 'Unknown'), COALESCE(SUM(total_tokens), 0)
+         FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
+         GROUP BY day, model ORDER BY day, 3 DESC",
+    )?;
+    let rows = statement.query_map(params![start.timestamp(), end.timestamp()], |row| {
+        Ok(DailyModelUsage {
+            day: row.get(0)?,
+            model: row.get(1)?,
+            total_tokens: from_sqlite_u64(row.get(2)?),
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+fn query_provider_usage(
+    connection: &Connection,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<ProviderUsage>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT provider, COALESCE(SUM(total_tokens), 0), COALESCE(SUM(input_tokens), 0),
+                COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_input_tokens), 0),
+                COALESCE(SUM(cache_creation_input_tokens), 0),
+                SUM(COALESCE(reported_cost_usd, estimated_cost_usd)), MAX(timestamp)
+         FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
+         GROUP BY provider ORDER BY 2 DESC",
+    )?;
+    let rows = statement.query_map(params![start.timestamp(), end.timestamp()], |row| {
+        let last_activity: Option<i64> = row.get(7)?;
+        Ok(ProviderUsage {
+            provider: parse_provider(row.get(0)?, 0)?,
+            total_tokens: from_sqlite_u64(row.get(1)?),
+            input_tokens: from_sqlite_u64(row.get(2)?),
+            output_tokens: from_sqlite_u64(row.get(3)?),
+            cached_input_tokens: from_sqlite_u64(row.get(4)?),
+            cache_creation_input_tokens: from_sqlite_u64(row.get(5)?),
+            estimated_cost_usd: row.get(6)?,
+            last_activity: last_activity
+                .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0)),
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+fn query_model_usage(
+    connection: &Connection,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<ModelUsage>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT provider, COALESCE(model, 'Unknown'), COALESCE(SUM(total_tokens), 0),
+                SUM(COALESCE(reported_cost_usd, estimated_cost_usd))
+         FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
+         GROUP BY provider, model ORDER BY 3 DESC",
+    )?;
+    let rows = statement.query_map(params![start.timestamp(), end.timestamp()], |row| {
+        Ok(ModelUsage {
+            provider: parse_provider(row.get(0)?, 0)?,
+            model: row.get(1)?,
+            total_tokens: from_sqlite_u64(row.get(2)?),
+            estimated_cost_usd: row.get(3)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+fn query_project_usage(
+    connection: &Connection,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<ProjectUsage>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT COALESCE(project_name, 'Unknown project'), MAX(project_path),
+                COALESCE(SUM(total_tokens), 0),
+                SUM(COALESCE(reported_cost_usd, estimated_cost_usd)), MAX(timestamp)
+         FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
+         GROUP BY 1 ORDER BY 3 DESC",
+    )?;
+    let rows = statement.query_map(params![start.timestamp(), end.timestamp()], |row| {
+        let last_activity: Option<i64> = row.get(4)?;
+        Ok(ProjectUsage {
+            project_name: row.get(0)?,
+            project_path: row.get(1)?,
+            total_tokens: from_sqlite_u64(row.get(2)?),
+            estimated_cost_usd: row.get(3)?,
+            last_activity: last_activity
+                .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0)),
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+fn query_recent_activity(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<RecentActivity>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT provider, model, session_id, total_tokens, timestamp
+         FROM usage_events ORDER BY timestamp DESC LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+        let timestamp: i64 = row.get(4)?;
+        Ok(RecentActivity {
+            provider: parse_provider(row.get(0)?, 0)?,
+            model: row.get(1)?,
+            session_id: row.get(2)?,
+            total_tokens: from_sqlite_u64(row.get(3)?),
+            timestamp: DateTime::<Utc>::from_timestamp(timestamp, 0).unwrap_or_else(Utc::now),
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+fn query_session_count(connection: &Connection) -> Result<u64, StorageError> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM (
+                SELECT 1 FROM usage_events
+                GROUP BY provider,
+                         COALESCE(session_id, source_file, id),
+                         COALESCE(source_file, ''),
+                         COALESCE(project_name, ''),
+                         COALESCE(project_path, '')
+             )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(from_sqlite_u64)
+        .map_err(StorageError::from)
+}
+
+fn query_sessions(
+    connection: &Connection,
+    query: SessionQuery,
+) -> Result<Vec<SessionSummary>, StorageError> {
+    let mut sql = String::from(
+        "SELECT provider,
+                session_id,
+                source_file,
+                project_name,
+                project_path,
+                MAX(model),
+                MIN(timestamp),
+                MAX(timestamp),
+                COUNT(*),
+                COALESCE(SUM(total_tokens), 0),
+                SUM(COALESCE(reported_cost_usd, estimated_cost_usd))
+         FROM usage_events",
+    );
+    let mut values = Vec::new();
+    if let Some(provider) = query.provider {
+        sql.push_str(" WHERE provider = ?");
+        values.push(Value::Text(provider.as_str().to_string()));
+    }
+    sql.push_str(
+        " GROUP BY provider,
+                  COALESCE(session_id, source_file, id),
+                  COALESCE(source_file, ''),
+                  COALESCE(project_name, ''),
+                  COALESCE(project_path, '')",
+    );
+    if let Some(ended_after) = query.ended_after {
+        sql.push_str(" HAVING MAX(timestamp) >= ?");
+        values.push(Value::Integer(ended_after.timestamp()));
+    }
+    sql.push_str(" ORDER BY MAX(timestamp) DESC");
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(values), |row| {
+        let started_at: i64 = row.get(6)?;
+        let ended_at: i64 = row.get(7)?;
+        Ok(SessionSummary {
+            provider: parse_provider(row.get(0)?, 0)?,
+            session_id: row.get(1)?,
+            source_file: row.get(2)?,
+            project_name: row.get(3)?,
+            project_path: row.get(4)?,
+            model: row.get(5)?,
+            started_at: DateTime::<Utc>::from_timestamp(started_at, 0).unwrap_or_else(Utc::now),
+            ended_at: DateTime::<Utc>::from_timestamp(ended_at, 0).unwrap_or_else(Utc::now),
+            turn_count: from_sqlite_u64(row.get(8)?),
+            total_tokens: from_sqlite_u64(row.get(9)?),
+            estimated_cost_usd: row.get(10)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
 }

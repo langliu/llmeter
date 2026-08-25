@@ -11,14 +11,13 @@ use std::{
 };
 
 use anyhow::Result;
-use llmeter_core::{Provider, SyncResult};
+use llmeter_core::{Provider, ProviderDetection, SyncResult};
 use llmeter_storage::Database;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::warn;
 
 use crate::{
     hooks,
-
     sync::{SyncEngine, SyncOptions},
     watcher,
 };
@@ -36,6 +35,7 @@ pub struct Collector {
     event_sender: Sender<CollectorEvent>,
     event_receiver: Arc<Mutex<Receiver<CollectorEvent>>>,
     sync_lock: Arc<Mutex<()>>,
+    detections: Arc<Mutex<Vec<ProviderDetection>>>,
 }
 
 impl Collector {
@@ -47,6 +47,7 @@ impl Collector {
             event_sender,
             event_receiver: Arc::new(Mutex::new(event_receiver)),
             sync_lock: Arc::new(Mutex::new(())),
+            detections: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -77,8 +78,25 @@ impl Collector {
         Ok(result)
     }
 
-    pub fn detect_all(&self) -> Vec<llmeter_core::ProviderDetection> {
-        self.engine.detect_all()
+    pub fn detect_all(&self) -> Vec<ProviderDetection> {
+        self.refresh_detections()
+    }
+
+    pub fn cached_detections(&self) -> Vec<ProviderDetection> {
+        if let Ok(cache) = self.detections.lock()
+            && !cache.is_empty()
+        {
+            return cache.clone();
+        }
+        self.refresh_detections()
+    }
+
+    pub fn refresh_detections(&self) -> Vec<ProviderDetection> {
+        let detected = self.engine.detect_all();
+        if let Ok(mut cache) = self.detections.lock() {
+            *cache = detected.clone();
+        }
+        detected
     }
 
     fn sync_with_options(&self, options: SyncOptions) -> Result<SyncResult> {

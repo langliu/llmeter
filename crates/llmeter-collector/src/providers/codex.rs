@@ -5,9 +5,9 @@ use llmeter_core::{Provider, ProviderDetection, SourceFile, SourceFormat, Source
 use serde_json::Value;
 
 use super::{
-    ParsedUsage, ProviderAdapter, counts_from_usage, data_status, home_dir, json_value, model,
-    nested, project_name, project_path, session_id, source_event_id, timestamp, usage_snapshot,
-    walk_jsonl,
+    ParsedUsage, ProviderAdapter, counts_from_usage, data_status, home_dir, json_value,
+    jsonl_exists, model, nested, project_name, project_path, session_id, source_event_id,
+    timestamp, usage_snapshot, walk_jsonl,
 };
 
 const CODEX_PARSER_VERSION: u32 = 2;
@@ -120,12 +120,10 @@ impl ProviderAdapter for CodexAdapter {
         let root = self.codex_root();
         let sessions = root.join("sessions");
         let archived = root.join("archived_sessions");
-        let mut files = walk_jsonl(&sessions)?;
-        files.extend(walk_jsonl(&archived)?);
         Ok(data_status(
             Provider::Codex,
-            vec![root, sessions, archived],
-            !files.is_empty(),
+            vec![root, sessions.clone(), archived.clone()],
+            jsonl_exists(&sessions)? || jsonl_exists(&archived)?,
             None,
         ))
     }

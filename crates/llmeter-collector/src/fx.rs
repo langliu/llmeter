@@ -140,10 +140,7 @@ fn cached_or_default(path: &Path) -> ExchangeRates {
 }
 
 fn number_field(rates: &serde_json::Map<String, Value>, key: &str) -> Option<f64> {
-    rates
-        .get(key)
-        .and_then(Value::as_f64)
-        .and_then(positive)
+    rates.get(key).and_then(Value::as_f64).and_then(positive)
 }
 
 fn positive(value: f64) -> Option<f64> {
@@ -208,10 +205,7 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "llmeter-fx-{name}-{}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("llmeter-fx-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
@@ -284,10 +278,9 @@ mod tests {
         .unwrap();
         age_cache(&cache_path(&dir));
 
-        let empty = refresh_exchange_rates_with(&dir, || {
-            Ok(json!({ "result": "success", "rates": {} }))
-        })
-        .unwrap();
+        let empty =
+            refresh_exchange_rates_with(&dir, || Ok(json!({ "result": "success", "rates": {} })))
+                .unwrap();
         assert_eq!(empty.source, FxSource::StaleCache);
         assert_eq!(empty.cny, 6.8);
 

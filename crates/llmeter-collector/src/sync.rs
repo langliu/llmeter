@@ -15,7 +15,7 @@ use llmeter_storage::{Database, InsertSummary};
 use tracing::{debug, warn};
 
 use crate::{
-    parsers::jsonl::IncrementalJsonlReader,
+    parsers::jsonl::{IncrementalJsonlReader, metadata_identity, metadata_modified_at},
     providers::{ParsedUsage, ProviderAdapter, SnapshotPolicy, default_adapters},
 };
 
@@ -187,6 +187,10 @@ impl SyncEngine {
             match source.format {
                 SourceFormat::Jsonl => self.sync_source(adapter, &source, result)?,
                 SourceFormat::Sqlite => {
+                    if self.should_skip_unchanged_source(adapter, &source)? {
+                        result.files_scanned += 1;
+                        continue;
+                    }
                     let parsed = adapter.parse_sqlite(&source)?;
                     self.sync_batch_source(
                         adapter,
@@ -198,6 +202,12 @@ impl SyncEngine {
                     )?;
                 }
                 SourceFormat::Snapshot => {
+                    if !adapter.uses_remote_snapshot()
+                        && self.should_skip_unchanged_source(adapter, &source)?
+                    {
+                        result.files_scanned += 1;
+                        continue;
+                    }
                     let snapshot = adapter.parse_snapshot(&source)?;
                     self.sync_batch_source(
                         adapter,
@@ -211,6 +221,20 @@ impl SyncEngine {
             }
         }
         Ok(())
+    }
+
+    fn should_skip_unchanged_source(
+        &self,
+        adapter: &dyn ProviderAdapter,
+        source: &SourceFile,
+    ) -> Result<bool> {
+        let Some(cursor) = self.database.get_cursor(&source.path)? else {
+            return Ok(false);
+        };
+        if cursor.parser_version != adapter.parser_version() {
+            return Ok(false);
+        }
+        Ok(IncrementalJsonlReader::is_unchanged(&source.path, &cursor).unwrap_or(false))
     }
 
     fn sync_batch_source(
@@ -273,20 +297,10 @@ impl SyncEngine {
                     adapter.parser_version(),
                 )
             });
-        let identity_kind = match source.format {
-            SourceFormat::Sqlite => "sqlite",
-            SourceFormat::Snapshot => "snapshot",
-            SourceFormat::Jsonl => "file",
-        };
-        cursor.file_identity = Some(format!("{identity_kind}:{}", metadata.len()));
-        let modified_at = metadata
-            .modified()
-            .ok()
-            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-            .and_then(|duration| i64::try_from(duration.as_millis()).ok());
+        cursor.file_identity = metadata_identity(&metadata);
         cursor.byte_offset = metadata.len();
         cursor.file_size = metadata.len();
-        cursor.modified_at = modified_at;
+        cursor.modified_at = metadata_modified_at(&metadata);
         cursor.parser_version = adapter.parser_version();
         cursor.last_event_hash = events.last().map(|event| event.id.clone());
         cursor.updated_at = Utc::now().timestamp();
@@ -568,7 +582,6 @@ mod tests {
         assert!(!SyncOptions::local_changes().include_remote_snapshots);
     }
 
-
     struct SnapshotTestAdapter {
         path: PathBuf,
         provider: Provider,
@@ -644,6 +657,66 @@ mod tests {
 
         fn uses_remote_snapshot(&self) -> bool {
             self.remote
+        }
+    }
+
+    struct CountingSqliteAdapter {
+        path: PathBuf,
+        parser_version: u32,
+        parses: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ProviderAdapter for CountingSqliteAdapter {
+        fn provider(&self) -> Provider {
+            Provider::Zed
+        }
+
+        fn parser_version(&self) -> u32 {
+            self.parser_version
+        }
+
+        fn detect(&self) -> Result<llmeter_core::ProviderDetection> {
+            Ok(llmeter_core::ProviderDetection {
+                provider: Provider::Zed,
+                status: ProviderStatus::DataFound,
+                roots: vec![self.path.clone()],
+                detail: None,
+            })
+        }
+
+        fn discover_sources(&self) -> Result<Vec<SourceFile>> {
+            Ok(vec![SourceFile {
+                path: self.path.clone(),
+                provider: Provider::Zed,
+                format: SourceFormat::Sqlite,
+                session_id: None,
+                project_path: None,
+                project_name: None,
+            }])
+        }
+
+        fn parse_line(&self, _source: &SourceFile, _line: &[u8]) -> Result<Option<ParsedUsage>> {
+            Ok(None)
+        }
+
+        fn parse_sqlite(&self, _source: &SourceFile) -> Result<Vec<ParsedUsage>> {
+            self.parses
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![ParsedUsage {
+                counts: TokenCounts {
+                    input_tokens: 4,
+                    total_tokens: 4,
+                    ..Default::default()
+                },
+                cumulative_snapshot: None,
+                timestamp: Utc::now(),
+                model: Some("zed-test".into()),
+                session_id: Some("thread".into()),
+                project_path: None,
+                project_name: None,
+                source_event_id: Some("thread:1".into()),
+                reported_cost_usd: None,
+            }])
         }
     }
 
@@ -726,6 +799,50 @@ mod tests {
         engine.sync_all().unwrap();
         assert_eq!(overview(&database).event_count, 0);
         assert_eq!(overview(&database).total_tokens, 0);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn unchanged_sqlite_source_is_not_reparsed() {
+        let home = test_home("sqlite-unchanged");
+        let source_path = home.join("threads.db");
+        fs::write(&source_path, "v1").unwrap();
+        let parses = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let database = Database::open_in_memory().unwrap();
+        let engine = SyncEngine::with_adapters(
+            database.clone(),
+            vec![Box::new(CountingSqliteAdapter {
+                path: source_path.clone(),
+                parser_version: 1,
+                parses: parses.clone(),
+            })],
+        );
+
+        assert_eq!(engine.sync_all().unwrap().files_scanned, 1);
+        assert_eq!(parses.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(overview(&database).total_tokens, 4);
+
+        assert_eq!(engine.sync_all().unwrap().files_scanned, 1);
+        assert_eq!(
+            parses.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "unchanged sqlite sources should reuse the stored cursor"
+        );
+
+        fs::write(&source_path, "v1-changed").unwrap();
+        assert_eq!(engine.sync_all().unwrap().files_scanned, 1);
+        assert_eq!(parses.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let upgraded = SyncEngine::with_adapters(
+            database,
+            vec![Box::new(CountingSqliteAdapter {
+                path: source_path,
+                parser_version: 2,
+                parses: parses.clone(),
+            })],
+        );
+        upgraded.sync_all().unwrap();
+        assert_eq!(parses.load(std::sync::atomic::Ordering::SeqCst), 3);
         let _ = fs::remove_dir_all(home);
     }
 
@@ -1263,7 +1380,6 @@ mod tests {
                 source_event_id: None,
                 snapshot_scope: None,
             }])
-
             .unwrap();
         database
             .upsert_cursor(&FileCursor::new(path, Provider::OpenCode, 1))

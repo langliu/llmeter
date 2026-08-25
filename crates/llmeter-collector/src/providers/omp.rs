@@ -4,7 +4,7 @@ use anyhow::Result;
 use llmeter_core::{Provider, ProviderDetection, SourceFile, SourceFormat, SourceMetadata};
 
 use super::{
-    ParsedUsage, ProviderAdapter, data_status, home_dir, json_value,
+    ParsedUsage, ProviderAdapter, data_status, home_dir, json_value, jsonl_exists,
     pi::{apply_pi_metadata, parse_pi_value},
     walk_jsonl,
 };
@@ -47,11 +47,10 @@ impl ProviderAdapter for OmpAdapter {
 
     fn detect(&self) -> Result<ProviderDetection> {
         let root = self.root();
-        let files = walk_jsonl(&root)?;
         Ok(data_status(
             Provider::Omp,
-            vec![root],
-            !files.is_empty(),
+            vec![root.clone()],
+            jsonl_exists(&root)?,
             None,
         ))
     }

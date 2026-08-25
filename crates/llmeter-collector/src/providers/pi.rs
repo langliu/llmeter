@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use super::{
     ParsedUsage, ProviderAdapter, counts_from_usage, data_status, home_dir, json_value,
-    project_name, project_path, session_id, source_event_id, timestamp, walk_jsonl,
+    jsonl_exists, project_name, project_path, session_id, source_event_id, timestamp, walk_jsonl,
 };
 
 const PI_PARSER_VERSION: u32 = 4;
@@ -62,8 +62,8 @@ impl ProviderAdapter for PiAdapter {
         let roots = self.roots();
         Ok(data_status(
             Provider::Pi,
-            roots,
-            !self.files()?.is_empty(),
+            roots.clone(),
+            jsonl_exists(&roots[0])?,
             None,
         ))
     }

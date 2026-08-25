@@ -549,7 +549,6 @@ fn trim_decimal(value: f64, suffix: &str) -> String {
     }
 }
 
-
 fn format_session_time(timestamp: chrono::DateTime<chrono::Utc>) -> String {
     let local = timestamp.with_timezone(&Local);
     t!(
