@@ -700,7 +700,7 @@ mod tests {
     use llmeter_core::{Provider, UsageEvent, UsageSnapshot};
 
     use super::*;
-    use crate::{DashboardQuery, SessionQuery, UsageRepository};
+    use crate::{DashboardQuery, SessionLoad, SessionQuery, UsageRepository};
 
     fn event(id: &str, source_event_id: Option<&str>, total: u64) -> UsageEvent {
         UsageEvent {
@@ -1148,7 +1148,7 @@ mod tests {
                 overview_start: thirty_start,
                 overview_end: end,
                 now_end: end,
-                sessions: Some(SessionQuery::default()),
+                session_load: SessionLoad::ListAndCount(SessionQuery::default()),
             })
             .unwrap();
 
@@ -1176,6 +1176,22 @@ mod tests {
         assert_eq!(loaded.session_count, 3);
         assert_eq!(loaded.sessions.len(), 3);
         assert_eq!(loaded.providers.len(), 3);
+
+        let skipped = repository
+            .load_dashboard(DashboardQuery {
+                today_start,
+                seven_start,
+                thirty_start,
+                heatmap_start: now - chrono::Duration::days(147),
+                overview_start: thirty_start,
+                overview_end: end,
+                now_end: end,
+                session_load: SessionLoad::Skip,
+            })
+            .unwrap();
+        assert_eq!(skipped.session_count, 0);
+        assert!(skipped.sessions.is_empty());
+        assert_eq!(skipped.today.total_tokens, loaded.today.total_tokens);
     }
 
     #[test]
@@ -1226,7 +1242,7 @@ mod tests {
                     overview_start: now - chrono::Duration::days(30),
                     overview_end: now + chrono::Duration::seconds(1),
                     now_end: now + chrono::Duration::seconds(1),
-                    sessions: Some(SessionQuery {
+                    session_load: SessionLoad::ListAndCount(SessionQuery {
                         provider: Some(Provider::Claude),
                         ended_after: None,
                     }),

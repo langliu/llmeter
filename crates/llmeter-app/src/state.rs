@@ -4,7 +4,7 @@ use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Utc};
 use llmeter_core::ProviderDetection;
 use llmeter_storage::{
     DailyModelUsage, DailyUsage, DashboardQuery, ModelUsage, Overview, ProjectUsage, ProviderUsage,
-    RecentActivity, SessionQuery, SessionSummary, UsageRepository,
+    RecentActivity, SessionLoad, SessionSummary, UsageRepository,
 };
 
 #[derive(Clone, Debug)]
@@ -56,7 +56,7 @@ impl UiSnapshot {
         repository: &UsageRepository,
         overview_start: DateTime<Utc>,
         overview_end: DateTime<Utc>,
-        sessions: Option<SessionQuery>,
+        session_load: SessionLoad,
     ) -> Result<Self, llmeter_storage::StorageError> {
         let now = Utc::now();
         let today_start = local_midnight(Local::now().date_naive());
@@ -71,7 +71,7 @@ impl UiSnapshot {
             overview_start,
             overview_end,
             now_end,
-            sessions,
+            session_load,
         })?;
         Ok(Self {
             today: data.today,

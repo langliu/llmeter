@@ -208,7 +208,7 @@ pub struct DashboardQuery {
     pub overview_start: DateTime<Utc>,
     pub overview_end: DateTime<Utc>,
     pub now_end: DateTime<Utc>,
-    pub sessions: Option<SessionQuery>,
+    pub session_load: SessionLoad,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -221,6 +221,15 @@ impl SessionQuery {
     pub fn is_unfiltered(self) -> bool {
         self.provider.is_none() && self.ended_after.is_none()
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SessionLoad {
+    #[default]
+    Skip,
+    Count,
+    List(SessionQuery),
+    ListAndCount(SessionQuery),
 }
 
 #[derive(Clone, Debug)]
@@ -259,7 +268,7 @@ impl UsageRepository {
     }
 
     pub fn load_dashboard(&self, query: DashboardQuery) -> Result<DashboardSnapshot, StorageError> {
-        let aggregates = {
+        let mut snapshot = {
             let connection = self.database.lock()?;
             let (today, seven_days, thirty_days) = query_windowed_overviews(
                 &connection,
@@ -268,83 +277,62 @@ impl UsageRepository {
                 query.thirty_start,
                 query.now_end,
             )?;
-            let overview = query_overview(&connection, query.overview_start, query.overview_end)?;
-            let overview_daily =
-                query_daily_usage(&connection, query.overview_start, query.overview_end)?;
-            let overview_providers =
-                query_provider_usage(&connection, query.overview_start, query.overview_end)?;
-            let overview_models =
-                query_model_usage(&connection, query.overview_start, query.overview_end)?;
-            let heatmap_daily = query_daily_usage(&connection, query.heatmap_start, query.now_end)?;
-            let heatmap_models =
-                query_daily_model_usage(&connection, query.heatmap_start, query.now_end)?;
-            let providers = query_provider_usage(&connection, query.thirty_start, query.now_end)?;
-            let models = query_model_usage(&connection, query.thirty_start, query.now_end)?;
-            let projects = query_project_usage(&connection, query.thirty_start, query.now_end)?;
-            let recent = query_recent_activity(&connection, 8)?;
-            (
+            DashboardSnapshot {
                 today,
                 seven_days,
                 thirty_days,
-                overview,
-                overview_daily,
-                overview_providers,
-                overview_models,
-                heatmap_daily,
-                heatmap_models,
-                providers,
-                models,
-                projects,
-                recent,
-            )
-        };
-        let (
-            today,
-            seven_days,
-            thirty_days,
-            overview,
-            overview_daily,
-            overview_providers,
-            overview_models,
-            heatmap_daily,
-            heatmap_models,
-            providers,
-            models,
-            projects,
-            recent,
-        ) = aggregates;
-        let (sessions, session_count) = {
-            let connection = self.database.lock()?;
-            match query.sessions {
-                Some(filter) => {
-                    let sessions = query_sessions(&connection, filter)?;
-                    let session_count = if filter.is_unfiltered() {
-                        sessions.len() as u64
-                    } else {
-                        query_session_count(&connection)?
-                    };
-                    (sessions, session_count)
-                }
-                None => (Vec::new(), query_session_count(&connection)?),
+                overview: query_overview(&connection, query.overview_start, query.overview_end)?,
+                overview_daily: query_daily_usage(
+                    &connection,
+                    query.overview_start,
+                    query.overview_end,
+                )?,
+                overview_providers: query_provider_usage(
+                    &connection,
+                    query.overview_start,
+                    query.overview_end,
+                )?,
+                overview_models: query_model_usage(
+                    &connection,
+                    query.overview_start,
+                    query.overview_end,
+                )?,
+                heatmap_daily: query_daily_usage(&connection, query.heatmap_start, query.now_end)?,
+                heatmap_models: query_daily_model_usage(
+                    &connection,
+                    query.heatmap_start,
+                    query.now_end,
+                )?,
+                providers: query_provider_usage(&connection, query.thirty_start, query.now_end)?,
+                models: query_model_usage(&connection, query.thirty_start, query.now_end)?,
+                projects: query_project_usage(&connection, query.thirty_start, query.now_end)?,
+                recent: query_recent_activity(&connection, 8)?,
+                sessions: Vec::new(),
+                session_count: 0,
             }
         };
-        Ok(DashboardSnapshot {
-            today,
-            seven_days,
-            thirty_days,
-            overview,
-            overview_daily,
-            overview_providers,
-            overview_models,
-            heatmap_daily,
-            heatmap_models,
-            providers,
-            models,
-            projects,
-            recent,
-            sessions,
-            session_count,
-        })
+        if query.session_load == SessionLoad::Skip {
+            return Ok(snapshot);
+        }
+        let connection = self.database.lock()?;
+        match query.session_load {
+            SessionLoad::Skip => {}
+            SessionLoad::Count => {
+                snapshot.session_count = query_session_count(&connection)?;
+            }
+            SessionLoad::List(filter) => {
+                snapshot.sessions = query_sessions(&connection, filter)?;
+            }
+            SessionLoad::ListAndCount(filter) => {
+                snapshot.sessions = query_sessions(&connection, filter)?;
+                snapshot.session_count = if filter.is_unfiltered() {
+                    snapshot.sessions.len() as u64
+                } else {
+                    query_session_count(&connection)?
+                };
+            }
+        }
+        Ok(snapshot)
     }
 
     pub fn load_overview_range(

@@ -7,5 +7,6 @@ pub use database::{Database, InsertSummary, StorageError, UpsertSummary, UsagePr
 pub use limit_repository::LimitRepository;
 pub use usage_repository::{
     DailyModelUsage, DailyUsage, DashboardQuery, DashboardSnapshot, ModelUsage, Overview,
-    ProjectUsage, ProviderUsage, RecentActivity, SessionQuery, SessionSummary, UsageRepository,
+    ProjectUsage, ProviderUsage, RecentActivity, SessionLoad, SessionQuery, SessionSummary,
+    UsageRepository,
 };
