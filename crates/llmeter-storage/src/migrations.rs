@@ -27,6 +27,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
             estimated_cost_usd REAL,
             source_file TEXT,
             source_event_id TEXT,
+            snapshot_scope TEXT,
             created_at INTEGER NOT NULL
         );
 
@@ -36,9 +37,6 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         CREATE INDEX IF NOT EXISTS idx_usage_events_project_path ON usage_events(project_path);
         CREATE INDEX IF NOT EXISTS idx_usage_events_session_id ON usage_events(session_id);
         CREATE INDEX IF NOT EXISTS idx_usage_events_source_file ON usage_events(source_file);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_provider_source_event
-            ON usage_events(provider, source_event_id)
-            WHERE source_event_id IS NOT NULL;
 
         CREATE TABLE IF NOT EXISTS file_cursors (
             path TEXT PRIMARY KEY,
@@ -79,11 +77,35 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
             [],
         )?;
     }
+    if !has_column(connection, "usage_events", "snapshot_scope")? {
+        connection.execute(
+            "ALTER TABLE usage_events ADD COLUMN snapshot_scope TEXT",
+            [],
+        )?;
+    }
+    // Remote snapshots are account-scoped. Keep legacy uniqueness for
+    // unscoped events while allowing one official ID per signed-in account.
+    connection.execute(
+        "DROP INDEX IF EXISTS idx_usage_events_provider_source_event",
+        [],
+    )?;
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_provider_source_event_legacy
+         ON usage_events(provider, source_event_id)
+         WHERE source_event_id IS NOT NULL AND snapshot_scope IS NULL",
+        [],
+    )?;
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_provider_scope_source_event
+         ON usage_events(provider, snapshot_scope, source_event_id)
+         WHERE snapshot_scope IS NOT NULL AND source_event_id IS NOT NULL",
+        [],
+    )?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version < 7 {
+    if version < 8 {
         reattribute_omp_sessions(connection)?;
     }
-    connection.pragma_update(None, "user_version", 7)?;
+    connection.pragma_update(None, "user_version", 8)?;
     Ok(())
 }
 
@@ -167,6 +189,7 @@ mod tests {
         run(&connection).unwrap();
 
         assert!(has_column(&connection, "usage_events", "reported_cost_usd").unwrap());
+        assert!(has_column(&connection, "usage_events", "snapshot_scope").unwrap());
         assert_eq!(
             connection
                 .query_row("SELECT count(*) FROM usage_events", [], |row| {
@@ -179,7 +202,7 @@ mod tests {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            7
+            8
         );
     }
 

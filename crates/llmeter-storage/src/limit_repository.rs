@@ -54,7 +54,14 @@ impl LimitRepository {
     pub fn load_snapshot(&self) -> Result<LimitsSnapshot, StorageError> {
         let now = Utc::now();
         let mut providers = Vec::new();
-        for provider in [Provider::Claude, Provider::Codex, Provider::Grok] {
+        for provider in [
+            Provider::Claude,
+            Provider::Codex,
+            Provider::Grok,
+            Provider::Cursor,
+            Provider::Qoder,
+            Provider::Trae,
+        ] {
             if let Some(mut limits) = self.load(provider)? {
                 if limits.cache_is_too_old(now) {
                     continue;

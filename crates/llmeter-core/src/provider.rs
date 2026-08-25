@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 pub enum Provider {
     Codex,
     Claude,
+    Cursor,
+    Qoder,
+    Trae,
     OpenCode,
     Pi,
     Omp,
@@ -17,9 +20,12 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 11] = [
         Self::Codex,
         Self::Claude,
+        Self::Cursor,
+        Self::Qoder,
+        Self::Trae,
         Self::OpenCode,
         Self::Pi,
         Self::Omp,
@@ -32,6 +38,9 @@ impl Provider {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Cursor => "cursor",
+            Self::Qoder => "qoder",
+            Self::Trae => "trae",
             Self::OpenCode => "opencode",
             Self::Pi => "pi",
             Self::Omp => "omp",
@@ -45,6 +54,9 @@ impl Provider {
         match self {
             Self::Codex => "Codex",
             Self::Claude => "Claude Code",
+            Self::Cursor => "Cursor",
+            Self::Qoder => "Qoder",
+            Self::Trae => "TRAE",
             Self::OpenCode => "OpenCode",
             Self::Pi => "Pi",
             Self::Omp => "Oh My Pi",
@@ -61,9 +73,9 @@ impl Provider {
             Self::OpenCode => Some(format!("opencode --session {session_ref}")),
             Self::Pi => Some(format!("pi --session {session_ref}")),
             Self::Omp => Some(format!("omp --resume {session_ref}")),
-            Self::Zed => None,
             Self::Grok => Some(format!("grok --resume {session_ref}")),
             Self::Hermes => Some(format!("hermes --resume {session_ref}")),
+            Self::Cursor | Self::Qoder | Self::Trae | Self::Zed => None,
         }
     }
 
@@ -128,6 +140,9 @@ impl FromStr for Provider {
         match value.to_ascii_lowercase().as_str() {
             "codex" => Ok(Self::Codex),
             "claude" | "claude_code" | "claude-code" => Ok(Self::Claude),
+            "cursor" => Ok(Self::Cursor),
+            "qoder" | "qoder-cn" | "qoder_cn" => Ok(Self::Qoder),
+            "trae" | "trae-solo" | "trae_solo" => Ok(Self::Trae),
             "opencode" | "open_code" | "open-code" => Ok(Self::OpenCode),
             "pi" | "pi-mono" => Ok(Self::Pi),
             "omp" | "oh-my-pi" | "oh_my_pi" | "ohmypi" => Ok(Self::Omp),
@@ -143,6 +158,7 @@ impl FromStr for Provider {
 pub enum SourceFormat {
     Jsonl,
     Sqlite,
+    Snapshot,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -243,6 +259,13 @@ pub struct UsageEvent {
     pub estimated_cost_usd: Option<f64>,
     pub source_file: Option<PathBuf>,
     pub source_event_id: Option<String>,
+    /// Stable account/snapshot identity for remote provider exports.
+    ///
+    /// Local log events leave this unset. The field is persisted separately
+    /// from `source_event_id` so the same provider event ID can safely exist
+    /// for two signed-in accounts.
+    #[serde(default)]
+    pub snapshot_scope: Option<String>,
 }
 
 impl UsageEvent {
@@ -321,6 +344,7 @@ mod tests {
             estimated_cost_usd: None,
             source_file: Some(PathBuf::from("/tmp/session.jsonl")),
             source_event_id: None,
+            snapshot_scope: None,
         };
         let serialized = serde_json::to_string(&event).unwrap();
         for forbidden in [

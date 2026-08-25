@@ -3697,9 +3697,11 @@ dependencies = [
 name = "llmeter-collector"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "anyhow",
  "base64",
  "blake3",
+ "cbc",
  "chrono",
  "dirs",
  "llmeter-core",
@@ -3707,6 +3709,7 @@ dependencies = [
  "notify 8.2.0",
  "rusqlite",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.20",
  "tracing",
  "ureq",

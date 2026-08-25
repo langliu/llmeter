@@ -345,6 +345,7 @@ mod tests {
                 estimated_cost_usd: None,
                 source_file: Some(source_path.clone()),
                 source_event_id: Some("old-prompt".into()),
+                snapshot_scope: None,
             }])
             .unwrap();
         database

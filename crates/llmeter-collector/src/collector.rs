@@ -18,6 +18,7 @@ use tracing::warn;
 
 use crate::{
     hooks,
+
     sync::{SyncEngine, SyncOptions},
     watcher,
 };
@@ -53,11 +54,17 @@ impl Collector {
     }
 
     pub fn sync_now(&self) -> Result<SyncResult> {
-        self.sync_with_options(SyncOptions::default())
+        let mut result = self.sync_with_options(SyncOptions::local_changes())?;
+        result.merge(self.sync_with_options(SyncOptions::remote_snapshots())?);
+        Ok(result)
     }
 
     pub fn sync_provider(&self, provider: Provider) -> Result<SyncResult> {
         self.sync_with_options(SyncOptions::only(provider))
+    }
+
+    fn sync_local_changes(&self) -> Result<SyncResult> {
+        self.sync_with_options(SyncOptions::local_changes())
     }
 
     pub fn full_rescan(&self) -> Result<SyncResult> {
@@ -65,7 +72,7 @@ impl Collector {
             .sync_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("sync lock poisoned"))?;
-        self.engine.database().clear_usage_and_cursors()?;
+        self.engine.clear_rebuildable_usage()?;
         let result = self.engine.sync(SyncOptions::default())?;
         let _ = self
             .event_sender

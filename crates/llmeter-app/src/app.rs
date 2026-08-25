@@ -9,7 +9,9 @@ use gpui_component::{
     input::{InputEvent, InputState},
     theme::{Theme as UiTheme, ThemeMode},
 };
-use llmeter_collector::{Collector, CollectorEvent, LimitCollector};
+use llmeter_collector::{
+    Collector, CollectorEvent, LimitCollector, providers::TRAE_CN_USAGE_SETTING,
+};
 use llmeter_core::LimitsSnapshot;
 use llmeter_storage::{SessionSummary, UsageRepository};
 use rust_i18n::t;
@@ -167,6 +169,7 @@ pub struct LLMeterView {
     pub(crate) copied_session: Option<String>,
     pub(crate) theme_pref: ThemePreference,
     pub(crate) locale_pref: LocalePreference,
+    pub(crate) trae_cn_usage_enabled: bool,
     pub(crate) settings_section: SettingsSection,
     pub(crate) heatmap: Entity<HeatmapView>,
     pub(crate) overview_period: OverviewPeriod,
@@ -195,6 +198,12 @@ impl LLMeterView {
         let locale_pref = LocalePreference::from_setting(
             repository.database().get_setting("locale").ok().flatten(),
         );
+        let trae_cn_usage_enabled = repository
+            .database()
+            .get_setting(TRAE_CN_USAGE_SETTING)
+            .ok()
+            .flatten()
+            .is_some_and(|value| matches!(value.trim(), "1" | "true"));
         i18n::apply(locale_pref);
         let detections = collector.detect_all();
         let today = Local::now().date_naive();
@@ -272,6 +281,7 @@ impl LLMeterView {
             copied_session: None,
             theme_pref,
             locale_pref,
+            trae_cn_usage_enabled,
             settings_section: SettingsSection::default(),
             heatmap: cx.new(|_| HeatmapView::default()),
             overview_period,
@@ -357,6 +367,25 @@ impl LLMeterView {
             self.settings_section = section;
             cx.notify();
         }
+    }
+
+    pub(crate) fn set_trae_cn_usage_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.trae_cn_usage_enabled == enabled {
+            return;
+        }
+        let database = self.collector.engine().database().clone();
+        if let Err(error) = database.set_setting(
+            TRAE_CN_USAGE_SETTING,
+            if enabled { "true" } else { "false" },
+        ) {
+            self.snapshot
+                .warnings
+                .push(format!("failed to save TRAE CN usage preference: {error}"));
+            cx.notify();
+            return;
+        }
+        self.trae_cn_usage_enabled = enabled;
+        self.refresh_sessions(cx);
     }
 
     pub(crate) fn navigate(&mut self, page: DashboardPage, cx: &mut Context<Self>) {

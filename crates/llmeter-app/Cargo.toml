@@ -9,6 +9,7 @@ description = "Local-first AI coding usage tracker"
 name = "LLMeter"
 identifier = "io.github.langliu.llmeter"
 icon = ["crates/llmeter-app/assets/AppIcon.icns"]
+resources = ["crates/llmeter-app/assets/THIRD_PARTY_NOTICES.md"]
 category = "Developer Tool"
 short_description = "Local-first AI coding usage tracker"
 long_description = "Track token usage from local AI coding agents without proxying traffic or uploading data."

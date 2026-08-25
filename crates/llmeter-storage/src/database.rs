@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
+use chrono::{DateTime, Utc};
 use llmeter_core::{FileCursor, Provider, TokenCounts, UsageEvent};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
@@ -93,8 +94,8 @@ impl Database {
                 id, provider, model, session_id, project_path, project_name, timestamp,
                 input_tokens, cached_input_tokens, cache_creation_input_tokens, output_tokens,
                 reasoning_tokens, total_tokens, reported_cost_usd, estimated_cost_usd,
-                source_file, source_event_id, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                source_file, source_event_id, snapshot_scope, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         )?;
         let mut summary = InsertSummary::default();
         for event in events {
@@ -122,6 +123,7 @@ impl Database {
                     .as_ref()
                     .map(|value| value.to_string_lossy().to_string()),
                 event.source_event_id,
+                event.snapshot_scope,
                 chrono::Utc::now().timestamp(),
             ])?;
             if inserted > 0 {
@@ -143,69 +145,144 @@ impl Database {
         }
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
-        let existing = existing_event_ids(&transaction, events)?;
-        let mut statement = transaction.prepare(
-            "INSERT INTO usage_events (
-                id, provider, model, session_id, project_path, project_name, timestamp,
-                input_tokens, cached_input_tokens, cache_creation_input_tokens, output_tokens,
-                reasoning_tokens, total_tokens, reported_cost_usd, estimated_cost_usd,
-                source_file, source_event_id, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
-            ON CONFLICT(id) DO UPDATE SET
-                provider = excluded.provider,
-                model = excluded.model,
-                session_id = excluded.session_id,
-                project_path = excluded.project_path,
-                project_name = excluded.project_name,
-                timestamp = excluded.timestamp,
-                input_tokens = excluded.input_tokens,
-                cached_input_tokens = excluded.cached_input_tokens,
-                cache_creation_input_tokens = excluded.cache_creation_input_tokens,
-                output_tokens = excluded.output_tokens,
-                reasoning_tokens = excluded.reasoning_tokens,
-                total_tokens = excluded.total_tokens,
-                reported_cost_usd = excluded.reported_cost_usd,
-                estimated_cost_usd = excluded.estimated_cost_usd,
-                source_file = excluded.source_file,
-                source_event_id = excluded.source_event_id",
-        )?;
-        let mut summary = UpsertSummary::default();
-        for event in events {
-            let exists = existing.contains(&event.id);
-            statement.execute(params![
-                event.id,
-                event.provider.as_str(),
-                event.model,
-                event.session_id,
-                event
-                    .project_path
-                    .as_ref()
-                    .map(|value| value.to_string_lossy().to_string()),
-                event.project_name,
-                event.timestamp.timestamp(),
-                to_sqlite_i64(event.input_tokens)?,
-                to_sqlite_i64(event.cached_input_tokens)?,
-                to_sqlite_i64(event.cache_creation_input_tokens)?,
-                to_sqlite_i64(event.output_tokens)?,
-                to_sqlite_i64(event.reasoning_tokens)?,
-                to_sqlite_i64(event.total_tokens)?,
-                event.reported_cost_usd,
-                event.estimated_cost_usd,
-                event
-                    .source_file
-                    .as_ref()
-                    .map(|value| value.to_string_lossy().to_string()),
-                event.source_event_id,
-                chrono::Utc::now().timestamp(),
-            ])?;
-            if exists {
-                summary.updated += 1;
-            } else {
-                summary.inserted += 1;
-                summary.tokens_added = summary.tokens_added.saturating_add(event.total_tokens);
-            }
+        let summary = upsert_usage_events(&transaction, events)?;
+        transaction.commit()?;
+        Ok(summary)
+    }
+
+    pub fn replace_usage_events_for_source(
+        &self,
+        provider: Provider,
+        source: &Path,
+        since: Option<DateTime<Utc>>,
+        events: &[UsageEvent],
+    ) -> Result<UpsertSummary, StorageError> {
+        self.replace_usage_events(provider, Some(source), since, None, events)
+    }
+
+    pub fn replace_usage_events_for_provider(
+        &self,
+        provider: Provider,
+        since: Option<DateTime<Utc>>,
+        events: &[UsageEvent],
+    ) -> Result<UpsertSummary, StorageError> {
+        self.replace_usage_events(provider, None, since, None, events)
+    }
+
+    pub fn replace_usage_events_for_provider_scoped(
+        &self,
+        provider: Provider,
+        since: Option<DateTime<Utc>>,
+        snapshot_scope: Option<&str>,
+        events: &[UsageEvent],
+    ) -> Result<UpsertSummary, StorageError> {
+        self.replace_usage_events(provider, None, since, snapshot_scope, events)
+    }
+
+    fn replace_usage_events(
+        &self,
+        provider: Provider,
+        source: Option<&Path>,
+        since: Option<DateTime<Utc>>,
+        snapshot_scope: Option<&str>,
+        events: &[UsageEvent],
+    ) -> Result<UpsertSummary, StorageError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let source = source.map(|value| value.to_string_lossy().to_string());
+        if source.is_none()
+            && let Some(snapshot_scope) = snapshot_scope
+        {
+            // Claim unscoped rows for this account before the window delete.
+            transaction.execute(
+                "UPDATE usage_events
+                 SET snapshot_scope = ?2
+                 WHERE provider = ?1 AND snapshot_scope IS NULL",
+                params![provider.as_str(), snapshot_scope],
+            )?;
         }
-        drop(statement);
+        let (existing_ids, previous_tokens) = {
+            let mut statement = transaction.prepare(
+                "SELECT id, total_tokens FROM usage_events
+                WHERE provider = ?1
+                   AND (?2 IS NULL OR source_file = ?2)
+                   AND (?3 IS NULL OR timestamp >= ?3)
+                   AND (?4 IS NULL OR snapshot_scope = ?4)",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    provider.as_str(),
+                    source,
+                    since.map(|value| value.timestamp()),
+                    snapshot_scope,
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )?;
+            let mut database_ids = HashSet::new();
+            let mut event_ids = HashSet::new();
+            let mut tokens = 0_u64;
+            for row in rows {
+                let (id, total) = row?;
+                database_ids.insert(id.clone());
+                event_ids.insert(id);
+                tokens = tokens.saturating_add(from_sqlite_u64(total));
+            }
+            drop(statement);
+
+            let mut identity_statement = transaction.prepare(
+                "SELECT id, total_tokens FROM usage_events
+                 WHERE id = ?1
+                    OR (?3 IS NOT NULL AND provider = ?2 AND source_event_id = ?3
+                        AND (snapshot_scope = ?4 OR snapshot_scope IS NULL))
+                 LIMIT 1",
+            )?;
+            for event in events {
+                let existing = identity_statement
+                    .query_row(
+                        params![
+                            event.id,
+                            event.provider.as_str(),
+                            event.source_event_id,
+                            event.snapshot_scope
+                        ],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()?;
+                if let Some((database_id, total)) = existing {
+                    event_ids.insert(event.id.clone());
+                    if database_ids.insert(database_id) {
+                        tokens = tokens.saturating_add(from_sqlite_u64(total));
+                    }
+                }
+            }
+            (event_ids, tokens)
+        };
+        transaction.execute(
+            "DELETE FROM usage_events
+             WHERE provider = ?1
+               AND (?2 IS NULL OR source_file = ?2)
+               AND (?3 IS NULL OR timestamp >= ?3)
+               AND (?4 IS NULL OR snapshot_scope = ?4)",
+            params![
+                provider.as_str(),
+                source,
+                since.map(|value| value.timestamp()),
+                snapshot_scope,
+            ],
+        )?;
+        upsert_usage_events(&transaction, events)?;
+        let inserted = events
+            .iter()
+            .filter(|event| !existing_ids.contains(&event.id))
+            .count();
+        let current_tokens = events.iter().fold(0_u64, |total, event| {
+            total.saturating_add(event.total_tokens)
+        });
+        let summary = UpsertSummary {
+            inserted,
+            updated: events.len().saturating_sub(inserted),
+            tokens_added: current_tokens.saturating_sub(previous_tokens),
+        };
         transaction.commit()?;
         Ok(summary)
     }
@@ -356,6 +433,26 @@ impl Database {
         Ok(())
     }
 
+    pub fn clear_usage_and_cursors_for_providers(
+        &self,
+        providers: &[Provider],
+    ) -> Result<(), StorageError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        for provider in providers {
+            transaction.execute(
+                "DELETE FROM usage_events WHERE provider = ?1",
+                params![provider.as_str()],
+            )?;
+            transaction.execute(
+                "DELETE FROM file_cursors WHERE provider = ?1",
+                params![provider.as_str()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn list_usage_for_pricing(&self) -> Result<Vec<UsagePricingInput>, StorageError> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
@@ -413,6 +510,103 @@ impl Database {
     }
 }
 
+fn upsert_usage_events(
+    transaction: &Transaction<'_>,
+    events: &[UsageEvent],
+) -> Result<UpsertSummary, StorageError> {
+    let mut existing_statement = transaction.prepare(
+        "SELECT id FROM usage_events
+         WHERE id = ?1
+            OR (?3 IS NOT NULL AND provider = ?2 AND source_event_id = ?3
+                AND (snapshot_scope = ?4 OR snapshot_scope IS NULL))
+         LIMIT 1",
+    )?;
+    let mut statement = transaction.prepare(
+        "INSERT INTO usage_events (
+            id, provider, model, session_id, project_path, project_name, timestamp,
+            input_tokens, cached_input_tokens, cache_creation_input_tokens, output_tokens,
+            reasoning_tokens, total_tokens, reported_cost_usd, estimated_cost_usd,
+            source_file, source_event_id, snapshot_scope, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+        ON CONFLICT DO UPDATE SET
+            id = excluded.id,
+            provider = excluded.provider,
+            model = excluded.model,
+            session_id = excluded.session_id,
+            project_path = excluded.project_path,
+            project_name = excluded.project_name,
+            timestamp = excluded.timestamp,
+            input_tokens = excluded.input_tokens,
+            cached_input_tokens = excluded.cached_input_tokens,
+            cache_creation_input_tokens = excluded.cache_creation_input_tokens,
+            output_tokens = excluded.output_tokens,
+            reasoning_tokens = excluded.reasoning_tokens,
+            total_tokens = excluded.total_tokens,
+            reported_cost_usd = excluded.reported_cost_usd,
+            estimated_cost_usd = excluded.estimated_cost_usd,
+            source_file = excluded.source_file,
+            source_event_id = excluded.source_event_id,
+            snapshot_scope = excluded.snapshot_scope",
+    )?;
+    let mut summary = UpsertSummary::default();
+    for event in events {
+        let existing_id = existing_statement
+            .query_row(
+                params![
+                    event.id,
+                    event.provider.as_str(),
+                    event.source_event_id,
+                    event.snapshot_scope
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        // Rekey NULL-scope official IDs so the scoped unique index updates in place.
+        if let Some(existing_id) = existing_id.as_deref()
+            && existing_id != event.id
+        {
+            transaction.execute(
+                "UPDATE usage_events SET id = ?1, snapshot_scope = ?2 WHERE id = ?3",
+                params![event.id, event.snapshot_scope, existing_id],
+            )?;
+        }
+        statement.execute(params![
+            event.id,
+            event.provider.as_str(),
+            event.model,
+            event.session_id,
+            event
+                .project_path
+                .as_ref()
+                .map(|value| value.to_string_lossy().to_string()),
+            event.project_name,
+            event.timestamp.timestamp(),
+            to_sqlite_i64(event.input_tokens)?,
+            to_sqlite_i64(event.cached_input_tokens)?,
+            to_sqlite_i64(event.cache_creation_input_tokens)?,
+            to_sqlite_i64(event.output_tokens)?,
+            to_sqlite_i64(event.reasoning_tokens)?,
+            to_sqlite_i64(event.total_tokens)?,
+            event.reported_cost_usd,
+            event.estimated_cost_usd,
+            event
+                .source_file
+                .as_ref()
+                .map(|value| value.to_string_lossy().to_string()),
+            event.source_event_id,
+            event.snapshot_scope,
+            chrono::Utc::now().timestamp(),
+        ])?;
+        if existing_id.is_some() {
+            summary.updated += 1;
+        } else {
+            summary.inserted += 1;
+            summary.tokens_added = summary.tokens_added.saturating_add(event.total_tokens);
+        }
+    }
+    Ok(summary)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsagePricingInput {
     pub id: String,
@@ -454,7 +648,7 @@ pub(crate) fn from_sqlite_u64(value: i64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use chrono::Utc;
     use llmeter_core::{Provider, UsageEvent, UsageSnapshot};
@@ -481,7 +675,17 @@ mod tests {
             estimated_cost_usd: Some(0.1),
             source_file: Some(PathBuf::from("/tmp/session.jsonl")),
             source_event_id: source_event_id.map(str::to_string),
+            snapshot_scope: None,
         }
+    }
+
+    fn overview(database: &Database) -> crate::Overview {
+        UsageRepository::new(database.clone())
+            .get_overview(
+                chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+                Utc::now() + chrono::Duration::days(1),
+            )
+            .unwrap()
     }
 
     #[test]
@@ -503,6 +707,248 @@ mod tests {
             .unwrap();
         assert_eq!(overview.total_tokens, 100);
         assert_eq!(overview.event_count, 1);
+    }
+
+    #[test]
+    fn upsert_rekeys_an_existing_official_event_after_its_source_path_changes() {
+        let database = Database::open_in_memory().unwrap();
+        let mut original = event("legacy-path-id", Some("official-1"), 100);
+        original.source_file = Some(PathBuf::from("/old/snapshot.json"));
+        database
+            .upsert_usage_events_with_summary(&[original])
+            .unwrap();
+
+        let mut moved = event("stable-official-id", Some("official-1"), 120);
+        moved.source_file = Some(PathBuf::from("/new/snapshot.json"));
+        let summary = database.upsert_usage_events_with_summary(&[moved]).unwrap();
+
+        assert_eq!(summary.inserted, 0);
+        assert_eq!(summary.updated, 1);
+        assert_eq!(summary.tokens_added, 0);
+        let usage = database.list_usage_for_pricing().unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].id, "stable-official-id");
+        let overview = UsageRepository::new(database)
+            .get_overview(
+                chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+                Utc::now() + chrono::Duration::seconds(1),
+            )
+            .unwrap();
+        assert_eq!(overview.event_count, 1);
+        assert_eq!(overview.total_tokens, 120);
+    }
+
+    #[test]
+    fn provider_scoped_clear_preserves_remote_usage_and_cursors() {
+        let database = Database::open_in_memory().unwrap();
+        let local_path = PathBuf::from("/tmp/local.jsonl");
+        let remote_path = PathBuf::from("/tmp/remote.json");
+        let mut local = event("local", Some("local"), 10);
+        local.source_file = Some(local_path.clone());
+        let mut remote = event("remote", Some("remote"), 20);
+        remote.provider = Provider::Trae;
+        remote.source_file = Some(remote_path.clone());
+        database.insert_usage_events(&[local, remote]).unwrap();
+        database
+            .upsert_cursor(&FileCursor::new(local_path.clone(), Provider::Codex, 1))
+            .unwrap();
+        database
+            .upsert_cursor(&FileCursor::new(remote_path.clone(), Provider::Trae, 1))
+            .unwrap();
+
+        database
+            .clear_usage_and_cursors_for_providers(&[Provider::Codex])
+            .unwrap();
+
+        assert!(database.get_cursor(&local_path).unwrap().is_none());
+        assert!(database.get_cursor(&remote_path).unwrap().is_some());
+        let overview = UsageRepository::new(database)
+            .get_overview(
+                chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+                Utc::now() + chrono::Duration::seconds(1),
+            )
+            .unwrap();
+        assert_eq!(overview.event_count, 1);
+        assert_eq!(overview.total_tokens, 20);
+    }
+
+    #[test]
+    fn snapshot_replacement_is_authoritative_for_the_entire_source() {
+        let database = Database::open_in_memory().unwrap();
+        let now = Utc::now();
+        let mut old = event("old", Some("old"), 10);
+        old.timestamp = now - chrono::Duration::days(10);
+        let mut covered = event("covered", Some("covered"), 20);
+        covered.timestamp = now - chrono::Duration::days(2);
+        database.insert_usage_events(&[old, covered]).unwrap();
+
+        let mut replacement = event("replacement", Some("replacement"), 30);
+        replacement.timestamp = now - chrono::Duration::days(3);
+        let first = database
+            .replace_usage_events_for_source(
+                Provider::Codex,
+                Path::new("/tmp/session.jsonl"),
+                None,
+                std::slice::from_ref(&replacement),
+            )
+            .unwrap();
+        assert_eq!(first.inserted, 1);
+        assert_eq!(first.tokens_added, 0);
+        let second = database
+            .replace_usage_events_for_source(
+                Provider::Codex,
+                Path::new("/tmp/session.jsonl"),
+                None,
+                std::slice::from_ref(&replacement),
+            )
+            .unwrap();
+        assert_eq!(second.inserted, 0);
+        assert_eq!(second.updated, 1);
+        assert_eq!(second.tokens_added, 0);
+
+        let overview = UsageRepository::new(database.clone())
+            .get_overview(
+                chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+                now + chrono::Duration::seconds(1),
+            )
+            .unwrap();
+        assert_eq!(overview.event_count, 1);
+        assert_eq!(overview.total_tokens, 30);
+
+        database
+            .replace_usage_events_for_source(
+                Provider::Codex,
+                Path::new("/tmp/session.jsonl"),
+                None,
+                &[],
+            )
+            .unwrap();
+        let overview = UsageRepository::new(database)
+            .get_overview(
+                chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+                now + chrono::Duration::seconds(1),
+            )
+            .unwrap();
+        assert_eq!(overview.event_count, 0);
+        assert_eq!(overview.total_tokens, 0);
+    }
+
+    #[test]
+    fn empty_snapshot_window_clears_covered_rows_and_preserves_older_history() {
+        let database = Database::open_in_memory().unwrap();
+        let now = Utc::now();
+        let mut old = event("old", Some("old"), 10);
+        old.timestamp = now - chrono::Duration::days(10);
+        let mut covered = event("covered", Some("covered"), 20);
+        covered.timestamp = now - chrono::Duration::days(2);
+        database.insert_usage_events(&[old, covered]).unwrap();
+
+        database
+            .replace_usage_events_for_source(
+                Provider::Codex,
+                Path::new("/tmp/session.jsonl"),
+                Some(now - chrono::Duration::days(3)),
+                &[],
+            )
+            .unwrap();
+
+        let overview = UsageRepository::new(database)
+            .get_overview(
+                chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+                now + chrono::Duration::seconds(1),
+            )
+            .unwrap();
+        assert_eq!(overview.event_count, 1);
+        assert_eq!(overview.total_tokens, 10);
+    }
+
+    #[test]
+    fn provider_snapshot_window_cleans_covered_rows_from_old_source_paths() {
+        let database = Database::open_in_memory().unwrap();
+        let now = Utc::now();
+        let mut historical = event("historical", Some("historical"), 10);
+        historical.provider = Provider::Trae;
+        historical.source_file = Some(PathBuf::from("/old/trae/storage.json"));
+        historical.timestamp = now - chrono::Duration::days(40);
+        let mut stale = event("stale", Some("stale"), 20);
+        stale.provider = Provider::Trae;
+        stale.source_file = Some(PathBuf::from("/old/trae/storage.json"));
+        stale.timestamp = now - chrono::Duration::days(2);
+        let mut unrelated = event("unrelated", Some("unrelated"), 30);
+        unrelated.provider = Provider::Cursor;
+        unrelated.source_file = Some(PathBuf::from("/cursor/state.vscdb"));
+        unrelated.timestamp = now - chrono::Duration::days(2);
+        database
+            .insert_usage_events(&[historical, stale, unrelated])
+            .unwrap();
+
+        database
+            .replace_usage_events_for_provider(
+                Provider::Trae,
+                Some(now - chrono::Duration::days(30)),
+                &[],
+            )
+            .unwrap();
+
+        let overview = UsageRepository::new(database)
+            .get_overview(
+                chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+                now + chrono::Duration::seconds(1),
+            )
+            .unwrap();
+        assert_eq!(overview.event_count, 2);
+        assert_eq!(overview.total_tokens, 40);
+    }
+
+    #[test]
+    fn scoped_remote_snapshots_keep_accounts_separate() {
+        let database = Database::open_in_memory().unwrap();
+        let mut account_a = event("cursor-a", Some("session-1"), 10);
+        account_a.provider = Provider::Cursor;
+        account_a.snapshot_scope = Some("account-a".into());
+        let mut account_b = event("cursor-b", Some("session-1"), 20);
+        account_b.provider = Provider::Cursor;
+        account_b.snapshot_scope = Some("account-b".into());
+
+        database
+            .replace_usage_events_for_provider_scoped(
+                Provider::Cursor,
+                None,
+                Some("account-a"),
+                std::slice::from_ref(&account_a),
+            )
+            .unwrap();
+        database
+            .replace_usage_events_for_provider_scoped(
+                Provider::Cursor,
+                None,
+                Some("account-b"),
+                std::slice::from_ref(&account_b),
+            )
+            .unwrap();
+        assert_eq!(overview(&database).total_tokens, 30);
+
+        account_b.total_tokens = 3;
+        account_b.input_tokens = 3;
+        database
+            .replace_usage_events_for_provider_scoped(
+                Provider::Cursor,
+                None,
+                Some("account-b"),
+                std::slice::from_ref(&account_b),
+            )
+            .unwrap();
+        assert_eq!(overview(&database).total_tokens, 13);
+
+        database
+            .replace_usage_events_for_provider_scoped(
+                Provider::Cursor,
+                None,
+                Some("account-a"),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(overview(&database).total_tokens, 3);
     }
 
     #[test]

@@ -11,6 +11,13 @@ The Hermes Agent asset is the provider-specific SVG from
 
 - Hermes Agent: https://icons.lobehub.com/components/hermes-agent
 
+The following provider-specific assets come from
+`@lobehub/icons-static-svg@1.94.0`:
+
+- Cursor: https://icons.lobehub.com/components/cursor
+- Qoder: https://icons.lobehub.com/components/qoder
+- TRAE: https://icons.lobehub.com/components/trae
+
 The following fallback assets use the SVG paths and brand colors from
 `simple-icons@16.28.0`:
 

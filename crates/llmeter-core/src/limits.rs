@@ -95,6 +95,10 @@ pub struct LimitWindow {
     pub used_amount: Option<f64>,
     pub limit_amount: Option<f64>,
     pub unit: Option<String>,
+    #[serde(default = "default_usage_known")]
+    pub usage_known: bool,
+    #[serde(default)]
+    pub quota_exceeded: bool,
 }
 
 impl LimitWindow {
@@ -107,8 +111,14 @@ impl LimitWindow {
             used_amount: None,
             limit_amount: None,
             unit: None,
+            usage_known: true,
+            quota_exceeded: false,
         }
     }
+}
+
+const fn default_usage_known() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -116,6 +126,7 @@ impl LimitWindow {
 pub enum LimitSource {
     #[default]
     ProviderApi,
+    LocalApp,
     DiskCache,
 }
 
@@ -173,5 +184,16 @@ mod tests {
         };
 
         assert!(limits.as_stale("offline", now).is_none());
+    }
+
+    #[test]
+    fn old_cached_windows_default_to_known_usage() {
+        let window: LimitWindow = serde_json::from_str(
+            r#"{"key":"legacy","used_percent":25.0,"reset_at":null,"window_seconds":null,"used_amount":null,"limit_amount":null,"unit":null}"#,
+        )
+        .unwrap();
+
+        assert!(window.usage_known);
+        assert!(!window.quota_exceeded);
     }
 }

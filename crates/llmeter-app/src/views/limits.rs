@@ -12,7 +12,14 @@ use crate::{
     views::{palette::Palette, provider_brand::provider_logo},
 };
 
-const LIMIT_PROVIDERS: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::Grok];
+const LIMIT_PROVIDERS: [Provider; 6] = [
+    Provider::Claude,
+    Provider::Codex,
+    Provider::Cursor,
+    Provider::Qoder,
+    Provider::Grok,
+    Provider::Trae,
+];
 
 pub(crate) fn limits_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl IntoElement {
     let p = Palette::from_app(cx);
@@ -197,9 +204,9 @@ fn provider_card(
         .into_any_element()
 }
 
-fn window_row(window: &LimitWindow, p: Palette) -> impl IntoElement {
+fn window_row(window: &LimitWindow, p: Palette) -> AnyElement {
     let ratio = (window.used_percent / 100.0).clamp(0.0, 1.0) as f32;
-    let color = if window.used_percent >= 90.0 {
+    let color = if window.quota_exceeded || window.used_percent >= 90.0 {
         rgb(0xdc2626)
     } else if window.used_percent >= 75.0 {
         rgb(0xd97706)
@@ -217,6 +224,49 @@ fn window_row(window: &LimitWindow, p: Palette) -> impl IntoElement {
         .used_amount
         .zip(window.limit_amount)
         .map(|(used, limit)| format_amounts(used, limit, window.unit.as_deref()));
+    let usage_label = if window.quota_exceeded {
+        t!("limits.quota_exceeded").to_string()
+    } else {
+        format_percent(window.used_percent)
+    };
+
+    if !window.usage_known {
+        let allowance = window
+            .limit_amount
+            .map(|limit| format_allowance(limit, window.unit.as_deref()))
+            .unwrap_or_else(|| t!("limits.usage_unknown").to_string());
+        return v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_sm()
+                            .text_color(p.foreground)
+                            .child(window_label(&window.key)),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.foreground)
+                            .child(allowance),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(p.muted_foreground)
+                    .child(t!("limits.allowance_only").to_string()),
+            )
+            .into_any_element();
+    }
 
     v_flex()
         .gap_2()
@@ -239,7 +289,7 @@ fn window_row(window: &LimitWindow, p: Palette) -> impl IntoElement {
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(color)
-                        .child(format_percent(window.used_percent)),
+                        .child(usage_label),
                 ),
         )
         .child(
@@ -263,6 +313,7 @@ fn window_row(window: &LimitWindow, p: Palette) -> impl IntoElement {
                     .when_some(reset, |this, reset| this.child(reset)),
             )
         })
+        .into_any_element()
 }
 
 fn status_style(
@@ -322,6 +373,12 @@ fn window_label(key: &str) -> String {
         "opus" => t!("limits.window_opus").to_string(),
         "credits" => t!("limits.window_credits").to_string(),
         "on_demand" => t!("limits.window_on_demand").to_string(),
+        "cursor_plan" => t!("limits.window_cursor_plan").to_string(),
+        "cursor_auto" => t!("limits.window_cursor_auto").to_string(),
+        "cursor_api" => t!("limits.window_cursor_api").to_string(),
+        "qoder_credits" => t!("limits.window_qoder_credits").to_string(),
+        "qoder_cn_credits" => t!("limits.window_qoder_cn_credits").to_string(),
+        "trae_fast_requests" => t!("limits.window_trae_fast_requests").to_string(),
         key if key.starts_with("model:") => key.trim_start_matches("model:").to_string(),
         key => key.replace('_', " "),
     }
@@ -348,6 +405,17 @@ fn format_amounts(used: f64, limit: f64, unit: Option<&str>) -> String {
     )
     .trim_end()
     .to_string()
+}
+
+fn format_allowance(limit: f64, unit: Option<&str>) -> String {
+    let unit = match unit {
+        Some("requests/hour") => t!("limits.requests_per_hour").to_string(),
+        Some(unit) => unit.to_string(),
+        None => String::new(),
+    };
+    format!("{} {unit}", compact_number(limit))
+        .trim_end()
+        .to_string()
 }
 
 fn compact_number(value: f64) -> String {
@@ -401,6 +469,10 @@ mod tests {
     #[test]
     fn labels_known_windows_and_preserves_model_names() {
         assert!(!window_label("five_hour").is_empty());
+        assert!(!window_label("cursor_plan").is_empty());
+        assert!(!window_label("qoder_credits").is_empty());
+        assert!(!window_label("qoder_cn_credits").is_empty());
+        assert!(!window_label("trae_fast_requests").is_empty());
         assert_eq!(window_label("model:Claude Opus"), "Claude Opus");
     }
 

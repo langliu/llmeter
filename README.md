@@ -39,6 +39,24 @@ safety rescan.
   cache-token breakdowns and the exact cost reported by Grok Build
 - Hermes Agent: $HERMES_HOME/state.db (default ~/.hermes/state.db) plus local
   profile databases, using per-model usage with aggregate-session reconciliation
+- Cursor: the official account usage CSV export, using the existing local Cursor
+  sign-in session; rows in each valid export replace that account's returned
+  time window while older history is retained
+- Qoder and Qoder CN: the validated `SharedClientCache/cache/db/local.db`
+  assistant-token schema, with cached input separated from ordinary input
+- TRAE SOLO CN: the official per-session usage API for a rolling 30-day window;
+  this remote read is disabled until explicitly enabled under Settings → Data & Sync
+
+The Limits page also reads account quota from the existing local login state for
+Claude Code, Codex, Cursor, Qoder/Qoder CN, and Grok. TRAE SOLO contributes its
+local entitlement and Fast Request allowance; its local state does not expose
+current usage, so LLMeter does not invent a percentage. Cursor's official export
+provides account-level token events but does not identify ordinary local chat
+sessions. TRAE SOLO international still exposes no readable per-request token
+log; TRAE SOLO CN installation and sign-in are detected locally, and its JWT is
+sent only to TRAE's pinned official API after the user enables token collection.
+Remote Cursor and TRAE snapshots are account-scoped, so switching accounts does
+not overwrite another account's recorded usage.
 
 Codex last_token_usage snapshots are treated as direct deltas when present.
 Other cumulative snapshots go through a per-session cumulative tracker, so
@@ -82,9 +100,10 @@ open target/release/bundle/osx/LLMeter.app
 
 The notify subcommand is intentionally lightweight: it writes a local signal
 and exits. The running app performs the actual incremental parse.
-The rescan subcommand explicitly clears derived usage and cursors, then
-rebuilds them from session files that still exist. Deleted agent history cannot
-be recovered by a rescan.
+The rescan subcommand clears usage and cursors only for providers that can be
+fully rebuilt from local sources. Remote snapshot history is retained and then
+refreshed, so data outside a provider's API window is not discarded. Deleted
+local agent history cannot be recovered by a rescan.
 Hook installation is opt-in; existing Codex notify configuration is treated as
 a conflict, and Claude hooks carry an LLMeter marker so uninstall only removes
 the managed entry.
