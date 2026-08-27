@@ -2,16 +2,18 @@ use std::rc::Rc;
 
 use chrono::{Datelike, Duration, Local, Timelike};
 use gpui::{
-    AnyElement, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
-    deferred, div, prelude::*, px, size,
+    AnyElement, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement,
+    Pixels, Render, SharedString, Size, Window, deferred, div, prelude::*, px, size,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable,
+    ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, VirtualListScrollHandle,
     button::{Button, ButtonGroup, ButtonVariants},
     h_flex,
     input::Input,
+    sheet::Sheet,
     v_flex, v_virtual_list,
 };
+use llmeter_collector::{SessionTranscript, TranscriptMessage, TranscriptRole};
 use llmeter_core::Provider;
 use llmeter_storage::SessionSummary;
 use rust_i18n::t;
@@ -395,14 +397,7 @@ fn session_row(
     p: Palette,
     cx: &mut Context<LLMeterView>,
 ) -> AnyElement {
-    let title = {
-        let title = session.title();
-        if title.trim().is_empty() {
-            t!("sessions.untitled").to_string()
-        } else {
-            title
-        }
-    };
+    let title = session_display_title(&session);
     let model = session
         .model
         .clone()
@@ -417,13 +412,17 @@ fn session_row(
     let turn_count = session.turn_count;
     let mono_font = cx.theme().mono_font_family.clone();
     let owned = session;
+    let detail_session = owned.clone();
+    let row_id = format!("session-row-{}", crate::app::session_key(&owned));
 
     h_flex()
-        .id(SharedString::from(format!(
-            "session-row-{}",
-            crate::app::session_key(&owned)
-        )))
+        .id(SharedString::from(row_id.clone()))
+        .debug_selector(move || row_id)
         .w_full()
+        .cursor_pointer()
+        .on_click(cx.listener(move |view, _, window, cx| {
+            view.show_session_detail(detail_session.clone(), window, cx);
+        }))
         .items_center()
         .justify_between()
         .h(px(78.0))
@@ -494,6 +493,255 @@ fn session_row(
                     p,
                 ))
                 .child(copy_button(command.is_some(), copied, owned, cx)),
+        )
+        .into_any_element()
+}
+
+#[derive(Clone, Debug)]
+enum TranscriptLoadState {
+    Loading,
+    Loaded(SessionTranscript),
+    Failed(String),
+}
+
+pub(crate) struct SessionDetailView {
+    palette: Palette,
+    transcript: TranscriptLoadState,
+    transcript_item_sizes: Rc<Vec<Size<Pixels>>>,
+    transcript_scroll: VirtualListScrollHandle,
+}
+
+impl SessionDetailView {
+    pub(crate) fn new(palette: Palette) -> Self {
+        Self {
+            palette,
+            transcript: TranscriptLoadState::Loading,
+            transcript_item_sizes: Rc::new(Vec::new()),
+            transcript_scroll: VirtualListScrollHandle::new(),
+        }
+    }
+
+    pub(crate) fn set_transcript(
+        &mut self,
+        transcript: Result<SessionTranscript, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.transcript = match transcript {
+            Ok(transcript) => {
+                self.transcript_item_sizes = Rc::new(
+                    transcript
+                        .messages
+                        .iter()
+                        .map(estimated_transcript_message_size)
+                        .collect(),
+                );
+                TranscriptLoadState::Loaded(transcript)
+            }
+            Err(error) => {
+                self.transcript_item_sizes = Rc::new(Vec::new());
+                TranscriptLoadState::Failed(error)
+            }
+        };
+        cx.notify();
+    }
+}
+
+impl Render for SessionDetailView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        session_detail_content(self, cx.entity())
+    }
+}
+
+pub(crate) fn session_detail_sheet(sheet: Sheet, detail: Entity<SessionDetailView>) -> Sheet {
+    sheet
+        .size(px(520.0))
+        .title(t!("sessions.transcript_details").to_string())
+        .child(detail)
+}
+
+fn session_detail_content(
+    detail_view: &SessionDetailView,
+    detail: Entity<SessionDetailView>,
+) -> AnyElement {
+    v_flex()
+        .debug_selector(|| "session-detail-content".to_string())
+        .w_full()
+        .gap_3()
+        .pb_6()
+        .child(transcript_section(
+            &detail_view.transcript,
+            detail_view.transcript_item_sizes.clone(),
+            detail_view.transcript_scroll.clone(),
+            detail,
+            detail_view.palette,
+        ))
+        .into_any_element()
+}
+
+fn transcript_section(
+    state: &TranscriptLoadState,
+    item_sizes: Rc<Vec<Size<Pixels>>>,
+    scroll: VirtualListScrollHandle,
+    detail: Entity<SessionDetailView>,
+    p: Palette,
+) -> impl IntoElement {
+    let content: AnyElement = match state {
+        TranscriptLoadState::Loading => div()
+            .text_sm()
+            .text_color(p.muted_foreground)
+            .child(t!("sessions.transcript_loading").to_string())
+            .into_any_element(),
+        TranscriptLoadState::Failed(error) => v_flex()
+            .gap_1()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(p.muted_foreground)
+                    .child(t!("sessions.transcript_unavailable").to_string()),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(p.muted_foreground)
+                    .child(error.clone()),
+            )
+            .into_any_element(),
+        TranscriptLoadState::Loaded(transcript) => {
+            if transcript.messages.is_empty() {
+                div()
+                    .text_sm()
+                    .text_color(p.muted_foreground)
+                    .child(t!("sessions.transcript_empty").to_string())
+                    .into_any_element()
+            } else {
+                let messages = v_virtual_list(
+                    detail,
+                    "session-transcript-items",
+                    item_sizes,
+                    move |detail, visible_range, _, _| {
+                        let TranscriptLoadState::Loaded(transcript) = &detail.transcript else {
+                            return Vec::new();
+                        };
+                        visible_range
+                            .filter_map(|index| {
+                                transcript
+                                    .messages
+                                    .get(index)
+                                    .map(|message| transcript_message(message, p))
+                            })
+                            .collect()
+                    },
+                )
+                .track_scroll(&scroll)
+                .h(px(480.0))
+                .w_full()
+                .gap_3();
+
+                let mut content = v_flex().gap_2().child(messages);
+                if transcript.truncated {
+                    content = content.child(
+                        div()
+                            .text_xs()
+                            .text_color(p.muted_foreground)
+                            .child(t!("sessions.transcript_truncated").to_string()),
+                    );
+                }
+                content.into_any_element()
+            }
+        }
+    };
+
+    div()
+        .w_full()
+        .rounded_xl()
+        .border_1()
+        .border_color(p.border.opacity(0.7))
+        .bg(p.tiles.opacity(0.72))
+        .px_3()
+        .py_3()
+        .child(content)
+}
+
+fn estimated_transcript_message_size(message: &TranscriptMessage) -> Size<Pixels> {
+    const CHARS_PER_LINE: usize = 52;
+    const LINE_HEIGHT: f32 = 20.0;
+    const FIXED_HEIGHT: f32 = 56.0;
+
+    let lines = message
+        .content
+        .lines()
+        .map(|line| {
+            let width = line
+                .chars()
+                .map(|character| if character.is_ascii() { 1 } else { 2 })
+                .sum::<usize>();
+            width.max(1).div_ceil(CHARS_PER_LINE)
+        })
+        .sum::<usize>()
+        .max(1);
+    size(px(1.0), px(FIXED_HEIGHT + lines as f32 * LINE_HEIGHT))
+}
+
+fn transcript_message(message: &TranscriptMessage, p: Palette) -> AnyElement {
+    let (label, foreground, background) = match message.role {
+        TranscriptRole::User => (
+            t!("sessions.transcript_user").to_string(),
+            p.link,
+            p.link.opacity(0.1),
+        ),
+        TranscriptRole::Assistant => (
+            t!("sessions.transcript_assistant").to_string(),
+            p.success,
+            p.success.opacity(0.1),
+        ),
+        TranscriptRole::Thinking => (
+            t!("sessions.transcript_thinking").to_string(),
+            p.muted_foreground,
+            p.muted.opacity(0.42),
+        ),
+        TranscriptRole::Tool => (
+            t!("sessions.transcript_tool").to_string(),
+            p.foreground,
+            p.accent.opacity(0.28),
+        ),
+    };
+
+    let timestamp = message.timestamp.map(format_session_time);
+    v_flex()
+        .gap_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(p.border.opacity(0.68))
+        .bg(background)
+        .px_3()
+        .py_3()
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(foreground)
+                        .child(label),
+                )
+                .when_some(timestamp, |this, timestamp| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(p.muted_foreground)
+                            .child(timestamp),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .whitespace_normal()
+                .text_sm()
+                .text_color(p.foreground)
+                .child(message.content.clone()),
         )
         .into_any_element()
 }
@@ -579,8 +827,18 @@ fn copy_button(
     .label(label)
     .disabled(!available)
     .on_click(cx.listener(move |view, _, _, cx| {
+        cx.stop_propagation();
         view.copy_resume_command(&session, cx);
     }))
+}
+
+fn session_display_title(session: &SessionSummary) -> String {
+    let title = session.title();
+    if title.trim().is_empty() {
+        t!("sessions.untitled").to_string()
+    } else {
+        title
+    }
 }
 
 fn empty_state(text: String, p: Palette) -> impl IntoElement {

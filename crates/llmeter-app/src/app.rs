@@ -1,16 +1,20 @@
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Datelike, Days, Duration as ChronoDuration, Local, NaiveDate, Utc};
-use gpui::{AppContext, ClipboardItem, Context, Entity, Render, Subscription, Window, point, px};
+use gpui::{
+    AppContext, ClipboardItem, Context, Entity, ParentElement, Render, Styled, Subscription,
+    Window, div, point, px,
+};
 use gpui_component::{
-    VirtualListScrollHandle,
+    Root, VirtualListScrollHandle, WindowExt,
     calendar::Date,
     date_picker::{DatePickerEvent, DatePickerState},
     input::{InputEvent, InputState},
     theme::{Theme as UiTheme, ThemeMode},
 };
 use llmeter_collector::{
-    Collector, CollectorEvent, LimitCollector, providers::TRAE_CN_USAGE_SETTING,
+    Collector, CollectorEvent, LimitCollector, load_session_transcript,
+    providers::TRAE_CN_USAGE_SETTING,
 };
 use llmeter_core::LimitsSnapshot;
 use llmeter_storage::{SessionLoad, SessionQuery, SessionSummary, UsageRepository};
@@ -21,7 +25,10 @@ use crate::{
     i18n::{self, LocalePreference},
     state::{OverviewRangeSnapshot, UiSnapshot, local_midnight},
     views::dashboard::{DashboardPage, HeatmapView, dashboard},
-    views::sessions::{SessionProviderFilter, SessionRangeFilter},
+    views::palette::Palette,
+    views::sessions::{
+        SessionDetailView, SessionProviderFilter, SessionRangeFilter, session_detail_sheet,
+    },
     views::settings::SettingsSection,
 };
 
@@ -731,6 +738,33 @@ impl LLMeterView {
         cx.notify();
     }
 
+    pub(crate) fn show_session_detail(
+        &mut self,
+        session: SessionSummary,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let palette = Palette::from_app(cx);
+        let detail = cx.new(|_| SessionDetailView::new(palette));
+        let weak_detail = detail.downgrade();
+        let session_for_load = session.clone();
+        cx.spawn(async move |_, cx| {
+            let transcript = cx
+                .background_executor()
+                .spawn(async move {
+                    load_session_transcript(&session_for_load).map_err(|error| format!("{error:#}"))
+                })
+                .await;
+            let _ = weak_detail.update(cx, |detail, cx| {
+                detail.set_transcript(transcript, cx);
+            });
+        })
+        .detach();
+        window.open_sheet(cx, move |sheet, _, _| {
+            session_detail_sheet(sheet, detail.clone())
+        });
+    }
+
     pub(crate) fn copy_resume_command(&mut self, session: &SessionSummary, cx: &mut Context<Self>) {
         let Some(command) = session.resume_command() else {
             return;
@@ -739,9 +773,7 @@ impl LLMeterView {
         let key = session_key(session);
         self.copied_session = Some(key.clone());
         self.copied_reset_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_secs(2))
-                .await;
+            cx.background_executor().timer(Duration::from_secs(2)).await;
             let _ = this.update(cx, |view, cx| {
                 if view.copied_session.as_deref() == Some(key.as_str()) {
                     view.copied_session = None;
@@ -1109,13 +1141,25 @@ pub(crate) fn session_key(session: &SessionSummary) -> String {
 }
 
 impl Render for LLMeterView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
-        dashboard(self, cx)
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        let sheet_layer = Root::render_sheet_layer(window, cx);
+        let dialog_layer = Root::render_dialog_layer(window, cx);
+        let notification_layer = Root::render_notification_layer(window, cx);
+
+        div()
+            .relative()
+            .size_full()
+            .child(dashboard(self, cx))
+            .children(sheet_layer)
+            .children(dialog_layer)
+            .children(notification_layer)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use super::{
         CURRENCY_SETTING, DisplayCurrency, LLMeterView, LocalePreference, OverviewPeriod,
         OverviewProviderFilter, SnapshotUpdate,
@@ -1123,8 +1167,10 @@ mod tests {
     use crate::views::dashboard::DashboardPage;
     use crate::views::sessions::SessionProviderFilter;
     use chrono::{Duration, Local, NaiveDate, TimeZone, Utc};
-    use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, point, px};
-    use gpui_component::ActiveTheme;
+    use gpui::{
+        AppContext, Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, point, px,
+    };
+    use gpui_component::{ActiveTheme, Root, WindowExt};
     use llmeter_collector::Collector;
     use llmeter_core::{LimitSource, LimitWindow, Provider, ProviderLimits};
     use llmeter_storage::{Database, ModelUsage, ProviderUsage, SessionSummary};
@@ -1216,6 +1262,44 @@ mod tests {
             offset,
             first
         );
+    }
+
+    #[gpui::test]
+    fn clicking_session_row_opens_detail_sheet(cx: &mut TestAppContext) {
+        let database = Database::open_in_memory().expect("in-memory database");
+        let collector = Collector::new(database);
+        cx.update(gpui_component::init);
+
+        let view_slot = Rc::new(RefCell::new(None));
+        let (root, cx) = cx.add_window_view({
+            let view_slot = view_slot.clone();
+            move |window, cx| {
+                let view = cx.new(|cx| LLMeterView::new(collector.clone(), window, cx));
+                view.update(cx, |view, _| {
+                    view.snapshot.sessions = fake_sessions(1);
+                    view.active_page = DashboardPage::Sessions;
+                });
+                *view_slot.borrow_mut() = Some(view.clone());
+                Root::new(view, window, cx)
+            }
+        });
+        let view = view_slot
+            .borrow()
+            .clone()
+            .expect("test view should be created");
+
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let row = cx
+            .debug_bounds("session-row-claude:session-0:/tmp/project-0/session.jsonl")
+            .expect("first session row should be rendered");
+        cx.simulate_click(row.center(), Modifiers::default());
+        assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("session-detail-content").is_some());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.snapshot.sessions.len(), 1);
+        });
+        let _ = root;
     }
 
     #[gpui::test]
