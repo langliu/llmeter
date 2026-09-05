@@ -3,6 +3,7 @@ mod assets;
 mod currency;
 mod i18n;
 mod state;
+mod theme;
 mod views;
 
 rust_i18n::i18n!("locales", fallback = "en");
@@ -92,14 +93,15 @@ fn main() -> Result<()> {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitleBar::title_bar_options()),
-                    window_background: WindowBackgroundAppearance::Blurred,
+                    window_background: WindowBackgroundAppearance::Opaque,
+                    window_min_size: Some(size(px(980.0), px(640.0))),
                     ..Default::default()
                 },
                 |window, cx| {
                     window.set_window_title("LLMeter");
-                    window.set_background_appearance(WindowBackgroundAppearance::Blurred);
+                    window.set_background_appearance(WindowBackgroundAppearance::Opaque);
                     let view = cx.new(|cx| app::LLMeterView::new(collector.clone(), window, cx));
-                    cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background.opacity(0.78)))
+                    cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
                 },
             )?;
             Ok::<_, anyhow::Error>(())

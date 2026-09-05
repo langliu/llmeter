@@ -12,6 +12,8 @@ nav:
 header:
   today: "今天"
 overview:
+  subtitle: "编程代理用量与活动一览"
+  estimated_cost: "预估费用"
   today: "今天"
   days_7: "7 天"
   days_30: "30 天"

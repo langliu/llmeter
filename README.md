@@ -108,6 +108,19 @@ Hook installation is opt-in; existing Codex notify configuration is treated as
 a conflict, and Claude hooks carry an LLMeter marker so uninstall only removes
 the managed entry.
 
+The development profile optimizes GPUI and its Taffy layout engine while
+keeping application code unoptimized with debug information. Without these
+per-package overrides, repeated layout during scrolling is noticeably slow.
+The first development build after changing them recompiles the UI runtime.
+
+An opt-in overview scrolling performance guard exercises 60 scroll steps at
+980×640, including event dispatch and layout/paint. Run it on an idle machine;
+it measures CPU work, not native GPU presentation or trackpad frame pacing:
+
+~~~sh
+cargo test -p llmeter-app overview_scroll_frame_budget -- --ignored --nocapture
+~~~
+
 Run the verification suite:
 
 ~~~sh

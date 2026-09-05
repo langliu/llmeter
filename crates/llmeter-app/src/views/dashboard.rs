@@ -102,16 +102,13 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
             .into_any_element(),
     };
 
-    let main = div().flex().flex_1().min_w(px(0.0)).p_3().child(
+    let main = div().flex().flex_1().min_w(px(0.0)).child(
         div()
             .flex()
             .flex_col()
             .size_full()
-            // GPUI's overflow mask is rectangular, so keep the scroll viewport
-            // inside the rounded corners instead of relying on rounded clipping.
-            .py_3()
-            .rounded_3xl()
-            .bg(p.background.opacity(0.96))
+            .py_6()
+            .bg(p.background)
             .text_color(p.foreground)
             .overflow_hidden()
             .child(
@@ -132,7 +129,7 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
     div()
         .flex()
         .size_full()
-        .bg(p.background.opacity(0.55))
+        .bg(p.background)
         .child(sidebar(active_page, cx))
         .child(main)
 }
@@ -158,8 +155,7 @@ fn providers_page(view: &LLMeterView, snapshot: &UiSnapshot, p: Palette) -> gpui
         .flex()
         .flex_col()
         .gap_4()
-        .px_4()
-        .py_1()
+        .px_6()
         .child(page_heading(
             t!("providers.title").to_string(),
             t!("providers.subtitle").to_string(),
@@ -198,8 +194,7 @@ fn projects_page(view: &LLMeterView, snapshot: &UiSnapshot, p: Palette) -> gpui:
         .flex()
         .flex_col()
         .gap_4()
-        .px_4()
-        .py_1()
+        .px_6()
         .child(page_heading(
             t!("projects.title").to_string(),
             t!("projects.subtitle").to_string(),
@@ -285,40 +280,39 @@ fn overview_page(
         .iter()
         .filter(|day| day.total_tokens > 0)
         .count();
-    let stats = glass_card(p)
+    let stats = surface_card(p).child(
+        div()
+            .flex()
+            .gap_2()
+            .child(stat_chip(
+                format_tokens(snapshot.today.total_tokens),
+                t!("overview.today").to_string(),
+                p,
+            ))
+            .child(stat_chip(
+                format_tokens(snapshot.seven_days.total_tokens),
+                t!("overview.days_7").to_string(),
+                p,
+            ))
+            .child(stat_chip(
+                format_tokens(snapshot.thirty_days.total_tokens),
+                t!("overview.days_30").to_string(),
+                p,
+            ))
+            .child(stat_chip(
+                format_tokens(snapshot.session_count),
+                t!("overview.conversations").to_string(),
+                p,
+            )),
+    );
+    let model_ranking = surface_card(p)
         .child(
             div()
-                .flex()
-                .gap_2()
-                .child(stat_chip(
-                    format_tokens(snapshot.today.total_tokens),
-                    t!("overview.today").to_string(),
-                    p,
-                ))
-                .child(stat_chip(
-                    format_tokens(snapshot.seven_days.total_tokens),
-                    t!("overview.days_7").to_string(),
-                    p,
-                ))
-                .child(stat_chip(
-                    format_tokens(snapshot.thirty_days.total_tokens),
-                    t!("overview.days_30").to_string(),
-                    p,
-                ))
-                .child(stat_chip(
-                    format_tokens(snapshot.session_count),
-                    t!("overview.conversations").to_string(),
-                    p,
-                )),
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(t!("overview.model_usage").to_string()),
         )
-        .child(
-            div()
-                .mt_3()
-                .border_t_1()
-                .border_color(p.border)
-                .pt_2()
-                .child(ranking),
-        )
+        .child(div().pt_3().child(ranking))
         .child(
             div()
                 .mt_3()
@@ -346,7 +340,7 @@ fn overview_page(
     }
     let mut share_bar = div()
         .flex()
-        .h(px(8.0))
+        .h(px(4.0))
         .w_full()
         .overflow_hidden()
         .rounded_full()
@@ -360,7 +354,7 @@ fn overview_page(
             div()
                 .h_full()
                 .w(relative(ratio))
-                .bg(provider_color(provider.provider)),
+                .bg(provider_color(provider.provider, p)),
         );
     }
     let all_models = aggregate_model_usage(&range.models);
@@ -374,7 +368,11 @@ fn overview_page(
         .gap_3();
     provider_cards = provider_cards.child(share_card(
         t!("overview.share_all").to_string(),
-        100.0,
+        if range.overview.total_tokens > 0 {
+            100.0
+        } else {
+            0.0
+        },
         all_models.len(),
         None,
         p,
@@ -436,15 +434,15 @@ fn overview_page(
             .map(|usage| provider_model_detail(usage, &range.models, view, p)),
     };
 
-    let hero = glass_card(p)
-        .child(overview_period_filter(view, cx))
+    let hero = surface_card(p)
+        .debug_selector(|| "overview-summary".into())
         .child(
             div()
                 .w_full()
                 .flex()
                 .flex_col()
-                .items_center()
-                .pt_4()
+                .items_start()
+                .pt_1()
                 .child(
                     div()
                         .text_xs()
@@ -453,9 +451,9 @@ fn overview_page(
                 )
                 .child(
                     div()
-                        .pt_3()
-                        .text_3xl()
-                        .font_weight(FontWeight::BOLD)
+                        .pt_2()
+                        .text_size(px(36.0))
+                        .font_weight(FontWeight::SEMIBOLD)
                         .child(format_full_number(range.overview.total_tokens)),
                 )
                 .child(
@@ -463,8 +461,12 @@ fn overview_page(
                         .pt_2()
                         .text_base()
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(p.success)
-                        .child(view.format_cost(range.overview.estimated_cost_usd)),
+                        .text_color(p.muted_foreground)
+                        .child(format!(
+                            "{}  {}",
+                            t!("overview.estimated_cost"),
+                            view.format_cost(range.overview.estimated_cost_usd)
+                        )),
                 ),
         )
         .child(div().pt_6().child(share_bar))
@@ -473,47 +475,67 @@ fn overview_page(
 
     div()
         .flex()
-        .items_start()
-        .gap_3()
-        .px_3()
+        .flex_col()
+        .gap_5()
+        .px_6()
         .child(
             div()
-                .w(px(380.0))
-                .flex_shrink_0()
                 .flex()
-                .flex_col()
-                .gap_3()
-                .child(stats)
-                .child(heatmap(
-                    view,
-                    &snapshot.heatmap_daily,
-                    &snapshot.heatmap_models,
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .child(page_heading(
+                    t!("nav.overview").to_string(),
+                    t!("overview.subtitle").to_string(),
                     p,
-                    cx,
                 ))
-                .child(panel(
-                    t!(
-                        "overview.token_trend_period",
-                        period = view.overview_period.label()
-                    )
-                    .to_string(),
-                    trend(&range.daily, view, p),
-                    p,
-                )),
+                .child(overview_period_filter(view, cx)),
         )
+        .child(stats)
         .child(
             div()
-                .flex_1()
-                .min_w(px(0.0))
                 .flex()
-                .flex_col()
-                .gap_3()
-                .child(hero)
-                .child(panel(
-                    t!("overview.recent_activity").to_string(),
-                    activity_rows,
-                    p,
-                )),
+                .items_start()
+                .gap_5()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .gap_5()
+                        .child(hero)
+                        .child(panel(
+                            t!(
+                                "overview.token_trend_period",
+                                period = view.overview_period.label()
+                            )
+                            .to_string(),
+                            trend(&range.daily, view, p),
+                            p,
+                        ))
+                        .child(panel(
+                            t!("overview.recent_activity").to_string(),
+                            activity_rows,
+                            p,
+                        )),
+                )
+                .child(
+                    div()
+                        .w(px(356.0))
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_col()
+                        .gap_5()
+                        .child(heatmap(
+                            view,
+                            &snapshot.heatmap_daily,
+                            &snapshot.heatmap_models,
+                            p,
+                            cx,
+                        ))
+                        .child(model_ranking),
+                ),
         )
         .into_any_element()
 }
@@ -526,6 +548,7 @@ fn overview_period_filter(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> 
         group = group.child(
             Button::new(("overview-period", index))
                 .label(period.label())
+                .small()
                 .selected(view.overview_period == period),
         );
     }
@@ -536,7 +559,6 @@ fn overview_period_filter(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> 
         .items_center()
         .justify_between()
         .gap_2()
-        .pb_3()
         .child(
             group.on_click(cx.listener(|view, clicks: &Vec<usize>, _, cx| {
                 if let Some(&index) = clicks.first()
@@ -558,45 +580,31 @@ fn overview_period_filter(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> 
         })
 }
 
-fn glass_card(p: Palette) -> gpui::Div {
+fn surface_card(p: Palette) -> gpui::Div {
     div()
         .flex()
         .flex_col()
         .p_4()
-        .rounded_2xl()
-        .bg(p.tiles.opacity(0.98))
+        .rounded_lg()
+        .bg(p.tiles)
         .border_1()
-        .border_color(p.border.opacity(0.7))
+        .border_color(p.border)
 }
 
 fn stat_chip(value: String, label: String, p: Palette) -> impl IntoElement {
-    let (background, border): (gpui::Hsla, gpui::Hsla) = if p.is_dark {
-        (p.muted.opacity(0.65), p.border.opacity(0.35))
-    } else {
-        (rgb(0xf1f5f9).into(), rgb(0xe2e8f0).into())
-    };
     div()
         .flex_1()
         .min_w(px(0.0))
-        .rounded_xl()
-        .bg(background)
-        .border_1()
-        .border_color(border)
-        .px_2()
-        .py_3()
+        .px_3()
+        .py_1()
+        .child(div().text_xs().text_color(p.muted_foreground).child(label))
         .child(
             div()
-                .text_sm()
+                .pt_2()
+                .text_size(px(24.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .whitespace_nowrap()
                 .child(value),
-        )
-        .child(
-            div()
-                .pt_1()
-                .text_xs()
-                .text_color(p.muted_foreground)
-                .child(label),
         )
 }
 
@@ -626,26 +634,18 @@ fn share_card(
     div()
         .id(format!("overview-provider-card-{provider_key}"))
         .w_full()
-        .rounded_2xl()
+        .rounded_lg()
         .border_1()
         .border_color(if selected {
             p.link.opacity(0.72)
         } else {
             p.border.opacity(0.7)
         })
-        .bg(if selected {
-            p.accent.opacity(0.5)
-        } else {
-            p.background.opacity(0.94)
-        })
+        .bg(if selected { p.accent } else { p.tiles })
         .px_3()
         .py_3()
         .cursor_pointer()
-        .hover(move |style| {
-            style
-                .border_color(p.link.opacity(0.5))
-                .bg(p.accent.opacity(0.38))
-        })
+        .hover(move |style| style.border_color(p.link.opacity(0.5)).bg(p.accent))
         .on_click(cx.listener(move |view, _, _, cx| {
             let filter = match provider {
                 Some(provider) => OverviewProviderFilter::Provider(provider),
@@ -745,7 +745,7 @@ fn all_model_detail(
         .child(div().pt_2().child(model_detail_rows(
             models,
             total_tokens,
-            rgb(0x16a34a),
+            p.link.into(),
             view,
             p,
         )))
@@ -793,7 +793,7 @@ fn provider_model_detail(
     let rows = model_detail_rows(
         &provider_models,
         provider.total_tokens,
-        provider_color(provider.provider),
+        provider_color(provider.provider, p),
         view,
         p,
     );
@@ -958,25 +958,26 @@ fn format_detail_percentage(value: f64) -> String {
 }
 
 fn sidebar(active_page: DashboardPage, cx: &mut Context<LLMeterView>) -> impl IntoElement {
+    let p = Palette::from_app(cx);
     let sidebar_foreground = cx.theme().sidebar_foreground;
-    let sidebar_muted = sidebar_foreground.opacity(0.65);
+    let sidebar_background = cx.theme().sidebar;
 
-    let mut navigation = div().flex().flex_col().gap_1().pt_5();
+    let mut navigation = div().flex().flex_col().gap_1().pt_6();
     for page in DashboardPage::ALL {
         let item = page.label();
         let is_active = page == active_page;
         let variant = if is_active {
             ButtonCustomVariant::new(cx)
-                .color(cx.theme().background.opacity(0.78))
-                .foreground(sidebar_foreground)
-                .hover(cx.theme().background.opacity(0.88))
-                .active(cx.theme().background.opacity(0.88))
+                .color(p.accent)
+                .foreground(p.link)
+                .hover(p.accent)
+                .active(p.accent)
         } else {
             ButtonCustomVariant::new(cx)
                 .color(gpui::transparent_black())
-                .foreground(sidebar_foreground)
-                .hover(cx.theme().sidebar_accent.opacity(0.55))
-                .active(cx.theme().sidebar_accent.opacity(0.55))
+                .foreground(p.muted_foreground)
+                .hover(p.muted)
+                .active(p.muted)
         };
         navigation = navigation.child(
             Button::new(item.clone())
@@ -984,6 +985,8 @@ fn sidebar(active_page: DashboardPage, cx: &mut Context<LLMeterView>) -> impl In
                 .selected(is_active)
                 .icon(page.icon())
                 .w_full()
+                .h(px(34.0))
+                .text_sm()
                 .justify_start()
                 .child(div().flex_1().min_w(px(0.0)).child(item))
                 .on_click(cx.listener(move |view, _, _, cx| view.navigate(page, cx))),
@@ -992,22 +995,63 @@ fn sidebar(active_page: DashboardPage, cx: &mut Context<LLMeterView>) -> impl In
     div()
         .flex()
         .flex_col()
-        .min_w(px(200.0))
-        .px_4()
+        .w(px(196.0))
+        .flex_shrink_0()
+        .px_3()
         .pb_4()
         .when(cfg!(target_os = "macos"), |this| this.pt(TITLE_BAR_HEIGHT))
         .when(!cfg!(target_os = "macos"), |this| this.pt_4())
-        .bg(gpui::transparent_black())
+        .bg(sidebar_background)
+        .border_r_1()
+        .border_color(p.border)
         .text_color(sidebar_foreground)
-        .child(div().text_lg().child(t!("app.name").to_string()))
         .child(
             div()
-                .pt_1()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .pt_3()
+                .child(
+                    div()
+                        .size(px(24.0))
+                        .rounded_md()
+                        .bg(p.link)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(p.tiles)
+                        .text_sm()
+                        .font_weight(FontWeight::BOLD)
+                        .child("L"),
+                )
+                .child(
+                    div()
+                        .text_base()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(t!("app.name").to_string()),
+                ),
+        )
+        .child(
+            div()
+                .pt_2()
+                .px_2()
                 .text_xs()
-                .text_color(sidebar_muted)
+                .text_color(p.muted_foreground)
                 .child(t!("app.tagline").to_string()),
         )
         .child(navigation)
+        .child(div().flex_1())
+        .child(
+            div()
+                .px_2()
+                .pt_4()
+                .border_t_1()
+                .border_color(p.border)
+                .text_xs()
+                .text_color(p.muted_foreground)
+                .child(t!("app.no_cloud").to_string()),
+        )
 }
 
 fn page_heading(title: String, subtitle: String, p: Palette) -> impl IntoElement {
@@ -1015,7 +1059,12 @@ fn page_heading(title: String, subtitle: String, p: Palette) -> impl IntoElement
         .flex()
         .flex_col()
         .gap_1()
-        .child(div().text_2xl().child(title))
+        .child(
+            div()
+                .text_xl()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(title),
+        )
         .child(
             div()
                 .text_sm()
@@ -1040,12 +1089,12 @@ fn provider_statuses(snapshot: &UiSnapshot, p: Palette) -> impl IntoElement {
 
 fn provider_status_row(detection: &ProviderDetection, p: Palette) -> impl IntoElement {
     let (label, color) = match detection.status {
-        ProviderStatus::DataFound => (t!("providers.data_found").to_string(), rgb(0x16a34a)),
-        ProviderStatus::Installed => (t!("providers.installed").to_string(), rgb(0x2563eb)),
-        ProviderStatus::NotInstalled => (t!("providers.not_detected").to_string(), rgb(0x94a3b8)),
-        ProviderStatus::UnsupportedVersion => {
-            (t!("providers.unsupported").to_string(), rgb(0xd97706))
+        ProviderStatus::DataFound => (t!("providers.data_found").to_string(), p.success),
+        ProviderStatus::Installed => (t!("providers.installed").to_string(), p.link),
+        ProviderStatus::NotInstalled => {
+            (t!("providers.not_detected").to_string(), p.muted_foreground)
         }
+        ProviderStatus::UnsupportedVersion => (t!("providers.unsupported").to_string(), p.warning),
     };
     div()
         .flex()
@@ -1084,15 +1133,14 @@ fn panel(title: String, content: impl IntoElement, p: Palette) -> impl IntoEleme
         .flex()
         .flex_col()
         .min_w(px(0.0))
-        .min_h(px(220.0))
-        .p_5()
-        .rounded_xl()
+        .p_4()
+        .rounded_lg()
         .bg(p.tiles)
         .border_1()
         .border_color(p.border)
         .child(
             div()
-                .text_base()
+                .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(p.foreground)
                 .child(title),
@@ -1327,13 +1375,13 @@ fn metric_chip(label: String, value: u64, p: Palette) -> impl IntoElement {
 fn token_pill(value: u64, p: Palette) -> impl IntoElement {
     div()
         .flex_shrink_0()
-        .rounded_full()
-        .bg(rgb(0x2563eb).opacity(0.12))
+        .rounded_md()
+        .bg(p.muted)
         .px_3()
         .py_1()
         .text_xs()
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(p.link)
+        .text_color(p.foreground)
         .child(format_tokens(value))
 }
 
@@ -1341,7 +1389,7 @@ fn pricing_pill(value: Option<f64>, view: &LLMeterView, p: Palette) -> impl Into
     let (label, background, foreground): (String, gpui::Hsla, gpui::Hsla) = match value {
         Some(value) => (
             view.format_amount(value),
-            rgb(0x22c55e).opacity(0.12).into(),
+            p.success.opacity(0.12),
             p.success,
         ),
         None => (
@@ -1362,19 +1410,17 @@ fn pricing_pill(value: Option<f64>, view: &LLMeterView, p: Palette) -> impl Into
         .child(label)
 }
 
-fn provider_color(provider: Provider) -> Rgba {
+fn provider_color(provider: Provider, p: Palette) -> Rgba {
+    // Chart colors are not logos: neutral brands still need visible marks on
+    // dark surfaces. Keep the same hue identity across both appearances.
     match provider {
-        Provider::Codex => rgb(0x2563eb),
-        Provider::Claude => rgb(0xd97706),
-        Provider::Cursor => rgb(0x171717),
-        Provider::Qoder => rgb(0x16a34a),
-        Provider::Trae => rgb(0x10b981),
-        Provider::OpenCode => rgb(0x0891b2),
-        Provider::Pi => rgb(0x7c3aed),
-        Provider::Omp => rgb(0x0f766e),
-        Provider::Zed => rgb(0x111827),
-        Provider::Grok => rgb(0x64748b),
-        Provider::Hermes => rgb(0x475569),
+        Provider::Codex => p.link.into(),
+        Provider::Claude => rgb(if p.is_dark { 0xe0aa81 } else { 0xb47952 }),
+        Provider::Cursor | Provider::Zed => rgb(if p.is_dark { 0xb1b5c2 } else { 0x565b6b }),
+        Provider::Qoder | Provider::Trae => p.success.into(),
+        Provider::OpenCode | Provider::Omp => rgb(if p.is_dark { 0x71b9c5 } else { 0x438591 }),
+        Provider::Pi => rgb(if p.is_dark { 0xc19be5 } else { 0x9364b7 }),
+        Provider::Grok | Provider::Hermes => rgb(if p.is_dark { 0x929eb8 } else { 0x64748b }),
     }
 }
 
@@ -1627,7 +1673,9 @@ fn heatmap(
     for week in 0..HEATMAP_WEEKS {
         let week_start = start + Duration::days(week * 7);
         let month = if week == 0 {
-            Some(week_start.month())
+            // A short partial month collides with the next label (especially
+            // English abbreviations) because each week is only 15px wide.
+            (week_start.day() <= 14).then_some(week_start.month())
         } else {
             (0..7).find_map(|offset| {
                 let date = week_start + Duration::days(offset);
@@ -1713,13 +1761,13 @@ fn heatmap(
     div()
         .w_full()
         .p_4()
-        .rounded_2xl()
-        .bg(p.tiles.opacity(0.98))
+        .rounded_lg()
+        .bg(p.tiles)
         .border_1()
-        .border_color(p.border.opacity(0.7))
+        .border_color(p.border)
         .child(
             div()
-                .text_base()
+                .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(p.foreground)
                 .child(t!("overview.heatmap").to_string()),
@@ -1748,10 +1796,10 @@ fn heatmap_level(value: u64, max_value: u64) -> usize {
 fn heatmap_level_color(level: usize, p: Palette) -> gpui::Hsla {
     match level {
         0 => p.muted,
-        1 => p.success.opacity(0.22),
-        2 => p.success.opacity(0.42),
-        3 => p.success.opacity(0.68),
-        _ => p.success,
+        1 => p.link.opacity(0.22),
+        2 => p.link.opacity(0.42),
+        3 => p.link.opacity(0.68),
+        _ => p.link,
     }
 }
 
@@ -1766,16 +1814,18 @@ fn trend(
             .child(empty_state(t!("overview.no_daily").to_string(), p))
             .into_any_element();
     }
-    let max = daily.iter().map(|day| day.total_tokens).max().unwrap_or(1);
+    let max = daily.iter().map(|day| day.total_tokens).max().unwrap_or(0);
+    let scale_max = max.max(1);
     let mut chart = div()
         .flex()
         .items_end()
         .gap_1()
-        .flex_1()
-        .min_h(px(96.0))
-        .w_full();
+        .h(px(128.0))
+        .w_full()
+        .border_b_1()
+        .border_color(p.border);
     for (index, day) in daily.iter().rev().take(30).rev().enumerate() {
-        let ratio = (day.total_tokens as f32 / max as f32).max(if day.total_tokens > 0 {
+        let ratio = (day.total_tokens as f32 / scale_max as f32).max(if day.total_tokens > 0 {
             0.04
         } else {
             0.01
@@ -1784,13 +1834,19 @@ fn trend(
         chart = chart.child(
             div()
                 .id(("trend-bar", index))
+                .debug_selector(move || format!("trend-bar-{index}"))
                 .flex_1()
                 .min_w(px(4.0))
-                .h(relative(ratio))
+                .max_w(px(28.0))
+                .h(px(ratio * 120.0))
                 .min_h(px(2.0))
                 .rounded_sm()
-                .bg(rgb(0x60a5fa))
-                .hover(|style| style.bg(rgb(0x93c5fd)))
+                .bg(if day.total_tokens > 0 {
+                    p.link.opacity(0.72)
+                } else {
+                    p.muted
+                })
+                .hover(move |style| style.bg(p.link))
                 .tooltip(move |_, cx| cx.new(|_| TrendTooltip(tooltip_text.clone())).into()),
         );
     }
@@ -1901,7 +1957,7 @@ impl Render for HeatmapTooltip {
                                     .h_full()
                                     .w(relative(ratio))
                                     .rounded_full()
-                                    .bg(theme.success),
+                                    .bg(theme.link),
                             ),
                     ),
             );
@@ -1941,13 +1997,13 @@ impl Render for HeatmapTooltip {
                         div()
                             .rounded_full()
                             .border_1()
-                            .border_color(theme.success.opacity(0.3))
-                            .bg(theme.success.opacity(0.1))
+                            .border_color(theme.link.opacity(0.3))
+                            .bg(theme.link.opacity(0.1))
                             .px_2()
                             .py_0p5()
                             .text_xs()
                             .whitespace_nowrap()
-                            .text_color(theme.success)
+                            .text_color(theme.link)
                             .child(t!("overview.heatmap_level", level = self.level).to_string()),
                     ),
             )

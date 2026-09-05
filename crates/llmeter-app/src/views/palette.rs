@@ -15,6 +15,8 @@ pub(crate) struct Palette {
     pub accent: Hsla,
     pub transparent: Hsla,
     pub success: Hsla,
+    pub warning: Hsla,
+    pub danger: Hsla,
     pub link: Hsla,
     pub popover: Hsla,
 }
@@ -32,6 +34,8 @@ impl Palette {
             accent: theme.accent,
             transparent: theme.transparent,
             success: theme.success,
+            warning: theme.warning,
+            danger: theme.danger,
             link: theme.link,
             popover: theme.popover,
         }

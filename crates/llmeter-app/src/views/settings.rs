@@ -56,13 +56,12 @@ pub(crate) fn settings_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
 
     v_flex()
         .size_full()
-        .px_8()
-        .pt_3()
+        .px_6()
         .pb_3()
         .child(
             div()
-                .text_3xl()
-                .font_weight(FontWeight::BOLD)
+                .text_xl()
+                .font_weight(FontWeight::SEMIBOLD)
                 .text_color(p.foreground)
                 .child(t!("settings.title").to_string()),
         )
@@ -137,7 +136,7 @@ fn section_nav(
 fn card(p: Palette) -> gpui::Div {
     v_flex()
         .w_full()
-        .rounded_xl()
+        .rounded_lg()
         .border_1()
         .border_color(p.border)
         .bg(p.tiles)

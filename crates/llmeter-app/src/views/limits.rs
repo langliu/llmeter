@@ -1,7 +1,7 @@
 use chrono::{DateTime, Local, Utc};
 use gpui::{
     AnyElement, Context, FontWeight, IntoElement, ParentElement, Styled, div, prelude::*, px,
-    relative, rgb,
+    relative,
 };
 use gpui_component::{Disableable, IconName, button::Button, h_flex, v_flex};
 use llmeter_core::{LimitWindow, Provider, ProviderLimits};
@@ -39,8 +39,7 @@ pub(crate) fn limits_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> 
 
     v_flex()
         .w_full()
-        .px_8()
-        .pt_3()
+        .px_6()
         .pb_6()
         .gap_6()
         .child(
@@ -54,8 +53,8 @@ pub(crate) fn limits_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> 
                         .gap_2()
                         .child(
                             div()
-                                .text_3xl()
-                                .font_weight(FontWeight::BOLD)
+                                .text_xl()
+                                .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(p.foreground)
                                 .child(t!("limits.title").to_string()),
                         )
@@ -91,18 +90,19 @@ fn provider_card(
     refreshing: bool,
     p: Palette,
 ) -> AnyElement {
-    let mut rows = v_flex().gap_4().pt_5();
+    let has_windows = limits.is_some_and(|item| !item.windows.is_empty());
+    let mut rows = v_flex()
+        .gap_4()
+        .when(has_windows, |this| this.pt_5())
+        .when(!has_windows, |this| this.pt_3());
     if let Some(limits) = limits {
         for window in &limits.windows {
             rows = rows.child(window_row(window, p));
         }
     }
-    if limits.is_none_or(|item| item.windows.is_empty()) {
+    if !has_windows {
         rows = rows.child(
             div()
-                .min_h(px(88.0))
-                .flex()
-                .items_center()
                 .text_sm()
                 .text_color(p.muted_foreground)
                 .child(empty_message(limits, refreshing)),
@@ -114,7 +114,9 @@ fn provider_card(
         .filter(|plan| !plan.is_empty())
         .map(str::to_string);
     let (status, status_color, status_background) = status_style(limits, refreshing, p);
-    let captured = limits.map(|item| {
+    // An authentication check is not a quota update. Keep empty cards compact
+    // and reserve the timestamp footer for cards that actually show limits.
+    let captured = limits.filter(|_| has_windows).map(|item| {
         t!(
             "limits.updated",
             time = relative_time(item.captured_at, Utc::now())
@@ -123,13 +125,15 @@ fn provider_card(
     });
 
     v_flex()
+        .debug_selector(move || format!("limit-card-{}", provider.as_str()))
         .w_full()
         .min_w(px(0.0))
-        .rounded_2xl()
+        .rounded_lg()
         .border_1()
-        .border_color(p.border.opacity(0.8))
-        .bg(p.popover.opacity(if p.is_dark { 0.34 } else { 0.52 }))
-        .p_5()
+        .border_color(p.border)
+        .bg(p.tiles)
+        .when(has_windows, |this| this.p_5())
+        .when(!has_windows, |this| this.p_4())
         .child(
             h_flex()
                 .w_full()
@@ -180,6 +184,7 @@ fn provider_card(
         .when_some(captured, |this, captured| {
             this.child(
                 div()
+                    .debug_selector(move || format!("limit-updated-{}", provider.as_str()))
                     .mt_5()
                     .pt_3()
                     .border_t_1()
@@ -192,7 +197,7 @@ fn provider_card(
         .when_some(
             limits.and_then(|item| item.last_error.clone().or_else(|| item.error.clone())),
             |this, error| {
-                this.child(div().pt_2().text_xs().text_color(rgb(0xd97706)).child(
+                this.child(div().pt_2().text_xs().text_color(p.warning).child(
                     if limits.is_some_and(|item| item.stale) {
                         format!("{} {error}", t!("limits.cached_warning"))
                     } else {
@@ -207,11 +212,11 @@ fn provider_card(
 fn window_row(window: &LimitWindow, p: Palette) -> AnyElement {
     let ratio = (window.used_percent / 100.0).clamp(0.0, 1.0) as f32;
     let color = if window.quota_exceeded || window.used_percent >= 90.0 {
-        rgb(0xdc2626)
+        p.danger
     } else if window.used_percent >= 75.0 {
-        rgb(0xd97706)
+        p.warning
     } else {
-        p.foreground.opacity(0.72).into()
+        p.link
     };
     let reset = window.reset_at.map(|reset| {
         t!(
@@ -294,7 +299,7 @@ fn window_row(window: &LimitWindow, p: Palette) -> AnyElement {
         )
         .child(
             div()
-                .h(px(10.0))
+                .h(px(6.0))
                 .w_full()
                 .overflow_hidden()
                 .rounded_full()
@@ -339,15 +344,19 @@ fn status_style(
         ),
         Some(item) if item.stale => (
             t!("limits.cached").to_string(),
-            rgb(0xd97706).into(),
-            rgb(0xd97706).opacity(0.12).into(),
+            p.warning,
+            p.warning.opacity(0.12),
         ),
         Some(item) if item.error.is_some() => (
             t!("limits.unavailable").to_string(),
-            rgb(0xdc2626).into(),
-            rgb(0xdc2626).opacity(0.12).into(),
+            p.danger,
+            p.danger.opacity(0.12),
         ),
-        Some(_) => (t!("limits.live").to_string(), p.foreground, p.muted),
+        Some(_) => (
+            t!("limits.live").to_string(),
+            p.success,
+            p.success.opacity(0.1),
+        ),
     }
 }
 

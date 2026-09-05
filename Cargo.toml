@@ -7,6 +7,15 @@ members = [
     "crates/llmeter-app",
 ]
 
+# GPUI's layout and painting loops are too expensive at opt-level 0 for
+# interactive scrolling. Keep application code debuggable while optimizing
+# the UI runtime used by `cargo run` and the inherited test profile.
+[profile.dev.package.gpui]
+opt-level = 2
+
+[profile.dev.package.taffy]
+opt-level = 3
+
 [workspace.package]
 edition = "2024"
 version = "0.1.0"

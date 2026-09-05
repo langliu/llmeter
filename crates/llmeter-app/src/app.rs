@@ -389,6 +389,7 @@ impl LLMeterView {
     }
 
     pub(crate) fn apply_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::theme::install(cx);
         match self.theme_pref {
             ThemePreference::Light => UiTheme::change(ThemeMode::Light, Some(window), cx),
             ThemePreference::Dark => UiTheme::change(ThemeMode::Dark, Some(window), cx),
@@ -1168,7 +1169,8 @@ mod tests {
     use crate::views::sessions::SessionProviderFilter;
     use chrono::{Duration, Local, NaiveDate, TimeZone, Utc};
     use gpui::{
-        AppContext, Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, point, px,
+        AppContext, Entity, Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
+        point, px,
     };
     use gpui_component::{ActiveTheme, Root, WindowExt};
     use llmeter_collector::Collector;
@@ -1343,7 +1345,11 @@ mod tests {
                 view.set_theme_preference(super::ThemePreference::Dark, window, cx);
             });
         });
-        cx.update(|_, cx| assert!(cx.theme().is_dark()));
+        cx.update(|_, cx| {
+            assert!(cx.theme().is_dark());
+            assert_eq!(cx.theme().theme_name().as_ref(), "LLMeter Dark");
+            assert_eq!(cx.theme().background, gpui::Hsla::from(gpui::rgb(0x141518)));
+        });
         assert_eq!(
             database.get_setting("theme").unwrap().as_deref(),
             Some("dark")
@@ -1354,7 +1360,11 @@ mod tests {
                 view.set_theme_preference(super::ThemePreference::Light, window, cx);
             });
         });
-        cx.update(|_, cx| assert!(!cx.theme().is_dark()));
+        cx.update(|_, cx| {
+            assert!(!cx.theme().is_dark());
+            assert_eq!(cx.theme().theme_name().as_ref(), "LLMeter Light");
+            assert_eq!(cx.theme().background, gpui::Hsla::from(gpui::rgb(0xfafafb)));
+        });
         assert_eq!(
             database.get_setting("theme").unwrap().as_deref(),
             Some("light")
@@ -1808,6 +1818,152 @@ mod tests {
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
         });
+        assert!(cx.debug_bounds("limit-updated-claude").is_some());
+        assert!(cx.debug_bounds("limit-updated-codex").is_some());
+    }
+
+    fn setup_scrollable_overview(
+        cx: &mut TestAppContext,
+    ) -> (Entity<LLMeterView>, &mut gpui::VisualTestContext) {
+        let (view, cx) = setup_sessions_page(cx);
+        cx.simulate_resize(gpui::size(px(980.0), px(640.0)));
+        view.update(cx, |view, cx| {
+            view.active_page = DashboardPage::Overview;
+            view.snapshot.sessions = fake_sessions(274);
+            view.snapshot.overview_range.daily = (0..30)
+                .map(|index| llmeter_storage::DailyUsage {
+                    day: format!("2026-08-{:02}", index + 1),
+                    total_tokens: 1_000 * (index + 1),
+                    estimated_cost_usd: Some(0.1),
+                })
+                .collect();
+            cx.notify();
+        });
+        // Settle initial layout and provider-column measurement first.
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+            });
+        }
+        (view, cx)
+    }
+
+    #[gpui::test]
+    fn overview_scroll_offset_survives_snapshot_refresh(cx: &mut TestAppContext) {
+        let (view, cx) = setup_scrollable_overview(cx);
+        let initial = cx.debug_bounds("overview-summary").unwrap().origin.y;
+        let position = point(px(500.0), px(450.0));
+        scroll(position, point(px(0.0), px(-40.0)), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let scrolled = cx.debug_bounds("overview-summary").unwrap().origin.y;
+        assert!(scrolled < initial, "the overview must actually scroll");
+
+        view.update(cx, |view, cx| {
+            view.snapshot.overview_range.overview.total_tokens += 1_000;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(
+            cx.debug_bounds("overview-summary").unwrap().origin.y,
+            scrolled
+        );
+
+        scroll(position, point(px(0.0), px(16.0)), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("overview-summary").unwrap().origin.y > scrolled);
+    }
+
+    // Wall-clock assertions are opt-in: run on an idle machine, not alongside
+    // the parallel suite. This measures CPU event dispatch + layout/paint,
+    // not native GPU presentation or trackpad frame pacing.
+    #[gpui::test]
+    #[ignore = "manual scroll performance guard; see README"]
+    fn overview_scroll_frame_budget(cx: &mut TestAppContext) {
+        let (_, cx) = setup_scrollable_overview(cx);
+        let started = std::time::Instant::now();
+        for frame in 0..60 {
+            let delta = if frame < 30 { -8.0 } else { 8.0 };
+            scroll(point(px(500.0), px(450.0)), point(px(0.0), px(delta)), cx);
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+            });
+        }
+        let elapsed = started.elapsed();
+        eprintln!("60 overview scroll steps (event dispatch + draw): {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "60 scroll inputs exceeded the 1-second CPU frame budget"
+        );
+    }
+
+    #[gpui::test]
+    fn overview_single_day_trend_stays_compact_in_both_themes(cx: &mut TestAppContext) {
+        let (view, cx) = setup_sessions_page(cx);
+        cx.simulate_resize(gpui::size(px(980.0), px(640.0)));
+        for preference in [super::ThemePreference::Light, super::ThemePreference::Dark] {
+            for tokens in [0, 61_254_399] {
+                cx.update(|window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.active_page = DashboardPage::Overview;
+                        view.set_theme_preference(preference, window, cx);
+                        view.snapshot.overview_range.daily = vec![llmeter_storage::DailyUsage {
+                            day: "2026-09-05".into(),
+                            total_tokens: tokens,
+                            estimated_cost_usd: None,
+                        }];
+                        cx.notify();
+                    });
+                    window.draw(cx).clear(cx);
+                });
+                let bar = cx.debug_bounds("trend-bar-0").expect("single day bar");
+                assert!(bar.size.width > px(0.0) && bar.size.width <= px(28.0));
+                assert!(bar.size.height >= px(2.0) && bar.size.height <= px(120.0));
+                let summary = cx.debug_bounds("overview-summary").expect("summary panel");
+                assert!(
+                    summary.size.width >= px(300.0),
+                    "main column must remain readable: {summary:?}"
+                );
+                assert!(summary.right() <= px(980.0));
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn disconnected_limit_cards_are_compact_in_both_themes(cx: &mut TestAppContext) {
+        let (view, cx) = setup_sessions_page(cx);
+        cx.simulate_resize(gpui::size(px(980.0), px(760.0)));
+        for preference in [super::ThemePreference::Light, super::ThemePreference::Dark] {
+            cx.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.active_page = DashboardPage::Limits;
+                    view.limits.providers =
+                        vec![ProviderLimits::not_configured(Provider::Claude, Utc::now())];
+                    view.set_theme_preference(preference, window, cx);
+                    cx.notify();
+                });
+                window.draw(cx).clear(cx);
+            });
+            let card = cx
+                .debug_bounds("limit-card-claude")
+                .expect("disconnected card");
+            assert!(
+                card.size.height <= px(120.0),
+                "disconnected card is too tall: {:?}",
+                card.size.height
+            );
+            assert!(
+                cx.debug_bounds("limit-updated-claude").is_none(),
+                "no quota data to timestamp"
+            );
+            let pending = cx.debug_bounds("limit-card-codex").expect("pending card");
+            assert!(pending.size.height <= px(120.0));
+        }
     }
 
     #[gpui::test]

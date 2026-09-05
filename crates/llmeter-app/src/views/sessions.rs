@@ -134,8 +134,7 @@ pub(crate) fn sessions_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
 
     v_flex()
         .size_full()
-        .px_8()
-        .pt_3()
+        .px_6()
         .pb_5()
         .child(
             h_flex()
@@ -147,8 +146,8 @@ pub(crate) fn sessions_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
                         .gap_2()
                         .child(
                             div()
-                                .text_3xl()
-                                .font_weight(FontWeight::BOLD)
+                                .text_xl()
+                                .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(p.foreground)
                                 .child(t!("sessions.title").to_string()),
                         )
@@ -653,10 +652,10 @@ fn transcript_section(
 
     div()
         .w_full()
-        .rounded_xl()
+        .rounded_lg()
         .border_1()
         .border_color(p.border.opacity(0.7))
-        .bg(p.tiles.opacity(0.72))
+        .bg(p.tiles)
         .px_3()
         .py_3()
         .child(content)
