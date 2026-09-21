@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag name (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release-macos:
+    name: Build & Release (macOS Apple Silicon)
+    runs-on: macos-14
+    env:
+      TARGET: aarch64-apple-darwin
+      ARCH: macos-arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-apple-darwin
+
+      - name: Run Workspace Tests
+        run: cargo test --workspace
+
+      - name: Install cargo-bundle
+        run: |
+          if ! command -v cargo-bundle &> /dev/null; then
+            cargo install cargo-bundle --locked
+          fi
+
+      - name: Build macOS App Bundle & Binary
+        run: |
+          cargo bundle --release --target $TARGET -p llmeter-app
+
+      - name: Ad-hoc Code Sign App Bundle
+        run: |
+          # Ad-hoc sign bundle for Apple Silicon execution without paid cert
+          codesign --force --deep -s - "target/$TARGET/release/bundle/osx/LLMeter.app"
+
+      - name: Package Release Assets
+        run: |
+          APP_PATH="target/$TARGET/release/bundle/osx/LLMeter.app"
+
+          # 1. Package DMG installer
+          DMG_ROOT="dmg_root"
+          rm -rf "$DMG_ROOT"
+          mkdir -p "$DMG_ROOT"
+          cp -R "$APP_PATH" "$DMG_ROOT/"
+          ln -s /Applications "$DMG_ROOT/Applications"
+          hdiutil create -volname "LLMeter" -srcfolder "$DMG_ROOT" -ov -format UDZO "LLMeter-$ARCH.dmg"
+          rm -rf "$DMG_ROOT"
+
+          # 2. Package Zip archive for .app
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "LLMeter-$ARCH.zip"
+
+          # 3. Package CLI tar.gz
+          tar -czf "llmeter-cli-$ARCH.tar.gz" -C "target/$TARGET/release" llmeter
+
+          # 4. Generate Checksums
+          shasum -a 256 "LLMeter-$ARCH.dmg" > "LLMeter-$ARCH.dmg.sha256"
+          shasum -a 256 "LLMeter-$ARCH.zip" > "LLMeter-$ARCH.zip.sha256"
+          shasum -a 256 "llmeter-cli-$ARCH.tar.gz" > "llmeter-cli-$ARCH.tar.gz.sha256"
+
+      - name: Upload Assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
+          files: |
+            LLMeter-macos-arm64.dmg
+            LLMeter-macos-arm64.dmg.sha256
+            LLMeter-macos-arm64.zip
+            LLMeter-macos-arm64.zip.sha256
+            llmeter-cli-macos-arm64.tar.gz
+            llmeter-cli-macos-arm64.tar.gz.sha256
+          generate_release_notes: true
