@@ -24,7 +24,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -79,14 +79,83 @@ jobs:
           shasum -a 256 "llmeter-cli-$ARCH.tar.gz" > "llmeter-cli-$ARCH.tar.gz.sha256"
 
       - name: Upload Assets to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.tag_name || github.ref_name }}
-          files: |
-            LLMeter-macos-arm64.dmg
-            LLMeter-macos-arm64.dmg.sha256
-            LLMeter-macos-arm64.zip
-            LLMeter-macos-arm64.zip.sha256
-            llmeter-cli-macos-arm64.tar.gz
-            llmeter-cli-macos-arm64.tar.gz.sha256
-          generate_release_notes: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ inputs.tag_name || github.ref_name }}
+        run: |
+          ASSETS=(
+            "LLMeter-macos-arm64.dmg"
+            "LLMeter-macos-arm64.dmg.sha256"
+            "LLMeter-macos-arm64.zip"
+            "LLMeter-macos-arm64.zip.sha256"
+            "llmeter-cli-macos-arm64.tar.gz"
+            "llmeter-cli-macos-arm64.tar.gz.sha256"
+          )
+          
+          # Create release if it does not exist, or upload assets if already created
+          gh release create "$TAG_NAME" \
+            --title "$TAG_NAME" \
+            --generate-notes \
+            "${ASSETS[@]}" \
+            || gh release upload "$TAG_NAME" "${ASSETS[@]}" --clobber
+
+      - name: Update Homebrew Tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG_NAME: ${{ inputs.tag_name || github.ref_name }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set. Skipping Homebrew Tap update."
+            exit 0
+          fi
+
+          VERSION="${TAG_NAME#v}"
+          SHA256=$(cat LLMeter-macos-arm64.zip.sha256 | awk '{print $1}')
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Clone tap repository
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/langliu/homebrew-tap.git" tap-repo
+          cd tap-repo
+          git checkout -B main
+
+          mkdir -p Casks
+          cat <<EOF > Casks/llmeter.rb
+cask "llmeter" do
+  version "${VERSION}"
+  sha256 "${SHA256}"
+
+  url "https://github.com/langliu/llmeter/releases/download/v#{version}/LLMeter-macos-arm64.zip"
+  name "LLMeter"
+  desc "Local-first AI coding usage tracker"
+  homepage "https://github.com/langliu/llmeter"
+
+  livecheck do
+    url :url
+    strategy :github_latest
+  end
+
+  app "LLMeter.app"
+
+  postflight do
+    system_command "/usr/bin/xattr",
+                   args: ["-cr", "#{appdir}/LLMeter.app"],
+                   sudo: false
+  end
+
+  zap trash: [
+    "~/Library/Application Support/LLMeter",
+    "~/Library/Saved Application State/io.github.langliu.llmeter.savedState",
+  ]
+end
+EOF
+
+          git add Casks/llmeter.rb
+          if git diff --staged --quiet; then
+            echo "No changes in Cask formula."
+          else
+            git commit -m "chore(cask): update llmeter to v${VERSION}"
+            git push origin main
+            echo "Successfully updated Homebrew Tap to v${VERSION}."
+          fi
