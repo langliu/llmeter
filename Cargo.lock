@@ -3676,7 +3676,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "llmeter-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3695,7 +3695,7 @@ dependencies = [
 
 [[package]]
 name = "llmeter-collector"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "anyhow",
@@ -3719,7 +3719,7 @@ dependencies = [
 
 [[package]]
 name = "llmeter-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "chrono",
@@ -3729,7 +3729,7 @@ dependencies = [
 
 [[package]]
 name = "llmeter-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "llmeter-core",
