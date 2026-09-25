@@ -16,7 +16,7 @@ use llmeter_collector::{
     Collector, CollectorEvent, LimitCollector, load_session_transcript,
     providers::TRAE_CN_USAGE_SETTING,
 };
-use llmeter_core::LimitsSnapshot;
+use llmeter_core::{LimitsSnapshot, Provider};
 use llmeter_storage::{SessionLoad, SessionQuery, SessionSummary, UsageRepository};
 use rust_i18n::t;
 
@@ -163,6 +163,7 @@ struct OverviewRangeUpdate {
 
 struct SessionsUpdate {
     sessions: Result<Vec<SessionSummary>, String>,
+    available_providers: Vec<Provider>,
     provider: SessionProviderFilter,
     range: SessionRangeFilter,
     generation: u64,
@@ -187,6 +188,7 @@ pub struct LLMeterView {
     pub(crate) session_provider: SessionProviderFilter,
     pub(crate) session_range: SessionRangeFilter,
     pub(crate) session_project: Option<String>,
+    pub(crate) session_available_providers: Vec<Provider>,
     pub(crate) session_search: Entity<InputState>,
     pub(crate) session_scroll: VirtualListScrollHandle,
     pub(crate) session_project_open: bool,
@@ -256,6 +258,7 @@ impl LLMeterView {
         let overview_custom_range = (today, today);
         let (overview_start, overview_end) =
             overview_period.bounds(Local::now(), overview_custom_range);
+        let initial_session_providers = repository.get_session_providers().unwrap_or_default();
         let (snapshot, has_session_count) = match UiSnapshot::load(
             &repository,
             overview_start,
@@ -333,6 +336,7 @@ impl LLMeterView {
             session_provider: SessionProviderFilter::All,
             session_range: SessionRangeFilter::All,
             session_project: None,
+            session_available_providers: initial_session_providers,
             session_search,
             session_scroll: VirtualListScrollHandle::new(),
             session_project_open: false,
@@ -669,10 +673,12 @@ impl LLMeterView {
             .name("llmeter-sessions".into())
             .spawn(move || {
                 let repository = UsageRepository::new(collector.engine().database().clone());
+                let available_providers = repository.get_session_providers().unwrap_or_default();
                 let _ = sender.send(SessionsUpdate {
                     sessions: repository
                         .get_sessions_matching(query)
                         .map_err(|error| format!("session query failed: {error}")),
+                    available_providers,
                     provider: update.0,
                     range: update.1,
                     generation: update.2,
@@ -699,6 +705,9 @@ impl LLMeterView {
                 }
                 self.applied_sessions_generation = update.generation;
                 self.snapshot.sessions = sessions;
+                if !update.available_providers.is_empty() || self.session_available_providers.is_empty() {
+                    self.session_available_providers = update.available_providers;
+                }
                 true
             }
             Err(error) => {
@@ -860,6 +869,22 @@ impl LLMeterView {
             .filter(|(_, session)| session.matches_query(&query))
             .map(|(index, _)| index)
             .collect()
+    }
+
+    pub(crate) fn session_providers(&self) -> Vec<Provider> {
+        if !self.session_available_providers.is_empty() {
+            let mut providers = self.session_available_providers.clone();
+            providers.sort_by_key(|provider| provider.display_name());
+            return providers;
+        }
+        let mut providers = Vec::new();
+        for session in &self.snapshot.sessions {
+            if !providers.contains(&session.provider) {
+                providers.push(session.provider);
+            }
+        }
+        providers.sort_by_key(|provider| provider.display_name());
+        providers
     }
 
     pub(crate) fn session_projects(&self) -> Vec<String> {
@@ -1328,6 +1353,20 @@ mod tests {
             point(px(0.0), px(0.0)),
             "filter change should scroll back to the top"
         );
+    }
+
+    #[gpui::test]
+    fn session_providers_only_includes_providers_with_sessions(cx: &mut TestAppContext) {
+        let database = Database::open_in_memory().expect("in-memory database");
+        let collector = Collector::new(database);
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|window, cx| LLMeterView::new(collector, window, cx));
+
+        view.update(cx, |view, _| {
+            assert!(view.session_providers().is_empty());
+            view.snapshot.sessions = fake_sessions(3); // all Claude
+            assert_eq!(view.session_providers(), vec![Provider::Claude]);
+        });
     }
 
     #[gpui::test]

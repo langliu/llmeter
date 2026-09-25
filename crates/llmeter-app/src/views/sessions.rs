@@ -31,21 +31,6 @@ pub(crate) enum SessionProviderFilter {
 }
 
 impl SessionProviderFilter {
-    const ALL: [Self; 12] = [
-        Self::All,
-        Self::Provider(Provider::Claude),
-        Self::Provider(Provider::Codex),
-        Self::Provider(Provider::Cursor),
-        Self::Provider(Provider::Qoder),
-        Self::Provider(Provider::Trae),
-        Self::Provider(Provider::Pi),
-        Self::Provider(Provider::Omp),
-        Self::Provider(Provider::OpenCode),
-        Self::Provider(Provider::Zed),
-        Self::Provider(Provider::Grok),
-        Self::Provider(Provider::Hermes),
-    ];
-
     fn label(self) -> String {
         match self {
             Self::All => t!("sessions.all").to_string(),
@@ -100,6 +85,7 @@ pub(crate) fn sessions_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
     let session_indices = Rc::new(view.visible_session_indices(cx));
     let visible_count = session_indices.len();
     let total_count = view.snapshot.sessions.len();
+    let providers = view.session_providers();
     let projects = view.session_projects();
     let project_open = view.session_project_open;
     let provider_open = view.session_provider_open;
@@ -174,7 +160,7 @@ pub(crate) fn sessions_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
                 .gap_2()
                 .flex_wrap()
                 .items_center()
-                .child(provider_filter(view.session_provider, provider_open, p, cx))
+                .child(provider_filter(view.session_provider, &providers, provider_open, p, cx))
                 .child(range_filter(view.session_range, cx))
                 .child(project_filter(
                     selected_project.as_deref(),
@@ -205,6 +191,7 @@ pub(crate) fn sessions_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
 
 fn provider_filter(
     selected: SessionProviderFilter,
+    available_providers: &[Provider],
     open: bool,
     p: Palette,
     cx: &mut Context<LLMeterView>,
@@ -236,7 +223,16 @@ fn provider_filter(
                 .shadow_sm()
                 .p_1()
                 .occlude();
-            for (index, filter) in SessionProviderFilter::ALL.into_iter().enumerate() {
+            let mut filters = vec![SessionProviderFilter::All];
+            for provider in available_providers {
+                filters.push(SessionProviderFilter::Provider(*provider));
+            }
+            if let SessionProviderFilter::Provider(active) = selected {
+                if !available_providers.contains(&active) {
+                    filters.push(selected);
+                }
+            }
+            for (index, filter) in filters.into_iter().enumerate() {
                 menu = menu.child(provider_menu_item(filter, selected == filter, index, p, cx));
             }
             this.child(deferred(menu).with_priority(1))

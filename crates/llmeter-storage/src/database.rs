@@ -1252,5 +1252,9 @@ mod tests {
             3,
             "overview conversation count stays unfiltered"
         );
+        assert_eq!(
+            repository.get_session_providers().unwrap(),
+            vec![Provider::Claude, Provider::Codex]
+        );
     }
 }

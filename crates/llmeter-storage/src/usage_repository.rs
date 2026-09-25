@@ -463,6 +463,23 @@ impl UsageRepository {
         names.dedup();
         Ok(names)
     }
+
+    pub fn get_session_providers(&self) -> Result<Vec<Provider>, StorageError> {
+        let connection = self.database.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT provider
+             FROM usage_events
+             ORDER BY provider ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            parse_provider(row.get(0)?, 0)
+        })?;
+        let mut providers = Vec::new();
+        for row in rows {
+            providers.push(row?);
+        }
+        Ok(providers)
+    }
 }
 
 fn parse_provider(value: String, column: usize) -> rusqlite::Result<Provider> {

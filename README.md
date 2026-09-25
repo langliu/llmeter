@@ -6,6 +6,35 @@ LLMeter reads the session logs produced by local coding agents, converts token
 metadata into a unified UsageEvent, and stores only local usage aggregates in
 SQLite. It does not proxy model traffic, require an API key, or upload data.
 
+## Installation
+
+### Homebrew (Recommended)
+
+Install via official tap (Apple Silicon macOS):
+
+~~~sh
+brew install langliu/tap/llmeter
+~~~
+
+Update to the latest version:
+
+~~~sh
+brew upgrade llmeter
+~~~
+
+### Manual Download
+
+Download `LLMeter-macos-arm64.dmg` or `LLMeter-macos-arm64.zip` from [Releases](https://github.com/langliu/llmeter/releases).
+
+> [!NOTE]
+> If you download manually from GitHub and macOS prompts that the application cannot be verified, run:
+>
+> ~~~sh
+> xattr -cr /Applications/LLMeter.app
+> ~~~
+>
+> Installing via Homebrew bypasses this warning automatically.
+
 ## Architecture
 
 ~~~text
