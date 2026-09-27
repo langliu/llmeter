@@ -14,6 +14,7 @@ pub(crate) fn provider_logo(provider: Provider, size: f32) -> AnyElement {
         Provider::Zed => "providers/zed.svg",
         Provider::Grok => "providers/grok.svg",
         Provider::Hermes => "providers/hermes.svg",
+        Provider::Antigravity => "providers/antigravity.svg",
     };
 
     if matches!(
@@ -27,6 +28,7 @@ pub(crate) fn provider_logo(provider: Provider, size: f32) -> AnyElement {
             | Provider::Grok
             | Provider::Hermes
             | Provider::Trae
+            | Provider::Antigravity
     ) {
         return div()
             .size(px(size))

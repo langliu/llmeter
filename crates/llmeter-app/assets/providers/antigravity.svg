@@ -1,0 +1,13 @@
+<svg role="img" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+  <title>Antigravity</title>
+  <defs>
+    <linearGradient id="antigravity-gradient" x1="12" y1="3.75" x2="12" y2="20.25" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F47C2A"/>
+      <stop offset="25%" stop-color="#D38542"/>
+      <stop offset="50%" stop-color="#7B8DAF"/>
+      <stop offset="75%" stop-color="#3D8AF5"/>
+      <stop offset="100%" stop-color="#3186FF"/>
+    </linearGradient>
+  </defs>
+  <path d="M19.233 19.875c1 .75 2.5 .25 1.125-1.125-4.125-4-3.25-15-8.375-15-5.125 0-4.25 11-8.375 15-1.5 1.5 .125 1.875 1.125 1.125C8.608 17.25 8.358 12.625 11.983 12.625c3.625 0 3.375 4.625 7.25 7.25Z" fill="url(#antigravity-gradient)"/>
+</svg>

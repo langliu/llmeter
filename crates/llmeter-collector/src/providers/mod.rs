@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use llmeter_storage::Database;
 
+pub(crate) mod antigravity;
 mod claude;
 mod codex;
 mod cursor;
@@ -26,6 +27,7 @@ mod qoder;
 mod trae;
 mod zed;
 
+pub use antigravity::AntigravityAdapter;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::CursorAdapter;
@@ -138,6 +140,7 @@ pub fn default_adapters(database: &Database) -> Vec<Box<dyn ProviderAdapter>> {
         Box::new(ZedAdapter::default()),
         Box::new(GrokAdapter::default()),
         Box::new(HermesAdapter::default()),
+        Box::new(AntigravityAdapter::default()),
     ]
 }
 

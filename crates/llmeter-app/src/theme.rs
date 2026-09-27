@@ -8,6 +8,7 @@ use gpui_component::theme::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode};
 
 pub(crate) fn install(cx: &mut App) {
     let theme = Theme::global_mut(cx);
+    theme.sheet.margin_top = gpui::px(0.0);
     theme.light_theme = Rc::new(config(false));
     theme.dark_theme = Rc::new(config(true));
 }

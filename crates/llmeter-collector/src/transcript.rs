@@ -76,6 +76,7 @@ pub fn load_session_transcript(session: &SessionSummary) -> Result<SessionTransc
         Provider::Qoder => load_qoder_sqlite(path, session),
         Provider::Zed => load_zed_sqlite(path, session),
         Provider::Hermes => load_hermes_sqlite(path, session),
+        Provider::Antigravity => load_antigravity_sqlite(path, session),
         Provider::Cursor | Provider::Trae => bail!(
             "{} only provides account usage data locally; its conversation content is not available",
             session.provider.display_name()
@@ -1271,4 +1272,83 @@ mod tests {
         assert_eq!(transcript.messages[2].role, TranscriptRole::Thinking);
         let _ = fs::remove_file(path);
     }
+}
+
+fn load_antigravity_sqlite(path: &Path, _session: &SessionSummary) -> Result<SessionTranscript> {
+    use crate::providers::antigravity::{ProtoValue, parse_proto_fields};
+
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut stmt = connection.prepare(
+        "SELECT idx, step_type, step_payload, metadata FROM steps ORDER BY idx"
+    )?;
+
+    let mut builder = TranscriptBuilder::default();
+    let mut rows = stmt.query([])?;
+
+    while let Some(row) = rows.next()? {
+        let _idx: i64 = row.get(0)?;
+        let _step_type: i64 = row.get(1)?;
+        let payload: Vec<u8> = row.get(2)?;
+        let metadata: Vec<u8> = row.get(3)?;
+
+        let mut timestamp = None;
+        let meta_fields = parse_proto_fields(&metadata);
+        if let Some(f1_list) = meta_fields.get(&1) {
+            if let Some(ProtoValue::Bytes(time_bytes)) = f1_list.first() {
+                let time_fields = parse_proto_fields(time_bytes);
+                if let Some(f1_sec) = time_fields.get(&1) {
+                    if let Some(ProtoValue::Varint(sec)) = f1_sec.first() {
+                        let nanos = time_fields
+                            .get(&2)
+                            .and_then(|vals| vals.first())
+                            .map(|v| match v {
+                                ProtoValue::Varint(n) => *n as u32,
+                                _ => 0,
+                            })
+                            .unwrap_or(0);
+                        timestamp = DateTime::<Utc>::from_timestamp(*sec as i64, nanos);
+                    }
+                }
+            }
+        }
+
+        let p_fields = parse_proto_fields(&payload);
+
+        // User message: field 19 -> field 2
+        if let Some(f19_list) = p_fields.get(&19) {
+            if let Some(ProtoValue::Bytes(f19_bytes)) = f19_list.first() {
+                let user_fields = parse_proto_fields(f19_bytes);
+                if let Some(f2_list) = user_fields.get(&2) {
+                    if let Some(ProtoValue::Bytes(text_bytes)) = f2_list.first() {
+                        if let Ok(text) = std::str::from_utf8(text_bytes) {
+                            if !text.trim().is_empty() {
+                                builder.push(TranscriptRole::User, text, timestamp);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Assistant message: field 20 -> field 1 (or 8)
+        if let Some(f20_list) = p_fields.get(&20) {
+            if let Some(ProtoValue::Bytes(f20_bytes)) = f20_list.first() {
+                let asst_fields = parse_proto_fields(f20_bytes);
+                let text_bytes = asst_fields
+                    .get(&1)
+                    .and_then(|vals| vals.first())
+                    .or_else(|| asst_fields.get(&8).and_then(|vals| vals.first()));
+
+                if let Some(ProtoValue::Bytes(tb)) = text_bytes {
+                    if let Ok(text) = std::str::from_utf8(tb) {
+                        if !text.trim().is_empty() {
+                            builder.push(TranscriptRole::Assistant, text, timestamp);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(builder.finish())
 }

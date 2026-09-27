@@ -17,10 +17,11 @@ pub enum Provider {
     Zed,
     Grok,
     Hermes,
+    Antigravity,
 }
 
 impl Provider {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Codex,
         Self::Claude,
         Self::Cursor,
@@ -32,6 +33,7 @@ impl Provider {
         Self::Zed,
         Self::Grok,
         Self::Hermes,
+        Self::Antigravity,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -47,6 +49,7 @@ impl Provider {
             Self::Zed => "zed",
             Self::Grok => "grok",
             Self::Hermes => "hermes",
+            Self::Antigravity => "antigravity",
         }
     }
 
@@ -63,6 +66,7 @@ impl Provider {
             Self::Zed => "Zed",
             Self::Grok => "Grok",
             Self::Hermes => "Hermes",
+            Self::Antigravity => "Antigravity",
         }
     }
 
@@ -75,7 +79,7 @@ impl Provider {
             Self::Omp => Some(format!("omp --resume {session_ref}")),
             Self::Grok => Some(format!("grok --resume {session_ref}")),
             Self::Hermes => Some(format!("hermes --resume {session_ref}")),
-            Self::Cursor | Self::Qoder | Self::Trae | Self::Zed => None,
+            Self::Cursor | Self::Qoder | Self::Trae | Self::Zed | Self::Antigravity => None,
         }
     }
 
@@ -149,6 +153,9 @@ impl FromStr for Provider {
             "zed" => Ok(Self::Zed),
             "grok" | "grok-build" | "grok_build" => Ok(Self::Grok),
             "hermes" | "hermes-agent" | "hermes_agent" => Ok(Self::Hermes),
+            "antigravity" | "agy" | "google-antigravity" | "google_antigravity" => {
+                Ok(Self::Antigravity)
+            },
             other => Err(format!("unsupported provider: {other}")),
         }
     }

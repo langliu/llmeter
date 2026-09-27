@@ -549,7 +549,7 @@ impl Render for SessionDetailView {
 
 pub(crate) fn session_detail_sheet(sheet: Sheet, detail: Entity<SessionDetailView>) -> Sheet {
     sheet
-        .size(px(520.0))
+        .size(px(680.0))
         .title(t!("sessions.transcript_details").to_string())
         .child(detail)
 }
@@ -560,9 +560,9 @@ fn session_detail_content(
 ) -> AnyElement {
     v_flex()
         .debug_selector(|| "session-detail-content".to_string())
-        .w_full()
+        .size_full()
         .gap_3()
-        .pb_6()
+        .pb_4()
         .child(transcript_section(
             &detail_view.transcript,
             detail_view.transcript_item_sizes.clone(),
@@ -628,11 +628,10 @@ fn transcript_section(
                     },
                 )
                 .track_scroll(&scroll)
-                .h(px(480.0))
-                .w_full()
+                .size_full()
                 .gap_3();
 
-                let mut content = v_flex().gap_2().child(messages);
+                let mut content = v_flex().size_full().gap_2().child(messages);
                 if transcript.truncated {
                     content = content.child(
                         div()
@@ -647,7 +646,7 @@ fn transcript_section(
     };
 
     div()
-        .w_full()
+        .size_full()
         .rounded_lg()
         .border_1()
         .border_color(p.border.opacity(0.7))
@@ -658,7 +657,7 @@ fn transcript_section(
 }
 
 fn estimated_transcript_message_size(message: &TranscriptMessage) -> Size<Pixels> {
-    const CHARS_PER_LINE: usize = 52;
+    const CHARS_PER_LINE: usize = 70;
     const LINE_HEIGHT: f32 = 20.0;
     const FIXED_HEIGHT: f32 = 56.0;
 
