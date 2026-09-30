@@ -16,28 +16,36 @@ use llmeter_storage::Database;
 
 pub(crate) mod antigravity;
 mod claude;
+mod cline;
 mod codex;
+mod copilot;
 mod cursor;
 mod grok;
 mod hermes;
+mod kilo;
 mod opencode;
 mod pi;
 mod qoder;
+mod roo;
 mod trae;
 mod zcode;
 mod zed;
 
 pub use antigravity::AntigravityAdapter;
 pub use claude::ClaudeAdapter;
+pub use cline::ClineAdapter;
 pub use codex::CodexAdapter;
+pub use copilot::CopilotAdapter;
 pub use cursor::CursorAdapter;
 pub(crate) use cursor::{cursor_root, cursor_session_cookie};
 pub use grok::GrokAdapter;
 pub use hermes::HermesAdapter;
+pub use kilo::KiloAdapter;
 pub use opencode::OpenCodeAdapter;
 pub use pi::PiCompatibleAdapter;
 pub use qoder::QoderAdapter;
 pub(crate) use qoder::qoder_root;
+pub use roo::RooAdapter;
 pub use trae::{TRAE_CN_USAGE_SETTING, TraeAdapter};
 pub(crate) use trae::{has_trae_cn_auth, read_entitlement, trae_cn_root, trae_root};
 pub use zcode::ZCodeAdapter;
@@ -149,6 +157,10 @@ pub fn default_adapters(database: &Database) -> Vec<Box<dyn ProviderAdapter>> {
         Box::new(HermesAdapter::default()),
         Box::new(AntigravityAdapter::default()),
         Box::new(ZCodeAdapter::default()),
+        Box::new(CopilotAdapter::default()),
+        Box::new(ClineAdapter::default()),
+        Box::new(RooAdapter::default()),
+        Box::new(KiloAdapter::default()),
     ]
 }
 

@@ -19,10 +19,14 @@ pub enum Provider {
     Hermes,
     Antigravity,
     ZCode,
+    Copilot,
+    Cline,
+    Roo,
+    Kilo,
 }
 
 impl Provider {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 17] = [
         Self::Codex,
         Self::Claude,
         Self::Cursor,
@@ -36,6 +40,10 @@ impl Provider {
         Self::Hermes,
         Self::Antigravity,
         Self::ZCode,
+        Self::Copilot,
+        Self::Cline,
+        Self::Roo,
+        Self::Kilo,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -53,6 +61,10 @@ impl Provider {
             Self::Hermes => "hermes",
             Self::Antigravity => "antigravity",
             Self::ZCode => "zcode",
+            Self::Copilot => "copilot",
+            Self::Cline => "cline",
+            Self::Roo => "roo",
+            Self::Kilo => "kilo",
         }
     }
 
@@ -71,6 +83,10 @@ impl Provider {
             Self::Hermes => "Hermes",
             Self::Antigravity => "Antigravity",
             Self::ZCode => "ZCode",
+            Self::Copilot => "Copilot CLI",
+            Self::Cline => "Cline",
+            Self::Roo => "Roo Code",
+            Self::Kilo => "Kilo Code",
         }
     }
 
@@ -83,12 +99,16 @@ impl Provider {
             Self::Omp => Some(format!("omp --resume {session_ref}")),
             Self::Grok => Some(format!("grok --resume {session_ref}")),
             Self::Hermes => Some(format!("hermes --resume {session_ref}")),
+            Self::Copilot => Some(format!("copilot resume {session_ref}")),
             Self::Cursor
             | Self::Qoder
             | Self::Trae
             | Self::Zed
             | Self::Antigravity
-            | Self::ZCode => None,
+            | Self::ZCode
+            | Self::Cline
+            | Self::Roo
+            | Self::Kilo => None,
         }
     }
 
@@ -166,6 +186,12 @@ impl FromStr for Provider {
                 Ok(Self::Antigravity)
             }
             "zcode" | "z-code" | "z_code" => Ok(Self::ZCode),
+            "copilot" | "github-copilot" | "copilot-cli" | "github_copilot_cli" => {
+                Ok(Self::Copilot)
+            }
+            "cline" | "claude-dev" | "claude_dev" => Ok(Self::Cline),
+            "roo" | "roo-code" | "roo_code" | "roocode" | "roo-cline" => Ok(Self::Roo),
+            "kilo" | "kilo-code" | "kilo_code" | "kilocode" => Ok(Self::Kilo),
             other => Err(format!("unsupported provider: {other}")),
         }
     }

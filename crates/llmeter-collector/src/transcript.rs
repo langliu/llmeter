@@ -84,6 +84,10 @@ pub fn load_session_transcript(session: &SessionSummary) -> Result<SessionTransc
             "{} only provides account usage data locally; its conversation content is not available",
             session.provider.display_name()
         ),
+        Provider::Copilot | Provider::Cline | Provider::Roo | Provider::Kilo => bail!(
+            "{} transcripts are not supported yet",
+            session.provider.display_name()
+        ),
     }
 }
 

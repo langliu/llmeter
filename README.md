@@ -78,6 +78,17 @@ safety rescan.
 - ZCode: the validated `model_usage` schema of `~/.zcode/cli/db/db.sqlite` (or
   `$ZCODE_HOME`), reporting every finished model request with cache-token
   breakdowns; requests still running are picked up once they complete
+- Copilot CLI: `~/.copilot/session-state/*/events.jsonl` (or `$COPILOT_HOME`),
+  diffing the cumulative per-model counters of each `session.shutdown` so
+  resumed sessions only count their increments
+- Cline: the per-task totals in `~/.cline/data/state/taskHistory.json` (or
+  `$CLINE_DATA_DIR`/`$CLINE_DIR`), with cache buckets separated and the
+  reported USD cost
+- Roo Code: every editor's `globalStorage/rooveterinaryinc.roo-cline` task
+  history (VS Code, VSCodium, Cursor, Windsurf), one usage per task
+- Kilo Code: the `step-finish` parts of `~/.local/share/kilo/kilo.db`
+  (or `$XDG_DATA_HOME/kilo`), one event per billed request with model and
+  project attribution
 
 The Limits page also reads account quota from the existing local login state for
 Claude Code, Codex, Cursor, Qoder/Qoder CN, and Grok. TRAE SOLO contributes its

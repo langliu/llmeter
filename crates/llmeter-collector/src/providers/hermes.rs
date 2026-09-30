@@ -9,7 +9,6 @@ use chrono::{DateTime, Utc};
 use llmeter_core::{
     Provider, ProviderDetection, ProviderStatus, SourceFile, SourceFormat, TokenCounts,
 };
-use rusqlite::Connection;
 
 use super::{ParsedUsage, ProviderAdapter, home_dir, project_name};
 use crate::sqlite::{open_read_only, table_has_columns};
@@ -467,7 +466,7 @@ mod tests {
 
     use chrono::Duration;
     use llmeter_storage::{Database, UsageRepository};
-    use rusqlite::params;
+    use rusqlite::{Connection, params};
 
     use super::*;
     use crate::sync::SyncEngine;

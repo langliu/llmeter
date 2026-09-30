@@ -37,6 +37,19 @@ official app icon distributed in the ZCode desktop app bundle
 resized to 256×256. LLMeter renders it on a white rounded chip so the dark
 tile stays readable on both themes.
 
+The Copilot CLI, Cline, Roo Code, and Kilo Code assets are the
+provider-specific monochrome glyphs from `@lobehub/icons-static-svg@1.95.1`
+(LobeHub/lobe-icons):
+
+- Copilot CLI: https://icons.lobehub.com/components/copilot (`copilot.svg`)
+- Cline: https://icons.lobehub.com/components/cline (`cline.svg`)
+- Roo Code: https://icons.lobehub.com/components/roo-code (`roo.svg`)
+- Kilo Code: https://icons.lobehub.com/components/kilo-code (`kilo.svg`)
+
+All four are `currentColor` glyphs; LLMeter renders them on the white
+rounded chip like the other monochrome marks. Cline and Kilo Code are also
+in Simple Icons, but LobeHub takes precedence per the sourcing rules.
+
 
 The names and logos are trademarks of their respective owners. The assets are
 used only to identify the local coding-agent session source in LLMeter.
