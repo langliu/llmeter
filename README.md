@@ -75,6 +75,9 @@ safety rescan.
   assistant-token schema, with cached input separated from ordinary input
 - TRAE SOLO CN: the official per-session usage API for a rolling 30-day window;
   this remote read is disabled until explicitly enabled under Settings → Data & Sync
+- ZCode: the validated `model_usage` schema of `~/.zcode/cli/db/db.sqlite` (or
+  `$ZCODE_HOME`), reporting every finished model request with cache-token
+  breakdowns; requests still running are picked up once they complete
 
 The Limits page also reads account quota from the existing local login state for
 Claude Code, Codex, Cursor, Qoder/Qoder CN, and Grok. TRAE SOLO contributes its

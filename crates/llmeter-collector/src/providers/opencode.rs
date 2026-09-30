@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use llmeter_core::{Provider, ProviderDetection, SourceFile, SourceFormat, TokenCounts};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::Connection;
 use serde_json::Value;
 
 use super::{
@@ -11,6 +11,7 @@ use super::{
     json_value, jsonl_exists, model, object_for_key, object_with_usage, project_name, project_path,
     session_id, source_event_id, timestamp, walk_jsonl, walk_matching,
 };
+use crate::sqlite::{open_read_only, table_has_columns};
 
 const OPENCODE_PARSER_VERSION: u32 = 2;
 const SESSION_TABLES: &[&str] = &["session_v2", "session"];
@@ -77,7 +78,7 @@ impl OpenCodeAdapter {
 
     fn supported_sqlite_source(&self) -> Result<Option<(PathBuf, String)>> {
         for path in self.sqlite_files()? {
-            if let Some(table) = find_session_table(&path)? {
+            if let Some(table) = find_session_table(&open_read_only(&path)?)? {
                 return Ok(Some((path, table)));
             }
         }
@@ -191,10 +192,9 @@ impl ProviderAdapter for OpenCodeAdapter {
     }
 
     fn parse_sqlite(&self, source: &SourceFile) -> Result<Vec<ParsedUsage>> {
-        let table = find_session_table(&source.path)?
+        let connection = open_read_only(&source.path)?;
+        let table = find_session_table(&connection)?
             .ok_or_else(|| anyhow::anyhow!("OpenCode session token schema is unsupported"))?;
-        let connection =
-            Connection::open_with_flags(&source.path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let query = format!(
             "SELECT id, directory, model, tokens_input, tokens_output, tokens_reasoning,
                     tokens_cache_read, tokens_cache_write, time_created, time_updated
@@ -250,42 +250,17 @@ impl ProviderAdapter for OpenCodeAdapter {
     }
 }
 
-fn find_session_table(path: &Path) -> Result<Option<String>> {
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+fn find_session_table(connection: &Connection) -> Result<Option<String>> {
     for table in SESSION_TABLES {
-        let table_exists: Option<String> = connection
-            .query_row(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                params![table],
-                |row| row.get(0),
-            )
-            .ok();
-        if table_exists.is_none() {
-            continue;
-        }
-        let columns = table_columns(&connection, table)?;
-        if REQUIRED_SESSION_COLUMNS
-            .iter()
-            .all(|required| columns.iter().any(|column| column == required))
-        {
+        if table_has_columns(connection, table, REQUIRED_SESSION_COLUMNS)? {
             return Ok(Some((*table).to_string()));
         }
     }
     Ok(None)
 }
 
-fn table_columns(connection: &Connection, table: &str) -> Result<Vec<String>> {
-    let escaped = table.replace('\'', "''");
-    let pragma = format!("PRAGMA table_info('{escaped}')");
-    let mut statement = connection.prepare(&pragma)?;
-    statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
 fn inspect_schema(path: &Path) -> Result<String> {
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let connection = open_read_only(path)?;
     let mut statement = connection.prepare(
         "SELECT name FROM sqlite_master
          WHERE type IN ('table', 'view')

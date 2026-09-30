@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use gpui::{AssetSource, Result, SharedString};
 
-const PROVIDER_ASSETS: [&str; 12] = [
+const PROVIDER_ASSETS: [&str; 13] = [
     "providers/codex.svg",
     "providers/claude.svg",
     "providers/cursor.svg",
@@ -15,6 +15,7 @@ const PROVIDER_ASSETS: [&str; 12] = [
     "providers/grok.svg",
     "providers/hermes.svg",
     "providers/antigravity.svg",
+    "providers/zcode.png",
 ];
 const ICON_ASSETS: [&str; 1] = ["icons/layers.svg"];
 
@@ -48,6 +49,9 @@ impl AssetSource for Assets {
             }
             "providers/antigravity.svg" => {
                 Some(include_bytes!("../assets/providers/antigravity.svg").as_slice())
+            }
+            "providers/zcode.png" => {
+                Some(include_bytes!("../assets/providers/zcode.png").as_slice())
             }
             "icons/layers.svg" => Some(include_bytes!("../assets/icons/layers.svg").as_slice()),
             _ => None,

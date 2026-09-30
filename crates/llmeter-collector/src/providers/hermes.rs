@@ -9,9 +9,10 @@ use chrono::{DateTime, Utc};
 use llmeter_core::{
     Provider, ProviderDetection, ProviderStatus, SourceFile, SourceFormat, TokenCounts,
 };
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 
 use super::{ParsedUsage, ProviderAdapter, home_dir, project_name};
+use crate::sqlite::{open_read_only, table_has_columns};
 
 const HERMES_PARSER_VERSION: u32 = 1;
 const SESSION_COLUMNS: &[&str] = &[
@@ -182,9 +183,8 @@ impl ProviderAdapter for HermesAdapter {
     }
 
     fn parse_sqlite(&self, source: &SourceFile) -> Result<Vec<ParsedUsage>> {
-        let connection =
-            Connection::open_with_flags(&source.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .with_context(|| format!("open Hermes state database {}", source.path.display()))?;
+        let connection = open_read_only(&source.path)
+            .with_context(|| format!("open Hermes state database {}", source.path.display()))?;
         let mut attributed = HashMap::<String, UsageTotals>::new();
         let mut parsed = Vec::new();
 
@@ -338,34 +338,13 @@ impl UsageTotals {
 }
 
 fn supported_schema(path: &Path) -> Result<bool> {
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    Ok(has_columns(&connection, "sessions", SESSION_COLUMNS)?
-        && has_columns(&connection, "session_model_usage", MODEL_USAGE_COLUMNS)?)
-}
-
-fn has_columns(connection: &Connection, table: &str, required: &[&str]) -> Result<bool> {
-    let exists = connection
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            [table],
-            |_| Ok(()),
-        )
-        .is_ok();
-    if !exists {
-        return Ok(false);
-    }
-    let pragma = format!("PRAGMA table_info('{}')", table.replace('\'', "''"));
-    let mut statement = connection.prepare(&pragma)?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(required
-        .iter()
-        .all(|required| columns.iter().any(|column| column == required)))
+    let connection = open_read_only(path)?;
+    Ok(table_has_columns(&connection, "sessions", SESSION_COLUMNS)?
+        && table_has_columns(&connection, "session_model_usage", MODEL_USAGE_COLUMNS)?)
 }
 
 fn usage_row_count(path: &Path) -> Result<u64> {
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let connection = open_read_only(path)?;
     let count = connection.query_row(
         "SELECT count(*) FROM sessions
          WHERE COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)

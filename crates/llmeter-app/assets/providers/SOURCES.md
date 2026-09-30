@@ -31,6 +31,12 @@ product mark from https://github.com/can1357/oh-my-pi/blob/main/assets/icon.svg
 (π bar + orange plugin connector). The dark `#0d0d0d` rounded ground is added
 so the light mark stays readable at LLMeter sizes on light and dark themes.
 
+ZCode is not in LobeHub Icons or Simple Icons either. `zcode.png` is the
+official app icon distributed in the ZCode desktop app bundle
+(`/Applications/ZCode.app/Contents/Resources/icon.png`, app version 3.14.4),
+resized to 256×256. LLMeter renders it on a white rounded chip so the dark
+tile stays readable on both themes.
+
 
 The names and logos are trademarks of their respective owners. The assets are
 used only to identify the local coding-agent session source in LLMeter.

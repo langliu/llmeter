@@ -5,6 +5,8 @@ pub mod limits;
 pub mod parsers;
 pub mod pricing;
 
+mod sqlite;
+
 pub mod providers;
 pub mod sync;
 pub mod transcript;

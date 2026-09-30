@@ -1416,6 +1416,7 @@ fn provider_color(provider: Provider, p: Palette) -> Rgba {
         Provider::Pi => rgb(if p.is_dark { 0xc19be5 } else { 0x9364b7 }),
         Provider::Grok | Provider::Hermes => rgb(if p.is_dark { 0x929eb8 } else { 0x64748b }),
         Provider::Antigravity => rgb(if p.is_dark { 0x7cacf8 } else { 0x4285f4 }),
+        Provider::ZCode => rgb(if p.is_dark { 0x8b93ff } else { 0x5259d6 }),
     }
 }
 

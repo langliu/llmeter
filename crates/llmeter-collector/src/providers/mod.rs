@@ -24,6 +24,7 @@ mod opencode;
 mod pi;
 mod qoder;
 mod trae;
+mod zcode;
 mod zed;
 
 pub use antigravity::AntigravityAdapter;
@@ -39,6 +40,7 @@ pub use qoder::QoderAdapter;
 pub(crate) use qoder::qoder_root;
 pub use trae::{TRAE_CN_USAGE_SETTING, TraeAdapter};
 pub(crate) use trae::{has_trae_cn_auth, read_entitlement, trae_cn_root, trae_root};
+pub use zcode::ZCodeAdapter;
 pub use zed::ZedAdapter;
 
 pub const PARSER_VERSION: u32 = 1;
@@ -146,6 +148,7 @@ pub fn default_adapters(database: &Database) -> Vec<Box<dyn ProviderAdapter>> {
         Box::new(GrokAdapter::default()),
         Box::new(HermesAdapter::default()),
         Box::new(AntigravityAdapter::default()),
+        Box::new(ZCodeAdapter::default()),
     ]
 }
 

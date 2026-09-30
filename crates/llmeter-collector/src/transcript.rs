@@ -9,8 +9,10 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use llmeter_core::Provider;
 use llmeter_storage::SessionSummary;
-use rusqlite::{Connection, OpenFlags, Row, types::ValueRef};
+use rusqlite::{Connection, Row, types::ValueRef};
 use serde_json::Value;
+
+use crate::sqlite::{open_read_only, quote_identifier, table_columns};
 
 const MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MESSAGES: usize = 1_000;
@@ -75,6 +77,7 @@ pub fn load_session_transcript(session: &SessionSummary) -> Result<SessionTransc
         }
         Provider::Qoder => load_qoder_sqlite(path, session),
         Provider::Zed => load_zed_sqlite(path, session),
+        Provider::ZCode => load_zcode_sqlite(path, session),
         Provider::Hermes => load_hermes_sqlite(path, session),
         Provider::Antigravity => load_antigravity_sqlite(path, session),
         Provider::Cursor | Provider::Trae => bail!(
@@ -604,7 +607,7 @@ fn load_opencode_sqlite(path: &Path, session: &SessionSummary) -> Result<Session
         .session_id
         .as_deref()
         .context("OpenCode session has no session ID")?;
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let connection = open_read_only(path)
         .with_context(|| format!("open OpenCode database {}", path.display()))?;
     let mut builder = TranscriptBuilder::default();
 
@@ -625,12 +628,29 @@ fn load_opencode_sqlite(path: &Path, session: &SessionSummary) -> Result<Session
         }
     }
 
-    let message_spec = find_table_spec(&connection, &["message", "messages"], true)?;
-    let part_spec = find_table_spec(&connection, &["part", "parts"], true)?;
+    load_message_part_sqlite(
+        &connection,
+        session_id,
+        &["message", "messages"],
+        &["part", "parts"],
+    )
+}
+
+/// Message + part transcript layout shared by OpenCode and ZCode: parent
+/// messages carry the role, parts carry the content keyed by `message_id`.
+fn load_message_part_sqlite(
+    connection: &Connection,
+    session_id: &str,
+    message_tables: &[&str],
+    part_tables: &[&str],
+) -> Result<SessionTranscript> {
+    let mut builder = TranscriptBuilder::default();
+    let message_spec = find_table_spec(connection, message_tables, true)?;
+    let part_spec = find_table_spec(connection, part_tables, true)?;
     let mut roles = HashMap::<String, TranscriptRole>::new();
 
     if let Some(spec) = message_spec {
-        for row in query_raw_rows(&connection, &spec, session_id)? {
+        for row in query_raw_rows(connection, &spec, session_id)? {
             let data = parse_row_data(&row);
             let role = infer_raw_role(&row, data.as_ref(), None);
             if let (Some(id), Some(role)) = (row.id.clone(), role) {
@@ -640,7 +660,7 @@ fn load_opencode_sqlite(path: &Path, session: &SessionSummary) -> Result<Session
         }
     }
     if let Some(spec) = part_spec {
-        for row in query_raw_rows(&connection, &spec, session_id)? {
+        for row in query_raw_rows(connection, &spec, session_id)? {
             let data = parse_row_data(&row);
             let role = row
                 .parent_id
@@ -659,13 +679,23 @@ fn load_opencode_sqlite(path: &Path, session: &SessionSummary) -> Result<Session
     Ok(builder.finish())
 }
 
+fn load_zcode_sqlite(path: &Path, session: &SessionSummary) -> Result<SessionTranscript> {
+    let session_id = session
+        .session_id
+        .as_deref()
+        .context("ZCode session has no session ID")?;
+    let connection =
+        open_read_only(path).with_context(|| format!("open ZCode database {}", path.display()))?;
+    load_message_part_sqlite(&connection, session_id, &["message"], &["part"])
+}
+
 fn load_qoder_sqlite(path: &Path, session: &SessionSummary) -> Result<SessionTranscript> {
     let session_id = session
         .session_id
         .as_deref()
         .context("Qoder session has no session ID")?;
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("open Qoder database {}", path.display()))?;
+    let connection =
+        open_read_only(path).with_context(|| format!("open Qoder database {}", path.display()))?;
     let Some(spec) = find_table_spec(&connection, &["chat_message", "message"], true)? else {
         return Ok(SessionTranscript::default());
     };
@@ -687,8 +717,8 @@ fn load_hermes_sqlite(path: &Path, session: &SessionSummary) -> Result<SessionTr
         .session_id
         .as_deref()
         .context("Hermes session has no session ID")?;
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("open Hermes database {}", path.display()))?;
+    let connection =
+        open_read_only(path).with_context(|| format!("open Hermes database {}", path.display()))?;
     let mut builder = TranscriptBuilder::default();
 
     if let Some(spec) = find_table_spec(&connection, &["messages", "message"], true)? {
@@ -736,7 +766,7 @@ fn load_zed_sqlite(path: &Path, session: &SessionSummary) -> Result<SessionTrans
         .session_id
         .as_deref()
         .context("Zed session has no thread ID")?;
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let connection = open_read_only(path)
         .with_context(|| format!("open Zed threads database {}", path.display()))?;
     let (data_type, data): (String, Vec<u8>) = connection
         .query_row(
@@ -1061,14 +1091,6 @@ fn table_names(connection: &Connection) -> Result<Vec<String>> {
         .map_err(Into::into)
 }
 
-fn table_columns(connection: &Connection, table: &str) -> Result<Vec<String>> {
-    let sql = format!("PRAGMA table_info({})", quote_identifier(table));
-    let mut statement = connection.prepare(&sql)?;
-    let rows = statement.query_map([], |row| row.get(1))?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
-}
-
 fn find_column(columns: &[String], candidates: &[&str]) -> Option<String> {
     candidates.iter().find_map(|candidate| {
         columns
@@ -1076,10 +1098,6 @@ fn find_column(columns: &[String], candidates: &[&str]) -> Option<String> {
             .find(|column| column.eq_ignore_ascii_case(candidate))
             .cloned()
     })
-}
-
-fn quote_identifier(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 fn row_text(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<String>> {
@@ -1290,7 +1308,7 @@ mod tests {
 fn load_antigravity_sqlite(path: &Path, _session: &SessionSummary) -> Result<SessionTranscript> {
     use crate::providers::antigravity::{ProtoValue, parse_proto_fields};
 
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let connection = open_read_only(path)?;
     let mut stmt = connection
         .prepare("SELECT idx, step_type, step_payload, metadata FROM steps ORDER BY idx")?;
 
