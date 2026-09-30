@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{borrow::Cow, path::Path};
 
 use chrono::{DateTime, Utc};
 use llmeter_core::Provider;
@@ -148,19 +148,19 @@ impl SessionSummary {
             return true;
         }
         let query = query.to_ascii_lowercase();
-        let haystacks = [
-            Some(self.title()),
-            self.project_label(),
-            self.project_path.clone(),
-            self.model.clone(),
-            self.session_id.clone(),
-            self.source_file.clone(),
-            Some(self.provider.display_name().to_string()),
+        let haystacks: [Option<Cow<'_, str>>; 7] = [
+            Some(Cow::Owned(self.title())),
+            self.project_label().map(Cow::Owned),
+            self.project_path.as_deref().map(Cow::Borrowed),
+            self.model.as_deref().map(Cow::Borrowed),
+            self.session_id.as_deref().map(Cow::Borrowed),
+            self.source_file.as_deref().map(Cow::Borrowed),
+            Some(Cow::Borrowed(self.provider.display_name())),
         ];
         haystacks
             .into_iter()
             .flatten()
-            .any(|value| value.to_ascii_lowercase().contains(&query))
+            .any(|value| value.to_ascii_lowercase().contains(query.as_str()))
     }
 }
 
@@ -268,70 +268,71 @@ impl UsageRepository {
     }
 
     pub fn load_dashboard(&self, query: DashboardQuery) -> Result<DashboardSnapshot, StorageError> {
-        let mut snapshot = {
-            let connection = self.database.lock()?;
+        let mut snapshot = self.database.with_reader(|connection| {
             let (today, seven_days, thirty_days) = query_windowed_overviews(
-                &connection,
+                connection,
                 query.today_start,
                 query.seven_start,
                 query.thirty_start,
                 query.now_end,
             )?;
-            DashboardSnapshot {
+            Ok(DashboardSnapshot {
                 today,
                 seven_days,
                 thirty_days,
-                overview: query_overview(&connection, query.overview_start, query.overview_end)?,
+                overview: query_overview(connection, query.overview_start, query.overview_end)?,
                 overview_daily: query_daily_usage(
-                    &connection,
+                    connection,
                     query.overview_start,
                     query.overview_end,
                 )?,
                 overview_providers: query_provider_usage(
-                    &connection,
+                    connection,
                     query.overview_start,
                     query.overview_end,
                 )?,
                 overview_models: query_model_usage(
-                    &connection,
+                    connection,
                     query.overview_start,
                     query.overview_end,
                 )?,
-                heatmap_daily: query_daily_usage(&connection, query.heatmap_start, query.now_end)?,
+                heatmap_daily: query_daily_usage(connection, query.heatmap_start, query.now_end)?,
                 heatmap_models: query_daily_model_usage(
-                    &connection,
+                    connection,
                     query.heatmap_start,
                     query.now_end,
                 )?,
-                providers: query_provider_usage(&connection, query.thirty_start, query.now_end)?,
-                models: query_model_usage(&connection, query.thirty_start, query.now_end)?,
-                projects: query_project_usage(&connection, query.thirty_start, query.now_end)?,
-                recent: query_recent_activity(&connection, 8)?,
+                providers: query_provider_usage(connection, query.thirty_start, query.now_end)?,
+                models: query_model_usage(connection, query.thirty_start, query.now_end)?,
+                projects: query_project_usage(connection, query.thirty_start, query.now_end)?,
+                recent: query_recent_activity(connection, 8)?,
                 sessions: Vec::new(),
                 session_count: 0,
-            }
-        };
+            })
+        })?;
         if query.session_load == SessionLoad::Skip {
             return Ok(snapshot);
         }
-        let connection = self.database.lock()?;
-        match query.session_load {
-            SessionLoad::Skip => {}
-            SessionLoad::Count => {
-                snapshot.session_count = query_session_count(&connection)?;
+        self.database.with_reader(|connection| {
+            match query.session_load {
+                SessionLoad::Skip => {}
+                SessionLoad::Count => {
+                    snapshot.session_count = query_session_count(connection)?;
+                }
+                SessionLoad::List(filter) => {
+                    snapshot.sessions = query_sessions(connection, filter)?;
+                }
+                SessionLoad::ListAndCount(filter) => {
+                    snapshot.sessions = query_sessions(connection, filter)?;
+                    snapshot.session_count = if filter.is_unfiltered() {
+                        snapshot.sessions.len() as u64
+                    } else {
+                        query_session_count(connection)?
+                    };
+                }
             }
-            SessionLoad::List(filter) => {
-                snapshot.sessions = query_sessions(&connection, filter)?;
-            }
-            SessionLoad::ListAndCount(filter) => {
-                snapshot.sessions = query_sessions(&connection, filter)?;
-                snapshot.session_count = if filter.is_unfiltered() {
-                    snapshot.sessions.len() as u64
-                } else {
-                    query_session_count(&connection)?
-                };
-            }
-        }
+            Ok(())
+        })?;
         Ok(snapshot)
     }
 
@@ -340,13 +341,14 @@ impl UsageRepository {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<OverviewRangeData, StorageError> {
-        let connection = self.database.lock()?;
-        Ok((
-            query_overview(&connection, start, end)?,
-            query_daily_usage(&connection, start, end)?,
-            query_provider_usage(&connection, start, end)?,
-            query_model_usage(&connection, start, end)?,
-        ))
+        self.database.with_reader(|connection| {
+            Ok((
+                query_overview(connection, start, end)?,
+                query_daily_usage(connection, start, end)?,
+                query_provider_usage(connection, start, end)?,
+                query_model_usage(connection, start, end)?,
+            ))
+        })
     }
 
     pub fn get_overview(
@@ -354,8 +356,8 @@ impl UsageRepository {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Overview, StorageError> {
-        let connection = self.database.lock()?;
-        query_overview(&connection, start, end)
+        self.database
+            .with_reader(|connection| query_overview(connection, start, end))
     }
 
     pub fn get_today_usage(
@@ -371,8 +373,8 @@ impl UsageRepository {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<DailyUsage>, StorageError> {
-        let connection = self.database.lock()?;
-        query_daily_usage(&connection, start, end)
+        self.database
+            .with_reader(|connection| query_daily_usage(connection, start, end))
     }
 
     pub fn get_daily_model_usage(
@@ -380,8 +382,8 @@ impl UsageRepository {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<DailyModelUsage>, StorageError> {
-        let connection = self.database.lock()?;
-        query_daily_model_usage(&connection, start, end)
+        self.database
+            .with_reader(|connection| query_daily_model_usage(connection, start, end))
     }
 
     pub fn get_provider_usage(
@@ -389,8 +391,8 @@ impl UsageRepository {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<ProviderUsage>, StorageError> {
-        let connection = self.database.lock()?;
-        query_provider_usage(&connection, start, end)
+        self.database
+            .with_reader(|connection| query_provider_usage(connection, start, end))
     }
 
     pub fn get_model_usage(
@@ -398,8 +400,8 @@ impl UsageRepository {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<ModelUsage>, StorageError> {
-        let connection = self.database.lock()?;
-        query_model_usage(&connection, start, end)
+        self.database
+            .with_reader(|connection| query_model_usage(connection, start, end))
     }
 
     pub fn get_project_usage(
@@ -407,13 +409,13 @@ impl UsageRepository {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<ProjectUsage>, StorageError> {
-        let connection = self.database.lock()?;
-        query_project_usage(&connection, start, end)
+        self.database
+            .with_reader(|connection| query_project_usage(connection, start, end))
     }
 
     pub fn get_recent_activity(&self, limit: usize) -> Result<Vec<RecentActivity>, StorageError> {
-        let connection = self.database.lock()?;
-        query_recent_activity(&connection, limit)
+        self.database
+            .with_reader(|connection| query_recent_activity(connection, limit))
     }
 
     pub fn get_session_count(&self) -> Result<u64, StorageError> {
@@ -429,56 +431,24 @@ impl UsageRepository {
         &self,
         query: SessionQuery,
     ) -> Result<Vec<SessionSummary>, StorageError> {
-        let connection = self.database.lock()?;
-        query_sessions(&connection, query)
-    }
-
-    pub fn get_session_projects(&self) -> Result<Vec<String>, StorageError> {
-        let connection = self.database.lock()?;
-        let mut statement = connection.prepare(
-            "SELECT DISTINCT project_name, project_path, source_file
-             FROM usage_events",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok(SessionSummary {
-                provider: Provider::Codex,
-                session_id: None,
-                source_file: row.get(2)?,
-                project_name: row.get(0)?,
-                project_path: row.get(1)?,
-                model: None,
-                started_at: Utc::now(),
-                ended_at: Utc::now(),
-                turn_count: 0,
-                total_tokens: 0,
-                estimated_cost_usd: None,
-            })
-        })?;
-        let mut names = rows
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter_map(|session| session.project_label())
-            .collect::<Vec<_>>();
-        names.sort();
-        names.dedup();
-        Ok(names)
+        self.database
+            .with_reader(|connection| query_sessions(connection, query))
     }
 
     pub fn get_session_providers(&self) -> Result<Vec<Provider>, StorageError> {
-        let connection = self.database.lock()?;
-        let mut statement = connection.prepare(
-            "SELECT DISTINCT provider
+        self.database.with_reader(|connection| {
+            let mut statement = connection.prepare_cached(
+                "SELECT DISTINCT provider
              FROM usage_events
              ORDER BY provider ASC",
-        )?;
-        let rows = statement.query_map([], |row| {
-            parse_provider(row.get(0)?, 0)
-        })?;
-        let mut providers = Vec::new();
-        for row in rows {
-            providers.push(row?);
-        }
-        Ok(providers)
+            )?;
+            let rows = statement.query_map([], |row| parse_provider(row.get(0)?, 0))?;
+            let mut providers = Vec::new();
+            for row in rows {
+                providers.push(row?);
+            }
+            Ok(providers)
+        })
     }
 }
 
@@ -511,12 +481,14 @@ fn query_overview(
     end: DateTime<Utc>,
 ) -> Result<Overview, StorageError> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(cached_input_tokens), 0),
                     COALESCE(SUM(cache_creation_input_tokens), 0), COALESCE(SUM(output_tokens), 0),
                     COALESCE(SUM(reasoning_tokens), 0), COALESCE(SUM(total_tokens), 0),
                     SUM(COALESCE(reported_cost_usd, estimated_cost_usd))
              FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2",
+        )?
+        .query_row(
             params![start.timestamp(), end.timestamp()],
             |row| overview_from_row(row, 0),
         )
@@ -532,7 +504,7 @@ fn query_windowed_overviews(
 ) -> Result<(Overview, Overview, Overview), StorageError> {
     let scan_start = today_start.min(seven_start).min(thirty_start);
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT
                 COUNT(*) FILTER (WHERE timestamp >= ?1),
                 COALESCE(SUM(input_tokens) FILTER (WHERE timestamp >= ?1), 0),
@@ -559,6 +531,8 @@ fn query_windowed_overviews(
                 COALESCE(SUM(total_tokens) FILTER (WHERE timestamp >= ?3), 0),
                 SUM(COALESCE(reported_cost_usd, estimated_cost_usd)) FILTER (WHERE timestamp >= ?3)
              FROM usage_events WHERE timestamp >= ?4 AND timestamp < ?5",
+        )?
+        .query_row(
             params![
                 today_start.timestamp(),
                 seven_start.timestamp(),
@@ -582,7 +556,7 @@ fn query_daily_usage(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<Vec<DailyUsage>, StorageError> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT strftime('%Y-%m-%d', timestamp, 'unixepoch', 'localtime') AS day,
                 COALESCE(SUM(total_tokens), 0),
                 SUM(COALESCE(reported_cost_usd, estimated_cost_usd))
@@ -605,7 +579,7 @@ fn query_daily_model_usage(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<Vec<DailyModelUsage>, StorageError> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT strftime('%Y-%m-%d', timestamp, 'unixepoch', 'localtime') AS day,
                 COALESCE(model, 'Unknown'), COALESCE(SUM(total_tokens), 0)
          FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
@@ -627,7 +601,7 @@ fn query_provider_usage(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<Vec<ProviderUsage>, StorageError> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT provider, COALESCE(SUM(total_tokens), 0), COALESCE(SUM(input_tokens), 0),
                 COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_input_tokens), 0),
                 COALESCE(SUM(cache_creation_input_tokens), 0),
@@ -658,7 +632,7 @@ fn query_model_usage(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<Vec<ModelUsage>, StorageError> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT provider, COALESCE(model, 'Unknown'), COALESCE(SUM(total_tokens), 0),
                 SUM(COALESCE(reported_cost_usd, estimated_cost_usd))
          FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
@@ -681,7 +655,7 @@ fn query_project_usage(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<Vec<ProjectUsage>, StorageError> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT COALESCE(project_name, 'Unknown project'), MAX(project_path),
                 COALESCE(SUM(total_tokens), 0),
                 SUM(COALESCE(reported_cost_usd, estimated_cost_usd)), MAX(timestamp)
@@ -707,7 +681,7 @@ fn query_recent_activity(
     connection: &Connection,
     limit: usize,
 ) -> Result<Vec<RecentActivity>, StorageError> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT provider, model, session_id, total_tokens, timestamp
          FROM usage_events ORDER BY timestamp DESC LIMIT ?1",
     )?;
@@ -727,7 +701,7 @@ fn query_recent_activity(
 
 fn query_session_count(connection: &Connection) -> Result<u64, StorageError> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT COUNT(*) FROM (
                 SELECT 1 FROM usage_events
                 GROUP BY provider,
@@ -736,9 +710,8 @@ fn query_session_count(connection: &Connection) -> Result<u64, StorageError> {
                          COALESCE(project_name, ''),
                          COALESCE(project_path, '')
              )",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
+        )?
+        .query_row([], |row| row.get::<_, i64>(0))
         .map(from_sqlite_u64)
         .map_err(StorageError::from)
 }
@@ -778,7 +751,7 @@ fn query_sessions(
         values.push(Value::Integer(ended_after.timestamp()));
     }
     sql.push_str(" ORDER BY MAX(timestamp) DESC");
-    let mut statement = connection.prepare(&sql)?;
+    let mut statement = connection.prepare_cached(&sql)?;
     let rows = statement.query_map(params_from_iter(values), |row| {
         let started_at: i64 = row.get(6)?;
         let ended_at: i64 = row.get(7)?;

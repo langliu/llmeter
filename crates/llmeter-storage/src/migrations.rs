@@ -87,23 +87,29 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
     if version < 8 {
         // Remote snapshots are account-scoped. Keep legacy uniqueness for
         // unscoped events while allowing one official ID per signed-in account.
-        connection.execute(
+        // One transaction so a failure cannot leave user_version behind and
+        // brick every subsequent launch; duplicates are removed first so the
+        // unique indexes can always be created.
+        let migration = connection.unchecked_transaction()?;
+        migration.execute(
             "DROP INDEX IF EXISTS idx_usage_events_provider_source_event",
             [],
         )?;
-        connection.execute(
+        deduplicate_source_event_ids(&migration)?;
+        migration.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_provider_source_event_legacy
              ON usage_events(provider, source_event_id)
              WHERE source_event_id IS NOT NULL AND snapshot_scope IS NULL",
             [],
         )?;
-        connection.execute(
+        migration.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_provider_scope_source_event
              ON usage_events(provider, snapshot_scope, source_event_id)
              WHERE snapshot_scope IS NOT NULL AND source_event_id IS NOT NULL",
             [],
         )?;
-        reattribute_omp_sessions(connection)?;
+        reattribute_omp_sessions(&migration)?;
+        migration.commit()?;
     }
     if version < 9 {
         connection.execute(
@@ -117,7 +123,16 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
             [],
         )?;
     }
-    connection.pragma_update(None, "user_version", 9)?;
+    if version < 10 {
+        // Covers every column of the session GROUP BY so the session count and
+        // session list queries run as index-only scans instead of table probes.
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_usage_events_session_group
+             ON usage_events(provider, session_id, source_file, project_name, project_path, id)",
+            [],
+        )?;
+    }
+    connection.pragma_update(None, "user_version", 10)?;
     Ok(())
 }
 
@@ -130,8 +145,47 @@ fn has_column(connection: &Connection, table: &str, expected: &str) -> Result<bo
         .any(|column| column == expected))
 }
 
-fn reattribute_omp_sessions(connection: &Connection) -> Result<(), StorageError> {
-    let transaction = connection.unchecked_transaction()?;
+/// Removes rows that would violate the v8 unique indexes, keeping the newest
+/// (highest created_at, then rowid) row of each conflicting group.
+fn deduplicate_source_event_ids(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), StorageError> {
+    transaction.execute(
+        "DELETE FROM usage_events
+         WHERE id IN (
+             SELECT loser.id
+             FROM usage_events AS loser
+             JOIN usage_events AS winner
+               ON winner.provider = loser.provider
+              AND winner.source_event_id = loser.source_event_id
+              AND winner.snapshot_scope IS NULL
+              AND loser.snapshot_scope IS NULL
+              AND loser.source_event_id IS NOT NULL
+              AND (winner.created_at > loser.created_at
+                   OR (winner.created_at = loser.created_at AND winner.rowid > loser.rowid))
+         )",
+        [],
+    )?;
+    transaction.execute(
+        "DELETE FROM usage_events
+         WHERE id IN (
+             SELECT loser.id
+             FROM usage_events AS loser
+             JOIN usage_events AS winner
+               ON winner.provider = loser.provider
+              AND winner.source_event_id = loser.source_event_id
+              AND winner.snapshot_scope = loser.snapshot_scope
+              AND winner.snapshot_scope IS NOT NULL
+              AND loser.source_event_id IS NOT NULL
+              AND (winner.created_at > loser.created_at
+                   OR (winner.created_at = loser.created_at AND winner.rowid > loser.rowid))
+         )",
+        [],
+    )?;
+    Ok(())
+}
+
+fn reattribute_omp_sessions(transaction: &rusqlite::Transaction<'_>) -> Result<(), StorageError> {
     transaction.execute(
         "DELETE FROM usage_events
          WHERE id IN (
@@ -164,7 +218,6 @@ fn reattribute_omp_sessions(connection: &Connection) -> Result<(), StorageError>
            AND replace(path, '\\', '/') LIKE '%/.omp/%'",
         [],
     )?;
-    transaction.commit()?;
     Ok(())
 }
 
@@ -218,7 +271,7 @@ mod tests {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            9
+            10
         );
     }
 
@@ -355,6 +408,59 @@ mod tests {
             names
                 .iter()
                 .any(|name| name == "idx_usage_events_provider_source_file")
+        );
+    }
+
+    #[test]
+    fn v8_deduplicates_conflicting_rows_instead_of_failing_to_open() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE usage_events (
+                    id TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    model TEXT,
+                    session_id TEXT,
+                    project_path TEXT,
+                    project_name TEXT,
+                    timestamp INTEGER NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    estimated_cost_usd REAL,
+                    source_file TEXT,
+                    source_event_id TEXT,
+                    snapshot_scope TEXT,
+                    created_at INTEGER NOT NULL
+                );
+                INSERT INTO usage_events (
+                    id, provider, timestamp, total_tokens, source_event_id, snapshot_scope, created_at
+                ) VALUES
+                    ('older', 'codex', 1, 10, 'official-1', NULL, 100),
+                    ('newer', 'codex', 2, 20, 'official-1', NULL, 200),
+                    ('scoped-a', 'cursor', 3, 30, 'official-2', 'account-a', 300),
+                    ('scoped-b', 'cursor', 4, 40, 'official-2', 'account-a', 250);",
+            )
+            .unwrap();
+
+        run(&connection).unwrap();
+
+        let rows = connection
+            .prepare("SELECT id, total_tokens FROM usage_events ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![("newer".into(), 20), ("scoped-a".into(), 30),],
+            "newest row per conflicting group is kept"
         );
     }
 }

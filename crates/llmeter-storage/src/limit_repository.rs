@@ -36,14 +36,16 @@ impl LimitRepository {
     }
 
     pub fn load(&self, provider: Provider) -> Result<Option<ProviderLimits>, StorageError> {
-        let connection = self.database.lock()?;
-        let payload = connection
-            .query_row(
-                "SELECT payload_json FROM limit_snapshots WHERE provider = ?1",
-                params![provider.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
+        let payload = self.database.with_reader(|connection| {
+            let payload = connection
+                .query_row(
+                    "SELECT payload_json FROM limit_snapshots WHERE provider = ?1",
+                    params![provider.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(payload)
+        })?;
         payload
             .as_deref()
             .map(serde_json::from_str)
