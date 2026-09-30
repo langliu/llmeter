@@ -169,6 +169,28 @@ struct SessionsUpdate {
     generation: u64,
 }
 
+/// Lazily rebuilt search/filter indices for the sessions page. Filter inputs
+/// and the sessions list itself only change on user action or a session query
+/// update, so rendering must not recompute them every frame.
+struct SessionFilterCache {
+    valid: bool,
+    query: String,
+    provider: SessionProviderFilter,
+    range_start: Option<DateTime<Utc>>,
+    project: Option<String>,
+    revision: u64,
+    indices: std::rc::Rc<Vec<usize>>,
+}
+
+#[derive(Default)]
+struct SessionDerivedCache {
+    providers_valid: bool,
+    projects_valid: bool,
+    revision: u64,
+    providers: std::rc::Rc<Vec<Provider>>,
+    projects: std::rc::Rc<Vec<String>>,
+}
+
 pub struct LLMeterView {
     collector: Collector,
     limit_collector: LimitCollector,
@@ -214,6 +236,14 @@ pub struct LLMeterView {
     sessions_generation: u64,
     applied_sessions_generation: u64,
     has_session_count: bool,
+    last_sync_reload: Option<Instant>,
+    sessions_data_revision: u64,
+    session_filter_cache: std::cell::RefCell<SessionFilterCache>,
+    session_derived_cache: std::cell::RefCell<SessionDerivedCache>,
+    heatmap_data_revision: u64,
+    heatmap_cells_cache: std::cell::RefCell<crate::views::dashboard::HeatmapCellsCache>,
+    pub(crate) hook_codex: Option<llmeter_collector::hooks::HookStatus>,
+    pub(crate) hook_claude: Option<llmeter_collector::hooks::HookStatus>,
     _search_subscription: Subscription,
     _overview_date_subscription: Subscription,
     _appearance_subscription: Subscription,
@@ -362,6 +392,24 @@ impl LLMeterView {
             sessions_generation: 0,
             applied_sessions_generation: 0,
             has_session_count,
+            last_sync_reload: None,
+            sessions_data_revision: 0,
+            session_filter_cache: std::cell::RefCell::new(SessionFilterCache {
+                valid: false,
+                query: String::new(),
+                provider: SessionProviderFilter::All,
+                range_start: None,
+                project: None,
+                revision: 0,
+                indices: std::rc::Rc::new(Vec::new()),
+            }),
+            session_derived_cache: std::cell::RefCell::new(SessionDerivedCache::default()),
+            heatmap_data_revision: 0,
+            heatmap_cells_cache: std::cell::RefCell::new(
+                crate::views::dashboard::HeatmapCellsCache::default(),
+            ),
+            hook_codex: llmeter_collector::hooks::codex_hook_status().ok(),
+            hook_claude: llmeter_collector::hooks::claude_hook_status().ok(),
             _search_subscription,
             _overview_date_subscription,
             _appearance_subscription,
@@ -705,7 +753,10 @@ impl LLMeterView {
                 }
                 self.applied_sessions_generation = update.generation;
                 self.snapshot.sessions = sessions;
-                if !update.available_providers.is_empty() || self.session_available_providers.is_empty() {
+                self.sessions_data_revision = self.sessions_data_revision.wrapping_add(1);
+                if !update.available_providers.is_empty()
+                    || self.session_available_providers.is_empty()
+                {
                     self.session_available_providers = update.available_providers;
                 }
                 true
@@ -842,6 +893,8 @@ impl LLMeterView {
         if let Some(status) = status {
             self.snapshot.warnings.push(status.detail);
         }
+        self.hook_codex = llmeter_collector::hooks::codex_hook_status().ok();
+        self.hook_claude = llmeter_collector::hooks::claude_hook_status().ok();
         cx.notify();
     }
 
@@ -850,12 +903,24 @@ impl LLMeterView {
         cx.notify();
     }
 
-    pub(crate) fn visible_session_indices(&self, cx: &gpui::App) -> Vec<usize> {
+    pub(crate) fn visible_session_indices(&self, cx: &gpui::App) -> std::rc::Rc<Vec<usize>> {
         let query = self.session_search.read(cx).value();
         let query = query.to_string();
-        let now = Utc::now();
-        let range_start = self.session_range.start(now);
-        self.snapshot
+        let range_start = self.session_range.start(Utc::now());
+        {
+            let cache = self.session_filter_cache.borrow();
+            if cache.valid
+                && cache.revision == self.sessions_data_revision
+                && cache.query == query
+                && cache.provider == self.session_provider
+                && cache.range_start == range_start
+                && cache.project == self.session_project
+            {
+                return cache.indices.clone();
+            }
+        }
+        let indices = self
+            .snapshot
             .sessions
             .iter()
             .enumerate()
@@ -868,26 +933,78 @@ impl LLMeterView {
             })
             .filter(|(_, session)| session.matches_query(&query))
             .map(|(index, _)| index)
-            .collect()
+            .collect::<Vec<_>>();
+        let indices = std::rc::Rc::new(indices);
+        *self.session_filter_cache.borrow_mut() = SessionFilterCache {
+            valid: true,
+            query,
+            provider: self.session_provider,
+            range_start,
+            project: self.session_project.clone(),
+            revision: self.sessions_data_revision,
+            indices: indices.clone(),
+        };
+        indices
     }
 
-    pub(crate) fn session_providers(&self) -> Vec<Provider> {
-        if !self.session_available_providers.is_empty() {
-            let mut providers = self.session_available_providers.clone();
-            providers.sort_by_key(|provider| provider.display_name());
-            return providers;
-        }
-        let mut providers = Vec::new();
-        for session in &self.snapshot.sessions {
-            if !providers.contains(&session.provider) {
-                providers.push(session.provider);
+    pub(crate) fn session_providers(&self) -> std::rc::Rc<Vec<Provider>> {
+        {
+            let cache = self.session_derived_cache.borrow();
+            if cache.providers_valid && cache.revision == self.sessions_data_revision {
+                return cache.providers.clone();
             }
         }
+        let mut providers: Vec<Provider> = if !self.session_available_providers.is_empty() {
+            self.session_available_providers.clone()
+        } else {
+            let mut providers = Vec::new();
+            for session in &self.snapshot.sessions {
+                if !providers.contains(&session.provider) {
+                    providers.push(session.provider);
+                }
+            }
+            providers
+        };
         providers.sort_by_key(|provider| provider.display_name());
+        let providers = std::rc::Rc::new(providers);
+        let mut cache = self.session_derived_cache.borrow_mut();
+        cache.providers_valid = true;
+        cache.revision = self.sessions_data_revision;
+        cache.providers = providers.clone();
         providers
     }
 
-    pub(crate) fn session_projects(&self) -> Vec<String> {
+    pub(crate) fn cached_heatmap_cells(
+        &self,
+        today: NaiveDate,
+    ) -> std::rc::Rc<Vec<crate::views::dashboard::HeatmapCell>> {
+        {
+            let cache = self.heatmap_cells_cache.borrow();
+            if cache.valid && cache.revision == self.heatmap_data_revision && cache.today == today {
+                return cache.cells.clone();
+            }
+        }
+        let cells = std::rc::Rc::new(crate::views::dashboard::build_heatmap_cells(
+            &self.snapshot.heatmap_daily,
+            &self.snapshot.heatmap_models,
+            today,
+        ));
+        *self.heatmap_cells_cache.borrow_mut() = crate::views::dashboard::HeatmapCellsCache {
+            valid: true,
+            revision: self.heatmap_data_revision,
+            today,
+            cells: cells.clone(),
+        };
+        cells
+    }
+
+    pub(crate) fn session_projects(&self) -> std::rc::Rc<Vec<String>> {
+        {
+            let cache = self.session_derived_cache.borrow();
+            if cache.projects_valid && cache.revision == self.sessions_data_revision {
+                return cache.projects.clone();
+            }
+        }
         let mut names = self
             .snapshot
             .sessions
@@ -896,6 +1013,11 @@ impl LLMeterView {
             .collect::<Vec<_>>();
         names.sort();
         names.dedup();
+        let names = std::rc::Rc::new(names);
+        let mut cache = self.session_derived_cache.borrow_mut();
+        cache.projects_valid = true;
+        cache.revision = self.sessions_data_revision;
+        cache.projects = names.clone();
         names
     }
 
@@ -905,7 +1027,23 @@ impl LLMeterView {
         while let Some(event) = self.collector.try_recv() {
             match event {
                 CollectorEvent::UsageChanged(result) => {
-                    pending_reload = Some(Some((Utc::now(), result.warnings)));
+                    let data_changed = result.events_inserted > 0 || result.tokens_added > 0;
+                    // No-op syncs (e.g. hook signals racing the watcher) only
+                    // need a periodic refresh, not one per signal burst.
+                    let throttled = !data_changed
+                        && self
+                            .last_sync_reload
+                            .is_some_and(|at| at.elapsed() < Duration::from_secs(60));
+                    if !throttled {
+                        if data_changed {
+                            self.last_sync_reload = None;
+                        } else {
+                            self.last_sync_reload = Some(Instant::now());
+                        }
+                        pending_reload = Some(Some((Utc::now(), result.warnings)));
+                    } else {
+                        self.snapshot.last_sync = Some(Utc::now());
+                    }
                 }
                 CollectorEvent::PricingUpdated => {
                     pending_reload.get_or_insert(None);
@@ -1152,9 +1290,35 @@ impl LLMeterView {
         } else {
             snapshot.overview_range = self.snapshot.overview_range.clone();
         }
+        if snapshot_data_equivalent(&snapshot, &self.snapshot) {
+            // Only the sync bookkeeping changed; keep the old snapshot and skip
+            // the full-tree redraw.
+            self.snapshot.last_sync = snapshot.last_sync;
+            self.snapshot.warnings = snapshot.warnings;
+            return false;
+        }
+        self.heatmap_data_revision = self.heatmap_data_revision.wrapping_add(1);
         self.snapshot = snapshot;
         true
     }
+}
+
+/// Compares every data-bearing field of two snapshots, ignoring volatile
+/// bookkeeping (last_sync, warnings) that changes on every sync.
+fn snapshot_data_equivalent(left: &UiSnapshot, right: &UiSnapshot) -> bool {
+    left.today == right.today
+        && left.seven_days == right.seven_days
+        && left.thirty_days == right.thirty_days
+        && left.overview_range == right.overview_range
+        && left.heatmap_daily == right.heatmap_daily
+        && left.heatmap_models == right.heatmap_models
+        && left.providers == right.providers
+        && left.models == right.models
+        && left.projects == right.projects
+        && left.recent == right.recent
+        && left.sessions == right.sessions
+        && left.session_count == right.session_count
+        && left.detections == right.detections
 }
 
 pub(crate) fn session_key(session: &SessionSummary) -> String {
@@ -1365,7 +1529,9 @@ mod tests {
         view.update(cx, |view, _| {
             assert!(view.session_providers().is_empty());
             view.snapshot.sessions = fake_sessions(3); // all Claude
-            assert_eq!(view.session_providers(), vec![Provider::Claude]);
+            // Production code bumps this whenever the session list is replaced.
+            view.sessions_data_revision = view.sessions_data_revision.wrapping_add(1);
+            assert_eq!(view.session_providers().as_slice(), &[Provider::Claude]);
         });
     }
 

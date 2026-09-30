@@ -63,7 +63,7 @@ pub(crate) fn settings_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
                 .text_xl()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(p.foreground)
-                .child(t!("settings.title").to_string()),
+                .child(t!("settings.title")),
         )
         .child(
             h_flex()
@@ -128,8 +128,8 @@ fn section_nav(
             .pt_4()
             .text_xs()
             .text_color(p.muted_foreground)
-            .child(t!("settings.note_1").to_string())
-            .child(t!("settings.note_2").to_string()),
+            .child(t!("settings.note_1"))
+            .child(t!("settings.note_2")),
     )
 }
 
@@ -364,7 +364,7 @@ fn data_card(view: &LLMeterView, p: Palette, cx: &mut Context<LLMeterView>) -> i
         ))
         .child(setting_row(
             t!("settings.hooks").to_string(),
-            hook_controls(p, cx),
+            hook_controls(view, p, cx),
             None,
             false,
             p,
@@ -391,21 +391,19 @@ fn data_card(view: &LLMeterView, p: Palette, cx: &mut Context<LLMeterView>) -> i
         ))
 }
 
-fn hook_controls(p: Palette, cx: &mut Context<LLMeterView>) -> gpui::Div {
-    let codex = llmeter_collector::hooks::codex_hook_status().ok();
-    let claude = llmeter_collector::hooks::claude_hook_status().ok();
+fn hook_controls(view: &LLMeterView, p: Palette, cx: &mut Context<LLMeterView>) -> gpui::Div {
     v_flex()
         .gap_2()
-        .child(t!("settings.hooks_subtitle").to_string())
+        .child(t!("settings.hooks_subtitle"))
         .child(hook_provider_row(
             llmeter_core::Provider::Codex,
-            codex.as_ref(),
+            view.hook_codex.as_ref(),
             p,
             cx,
         ))
         .child(hook_provider_row(
             llmeter_core::Provider::Claude,
-            claude.as_ref(),
+            view.hook_claude.as_ref(),
             p,
             cx,
         ))
@@ -472,7 +470,7 @@ fn footer(view: &LLMeterView, p: Palette) -> impl IntoElement {
         .text_color(p.muted_foreground)
         .child(format!("LLMeter v{}", env!("CARGO_PKG_VERSION")))
         .child("·")
-        .child(t!("settings.footer_local").to_string())
+        .child(t!("settings.footer_local"))
         .child("·")
         .child(
             t!(

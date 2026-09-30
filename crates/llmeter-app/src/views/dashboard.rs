@@ -310,7 +310,7 @@ fn overview_page(
             div()
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(t!("overview.model_usage").to_string()),
+                .child(t!("overview.model_usage")),
         )
         .child(div().pt_3().child(ranking))
         .child(
@@ -324,7 +324,7 @@ fn overview_page(
                 .text_xs()
                 .text_color(p.muted_foreground)
                 .child(format!("{}  {}", t!("overview.started"), started))
-                .child(t!("overview.active_days", days = active_days).to_string()),
+                .child(t!("overview.active_days", days = active_days)),
         );
 
     let provider_total = snapshot
@@ -447,7 +447,7 @@ fn overview_page(
                     div()
                         .text_xs()
                         .text_color(p.muted_foreground)
-                        .child(t!("overview.token_total").to_string()),
+                        .child(t!("overview.token_total")),
                 )
                 .child(
                     div()
@@ -527,13 +527,7 @@ fn overview_page(
                         .flex()
                         .flex_col()
                         .gap_5()
-                        .child(heatmap(
-                            view,
-                            &snapshot.heatmap_daily,
-                            &snapshot.heatmap_models,
-                            p,
-                            cx,
-                        ))
+                        .child(heatmap(view, p, cx))
                         .child(model_ranking),
                 ),
         )
@@ -675,7 +669,7 @@ fn share_card(
                 .pt_1()
                 .text_xs()
                 .text_color(p.muted_foreground)
-                .child(t!("overview.model_count", count = models).to_string()),
+                .child(t!("overview.model_count", count = models)),
         )
 }
 
@@ -732,7 +726,7 @@ fn all_model_detail(
                     div()
                         .text_base()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(t!("overview.all_models").to_string()),
+                        .child(t!("overview.all_models")),
                 ),
         )
         .child(
@@ -740,7 +734,7 @@ fn all_model_detail(
                 .pt_2()
                 .text_xs()
                 .text_color(p.muted_foreground)
-                .child(t!("overview.all_models_description").to_string()),
+                .child(t!("overview.all_models_description")),
         )
         .child(div().pt_2().child(model_detail_rows(
             models,
@@ -1029,7 +1023,7 @@ fn sidebar(active_page: DashboardPage, cx: &mut Context<LLMeterView>) -> impl In
                     div()
                         .text_base()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(t!("app.name").to_string()),
+                        .child(t!("app.name")),
                 ),
         )
         .child(
@@ -1038,7 +1032,7 @@ fn sidebar(active_page: DashboardPage, cx: &mut Context<LLMeterView>) -> impl In
                 .px_2()
                 .text_xs()
                 .text_color(p.muted_foreground)
-                .child(t!("app.tagline").to_string()),
+                .child(t!("app.tagline")),
         )
         .child(navigation)
         .child(div().flex_1())
@@ -1050,7 +1044,7 @@ fn sidebar(active_page: DashboardPage, cx: &mut Context<LLMeterView>) -> impl In
                 .border_color(p.border)
                 .text_xs()
                 .text_color(p.muted_foreground)
-                .child(t!("app.no_cloud").to_string()),
+                .child(t!("app.no_cloud")),
         )
 }
 
@@ -1430,11 +1424,21 @@ const HEATMAP_CELL: f32 = 12.0;
 const HEATMAP_GAP: f32 = 3.0;
 
 #[derive(Clone, Debug, PartialEq)]
-struct HeatmapCell {
+pub(crate) struct HeatmapCell {
     date_text: String,
     value: u64,
     level: usize,
     models: Vec<(String, u64)>,
+}
+
+/// Caches the per-day heatmap cells so the overview page does not re-parse
+/// hundreds of date strings and rebuild the model map on every frame.
+#[derive(Default)]
+pub(crate) struct HeatmapCellsCache {
+    pub valid: bool,
+    pub revision: u64,
+    pub today: chrono::NaiveDate,
+    pub cells: Rc<Vec<HeatmapCell>>,
 }
 
 /// Paints the 20×7 weekly calendar as a single canvas so scrolling the overview
@@ -1601,17 +1605,14 @@ fn heatmap_hit_index(
     Some((week * 7 + weekday) as usize)
 }
 
-fn heatmap(
-    view: &LLMeterView,
+/// Builds the 20×7 grid cells for the weeks ending today. Depends only on the
+/// snapshot heatmap aggregates and the calendar day, so callers cache the
+/// result instead of rebuilding it during render.
+pub(crate) fn build_heatmap_cells(
     daily: &[llmeter_storage::DailyUsage],
     model_usage: &[DailyModelUsage],
-    p: Palette,
-    cx: &mut Context<LLMeterView>,
-) -> gpui::AnyElement {
-    let cell_size = px(HEATMAP_CELL);
-    let gap = px(HEATMAP_GAP);
-    let label_width = px(18.0);
-    let today = Local::now().date_naive();
+    today: NaiveDate,
+) -> Vec<HeatmapCell> {
     let current_week_start =
         today - Duration::days(i64::from(today.weekday().num_days_from_sunday()));
     let start = current_week_start - Duration::days((HEATMAP_WEEKS - 1) * 7);
@@ -1645,17 +1646,27 @@ fn heatmap(
         }
     }
     let max_value = values.iter().map(|(_, value)| *value).max().unwrap_or(0);
-    let cells = Rc::new(
-        values
-            .into_iter()
-            .map(|(date, value)| HeatmapCell {
-                date_text: date.format("%Y-%m-%d").to_string(),
-                value,
-                level: heatmap_level(value, max_value),
-                models: models_by_day.remove(&date).unwrap_or_default(),
-            })
-            .collect::<Vec<_>>(),
-    );
+    values
+        .into_iter()
+        .map(|(date, value)| HeatmapCell {
+            date_text: date.format("%Y-%m-%d").to_string(),
+            value,
+            level: heatmap_level(value, max_value),
+            models: models_by_day.remove(&date).unwrap_or_default(),
+        })
+        .collect()
+}
+
+fn heatmap(view: &LLMeterView, p: Palette, cx: &mut Context<LLMeterView>) -> gpui::AnyElement {
+    let cell_size = px(HEATMAP_CELL);
+    let gap = px(HEATMAP_GAP);
+    let label_width = px(18.0);
+    let today = Local::now().date_naive();
+    let cells = view.cached_heatmap_cells(today);
+    let start = today
+        - Duration::days(i64::from(today.weekday().num_days_from_sunday()))
+        - Duration::days((HEATMAP_WEEKS - 1) * 7);
+
     view.heatmap.update(cx, |heatmap, cx| {
         heatmap.sync(
             cells,
@@ -1753,11 +1764,11 @@ fn heatmap(
         .pt_3()
         .text_xs()
         .text_color(p.muted_foreground)
-        .child(t!("overview.heatmap_less").to_string());
+        .child(t!("overview.heatmap_less"));
     for color in legend_colors {
         legend = legend.child(div().size(px(16.0)).rounded_sm().bg(color));
     }
-    legend = legend.child(t!("overview.heatmap_more").to_string());
+    legend = legend.child(t!("overview.heatmap_more"));
 
     div()
         .w_full()
@@ -1771,7 +1782,7 @@ fn heatmap(
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(p.foreground)
-                .child(t!("overview.heatmap").to_string()),
+                .child(t!("overview.heatmap")),
         )
         .child(div().pt_3().child(week_row).child(div().pt_2().child(grid)))
         .child(legend)
@@ -1866,7 +1877,7 @@ fn trend(
                 .text_xs()
                 .text_color(p.muted_foreground)
                 .child(first_day.day.clone())
-                .child(t!("overview.trend_peak", value = format_tokens(max)).to_string())
+                .child(t!("overview.trend_peak", value = format_tokens(max)))
                 .child(last_day.day.clone()),
         )
         .into_any_element()
@@ -1968,7 +1979,7 @@ impl Render for HeatmapTooltip {
                 div()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child(t!("overview.heatmap_no_models").to_string()),
+                    .child(t!("overview.heatmap_no_models")),
             );
         }
 
@@ -2005,7 +2016,7 @@ impl Render for HeatmapTooltip {
                             .text_xs()
                             .whitespace_nowrap()
                             .text_color(theme.link)
-                            .child(t!("overview.heatmap_level", level = self.level).to_string()),
+                            .child(t!("overview.heatmap_level", level = self.level)),
                     ),
             )
             .child(
@@ -2026,7 +2037,7 @@ impl Render for HeatmapTooltip {
                             .text_xs()
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme.muted_foreground)
-                            .child(t!("overview.heatmap_token_unit").to_string()),
+                            .child(t!("overview.heatmap_token_unit")),
                     ),
             )
             .child(
@@ -2040,7 +2051,7 @@ impl Render for HeatmapTooltip {
                             .pb_2()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(t!("overview.heatmap_models").to_string()),
+                            .child(t!("overview.heatmap_models")),
                     )
                     .child(model_rows),
             )

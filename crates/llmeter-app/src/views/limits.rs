@@ -56,13 +56,13 @@ pub(crate) fn limits_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> 
                                 .text_xl()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(p.foreground)
-                                .child(t!("limits.title").to_string()),
+                                .child(t!("limits.title")),
                         )
                         .child(
                             div()
                                 .text_sm()
                                 .text_color(p.muted_foreground)
-                                .child(t!("limits.subtitle").to_string()),
+                                .child(t!("limits.subtitle")),
                         ),
                 )
                 .child(
@@ -80,7 +80,7 @@ pub(crate) fn limits_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> 
                 .pt_1()
                 .text_xs()
                 .text_color(p.muted_foreground)
-                .child(t!("limits.privacy_note").to_string()),
+                .child(t!("limits.privacy_note")),
         )
 }
 
@@ -268,7 +268,7 @@ fn window_row(window: &LimitWindow, p: Palette) -> AnyElement {
                 div()
                     .text_xs()
                     .text_color(p.muted_foreground)
-                    .child(t!("limits.allowance_only").to_string()),
+                    .child(t!("limits.allowance_only")),
             )
             .into_any_element();
     }

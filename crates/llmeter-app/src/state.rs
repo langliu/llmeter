@@ -27,7 +27,7 @@ pub struct UiSnapshot {
     pub warnings: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct OverviewRangeSnapshot {
     pub overview: Overview,
     pub daily: Vec<DailyUsage>,

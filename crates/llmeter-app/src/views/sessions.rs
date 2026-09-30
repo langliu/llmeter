@@ -82,7 +82,7 @@ impl SessionRangeFilter {
 
 pub(crate) fn sessions_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl IntoElement {
     let p = Palette::from_app(cx);
-    let session_indices = Rc::new(view.visible_session_indices(cx));
+    let session_indices = view.visible_session_indices(cx);
     let visible_count = session_indices.len();
     let total_count = view.snapshot.sessions.len();
     let providers = view.session_providers();
@@ -135,13 +135,13 @@ pub(crate) fn sessions_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
                                 .text_xl()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(p.foreground)
-                                .child(t!("sessions.title").to_string()),
+                                .child(t!("sessions.title")),
                         )
                         .child(
                             div()
                                 .text_sm()
                                 .text_color(p.muted_foreground)
-                                .child(t!("sessions.subtitle").to_string()),
+                                .child(t!("sessions.subtitle")),
                         ),
                 )
                 .child(
@@ -160,7 +160,13 @@ pub(crate) fn sessions_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
                 .gap_2()
                 .flex_wrap()
                 .items_center()
-                .child(provider_filter(view.session_provider, &providers, provider_open, p, cx))
+                .child(provider_filter(
+                    view.session_provider,
+                    &providers,
+                    provider_open,
+                    p,
+                    cx,
+                ))
                 .child(range_filter(view.session_range, cx))
                 .child(project_filter(
                     selected_project.as_deref(),
@@ -584,7 +590,7 @@ fn transcript_section(
         TranscriptLoadState::Loading => div()
             .text_sm()
             .text_color(p.muted_foreground)
-            .child(t!("sessions.transcript_loading").to_string())
+            .child(t!("sessions.transcript_loading"))
             .into_any_element(),
         TranscriptLoadState::Failed(error) => v_flex()
             .gap_1()
@@ -592,7 +598,7 @@ fn transcript_section(
                 div()
                     .text_sm()
                     .text_color(p.muted_foreground)
-                    .child(t!("sessions.transcript_unavailable").to_string()),
+                    .child(t!("sessions.transcript_unavailable")),
             )
             .child(
                 div()
@@ -606,7 +612,7 @@ fn transcript_section(
                 div()
                     .text_sm()
                     .text_color(p.muted_foreground)
-                    .child(t!("sessions.transcript_empty").to_string())
+                    .child(t!("sessions.transcript_empty"))
                     .into_any_element()
             } else {
                 let messages = v_virtual_list(
@@ -637,7 +643,7 @@ fn transcript_section(
                         div()
                             .text_xs()
                             .text_color(p.muted_foreground)
-                            .child(t!("sessions.transcript_truncated").to_string()),
+                            .child(t!("sessions.transcript_truncated")),
                     );
                 }
                 content.into_any_element()
@@ -760,7 +766,7 @@ fn one_shot_badge(p: Palette) -> impl IntoElement {
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .text_color(p.success)
-        .child(t!("sessions.one_shot").to_string())
+        .child(t!("sessions.one_shot"))
 }
 
 fn metric_cell(
