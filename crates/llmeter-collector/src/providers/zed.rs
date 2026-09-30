@@ -368,6 +368,10 @@ impl ProviderAdapter for ZedAdapter {
         })
     }
 
+    fn sync_detection(&self) -> Result<Option<ProviderDetection>> {
+        self.detect().map(Some)
+    }
+
     fn discover_sources(&self) -> Result<Vec<SourceFile>> {
         self.refresh_prompt_times();
         let mut sources = self

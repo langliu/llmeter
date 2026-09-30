@@ -29,12 +29,19 @@ pub enum CollectorEvent {
     FxUpdated(crate::fx::ExchangeRates),
 }
 
+/// Holds the sync locks for the duration of one sync run.
+struct SyncLockGuards<'a> {
+    _remote: Option<std::sync::MutexGuard<'a, ()>>,
+    _local: Option<std::sync::MutexGuard<'a, ()>>,
+}
+
 #[derive(Clone)]
 pub struct Collector {
     engine: SyncEngine,
     event_sender: Sender<CollectorEvent>,
     event_receiver: Arc<Mutex<Receiver<CollectorEvent>>>,
-    sync_lock: Arc<Mutex<()>>,
+    local_sync_lock: Arc<Mutex<()>>,
+    remote_sync_lock: Arc<Mutex<()>>,
     detections: Arc<Mutex<Vec<ProviderDetection>>>,
 }
 
@@ -46,7 +53,8 @@ impl Collector {
             engine: SyncEngine::new(database),
             event_sender,
             event_receiver: Arc::new(Mutex::new(event_receiver)),
-            sync_lock: Arc::new(Mutex::new(())),
+            local_sync_lock: Arc::new(Mutex::new(())),
+            remote_sync_lock: Arc::new(Mutex::new(())),
             detections: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -66,10 +74,7 @@ impl Collector {
     }
 
     pub fn full_rescan(&self) -> Result<SyncResult> {
-        let _guard = self
-            .sync_lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("sync lock poisoned"))?;
+        let _guards = self.acquire_sync_locks(true, true)?;
         self.engine.clear_rebuildable_usage()?;
         let result = self.engine.sync(SyncOptions::default())?;
         let _ = self
@@ -99,11 +104,32 @@ impl Collector {
         detected
     }
 
+    fn acquire_sync_locks(&self, local: bool, remote: bool) -> Result<SyncLockGuards<'_>> {
+        // Fixed order (remote, then local) so combined runs cannot deadlock
+        // against runs that hold only one of the two locks.
+        let remote_guard = remote
+            .then(|| {
+                self.remote_sync_lock
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("remote sync lock poisoned"))
+            })
+            .transpose()?;
+        let local_guard = local
+            .then(|| {
+                self.local_sync_lock
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("local sync lock poisoned"))
+            })
+            .transpose()?;
+        Ok(SyncLockGuards {
+            _remote: remote_guard,
+            _local: local_guard,
+        })
+    }
+
     fn sync_with_options(&self, options: SyncOptions) -> Result<SyncResult> {
-        let _guard = self
-            .sync_lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("sync lock poisoned"))?;
+        let (local, remote) = self.engine.sync_lock_scope(&options);
+        let _guards = self.acquire_sync_locks(local, remote)?;
         let result = self.engine.sync(options)?;
         let _ = self
             .event_sender
@@ -224,6 +250,7 @@ fn options_for_events(engine: &SyncEngine, events: &[Event]) -> SyncOptions {
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(hooks::data_dir);
+    let watch_roots = engine.watch_roots();
     let mut providers = HashSet::new();
     let mut saw_signal = false;
     for event in events {
@@ -235,9 +262,9 @@ fn options_for_events(engine: &SyncEngine, events: &[Event]) -> SyncOptions {
                 }
                 continue;
             }
-            for (provider, root) in engine.watch_roots() {
-                if path_is_under(path, &root) || path_is_under(&root, path) {
-                    providers.insert(provider);
+            for (provider, root) in &watch_roots {
+                if path_is_under(path, root) || path_is_under(root, path) {
+                    providers.insert(*provider);
                 }
             }
         }

@@ -1,13 +1,15 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use llmeter_core::{Provider, ProviderDetection, SourceFile, SourceFormat, SourceMetadata};
+#[cfg(test)]
+use llmeter_core::SourceFormat;
+use llmeter_core::{Provider, ProviderDetection, SourceFile, SourceMetadata};
 use serde_json::Value;
 
 use super::{
     ParsedUsage, ProviderAdapter, counts_from_usage, data_status, home_dir, json_value,
-    jsonl_exists, model, nested, project_name, project_path, session_id, source_event_id,
-    timestamp, usage_snapshot, walk_jsonl,
+    jsonl_exists, jsonl_session_sources, model, nested, project_name, project_path, session_id,
+    source_event_id, timestamp, usage_snapshot, walk_jsonl,
 };
 
 const CODEX_PARSER_VERSION: u32 = 2;
@@ -133,22 +135,7 @@ impl ProviderAdapter for CodexAdapter {
         let mut files = walk_jsonl(&root.join("sessions"))?;
         files.extend(walk_jsonl(&root.join("archived_sessions"))?);
         files.sort();
-        Ok(files
-            .into_iter()
-            .map(|path| {
-                let session_id = path
-                    .file_stem()
-                    .map(|value| value.to_string_lossy().to_string());
-                SourceFile {
-                    path,
-                    provider: Provider::Codex,
-                    format: SourceFormat::Jsonl,
-                    session_id,
-                    project_path: None,
-                    project_name: None,
-                }
-            })
-            .collect())
+        Ok(jsonl_session_sources(files, Provider::Codex, |_| None))
     }
 
     fn update_source_metadata(

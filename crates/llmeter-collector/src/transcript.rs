@@ -510,7 +510,11 @@ fn parse_timestamp_value(value: &Value) -> Option<DateTime<Utc>> {
             DateTime::<Utc>::from_timestamp_millis(millis)
         };
     }
-    let text = value.as_str()?.trim();
+    parse_timestamp_text(value.as_str()?)
+}
+
+fn parse_timestamp_text(text: &str) -> Option<DateTime<Utc>> {
+    let text = text.trim();
     DateTime::parse_from_rfc3339(text)
         .ok()
         .map(|value| value.with_timezone(&Utc))
@@ -608,8 +612,9 @@ fn load_opencode_sqlite(path: &Path, session: &SessionSummary) -> Result<Session
     // session_message. Older installations use message + part instead.
     if let Some(spec) = find_table_spec(&connection, &["session_message"], true)? {
         for row in query_raw_rows(&connection, &spec, session_id)? {
-            let role = infer_raw_role(&row, None);
-            parse_raw_row(&row, role, &mut builder);
+            let data = parse_row_data(&row);
+            let role = infer_raw_role(&row, data.as_ref(), None);
+            parse_raw_row(&row, data.as_ref(), role, &mut builder);
             if builder.messages.len() >= MAX_MESSAGES {
                 builder.truncated = true;
                 break;
@@ -626,22 +631,24 @@ fn load_opencode_sqlite(path: &Path, session: &SessionSummary) -> Result<Session
 
     if let Some(spec) = message_spec {
         for row in query_raw_rows(&connection, &spec, session_id)? {
-            let role = infer_raw_role(&row, None);
+            let data = parse_row_data(&row);
+            let role = infer_raw_role(&row, data.as_ref(), None);
             if let (Some(id), Some(role)) = (row.id.clone(), role) {
                 roles.insert(id, role);
             }
-            parse_raw_row(&row, role, &mut builder);
+            parse_raw_row(&row, data.as_ref(), role, &mut builder);
         }
     }
     if let Some(spec) = part_spec {
         for row in query_raw_rows(&connection, &spec, session_id)? {
+            let data = parse_row_data(&row);
             let role = row
                 .parent_id
                 .as_deref()
                 .and_then(|id| roles.get(id).copied())
-                .or_else(|| infer_raw_role(&row, None))
+                .or_else(|| infer_raw_role(&row, data.as_ref(), None))
                 .or(Some(TranscriptRole::Assistant));
-            parse_raw_row(&row, role, &mut builder);
+            parse_raw_row(&row, data.as_ref(), role, &mut builder);
             if builder.messages.len() >= MAX_MESSAGES {
                 builder.truncated = true;
                 break;
@@ -664,8 +671,9 @@ fn load_qoder_sqlite(path: &Path, session: &SessionSummary) -> Result<SessionTra
     };
     let mut builder = TranscriptBuilder::default();
     for row in query_raw_rows(&connection, &spec, session_id)? {
-        let role = infer_raw_role(&row, Some(TranscriptRole::Assistant));
-        parse_raw_row(&row, role, &mut builder);
+        let data = parse_row_data(&row);
+        let role = infer_raw_role(&row, data.as_ref(), Some(TranscriptRole::Assistant));
+        parse_raw_row(&row, data.as_ref(), role, &mut builder);
         if builder.messages.len() >= MAX_MESSAGES {
             builder.truncated = true;
             break;
@@ -685,8 +693,9 @@ fn load_hermes_sqlite(path: &Path, session: &SessionSummary) -> Result<SessionTr
 
     if let Some(spec) = find_table_spec(&connection, &["messages", "message"], true)? {
         for row in query_raw_rows(&connection, &spec, session_id)? {
-            let role = infer_raw_role(&row, None);
-            parse_raw_row(&row, role, &mut builder);
+            let data = parse_row_data(&row);
+            let role = infer_raw_role(&row, data.as_ref(), None);
+            parse_raw_row(&row, data.as_ref(), role, &mut builder);
             if builder.messages.len() >= MAX_MESSAGES {
                 builder.truncated = true;
                 break;
@@ -785,43 +794,47 @@ fn record_role(value: &Value, fallback: Option<TranscriptRole>) -> Option<Transc
         .or(fallback)
 }
 
-fn infer_raw_role(row: &RawRow, fallback: Option<TranscriptRole>) -> Option<TranscriptRole> {
+/// Parses `row.data` once per row; the value is shared by role inference and
+/// record parsing instead of being re-parsed for each step.
+fn parse_row_data(row: &RawRow) -> Option<Value> {
+    row.data
+        .as_deref()
+        .and_then(|data| serde_json::from_str::<Value>(data).ok())
+}
+
+fn infer_raw_role(
+    row: &RawRow,
+    data: Option<&Value>,
+    fallback: Option<TranscriptRole>,
+) -> Option<TranscriptRole> {
     row.role
         .clone()
         .and_then(parse_role)
+        .or_else(|| data.and_then(|value| record_role(value, None)))
         .or_else(|| {
-            row.data
-                .as_deref()
-                .and_then(|data| serde_json::from_str::<Value>(data).ok())
-                .and_then(|value| record_role(&value, None))
-        })
-        .or_else(|| {
-            row.data
-                .as_deref()
-                .and_then(|data| serde_json::from_str::<Value>(data).ok())
-                .and_then(|value| {
-                    if field(&value, "content").is_some() {
-                        Some(TranscriptRole::Assistant)
-                    } else if field(&value, "text").is_some() {
-                        Some(TranscriptRole::User)
-                    } else {
-                        None
-                    }
-                })
+            data.and_then(|value| {
+                if field(value, "content").is_some() {
+                    Some(TranscriptRole::Assistant)
+                } else if field(value, "text").is_some() {
+                    Some(TranscriptRole::User)
+                } else {
+                    None
+                }
+            })
         })
         .or(fallback)
 }
 
-fn parse_raw_row(row: &RawRow, fallback: Option<TranscriptRole>, builder: &mut TranscriptBuilder) {
-    let timestamp = row
-        .timestamp
-        .as_deref()
-        .and_then(|value| parse_timestamp_value(&Value::String(value.to_string())));
+fn parse_raw_row(
+    row: &RawRow,
+    data: Option<&Value>,
+    fallback: Option<TranscriptRole>,
+    builder: &mut TranscriptBuilder,
+) {
+    let timestamp = row.timestamp.as_deref().and_then(parse_timestamp_text);
     let before = builder.messages.len();
-    if let Some(data) = row.data.as_deref()
-        && let Ok(value) = serde_json::from_str::<Value>(data)
-    {
-        parse_generic_record(&value, fallback, builder);
+    if let Some(value) = data {
+        parse_generic_record(value, fallback, builder);
     }
     if builder.messages.len() == before
         && let Some(content) = row.content.as_deref()
@@ -1278,9 +1291,8 @@ fn load_antigravity_sqlite(path: &Path, _session: &SessionSummary) -> Result<Ses
     use crate::providers::antigravity::{ProtoValue, parse_proto_fields};
 
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let mut stmt = connection.prepare(
-        "SELECT idx, step_type, step_payload, metadata FROM steps ORDER BY idx"
-    )?;
+    let mut stmt = connection
+        .prepare("SELECT idx, step_type, step_payload, metadata FROM steps ORDER BY idx")?;
 
     let mut builder = TranscriptBuilder::default();
     let mut rows = stmt.query([])?;

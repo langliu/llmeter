@@ -130,6 +130,10 @@ impl ProviderAdapter for QoderAdapter {
         })
     }
 
+    fn sync_detection(&self) -> Result<Option<ProviderDetection>> {
+        self.detect().map(Some)
+    }
+
     fn discover_sources(&self) -> Result<Vec<SourceFile>> {
         self.existing_databases()
             .into_iter()
@@ -172,6 +176,9 @@ impl ProviderAdapter for QoderAdapter {
             ))
         })?;
         let mut parsed = Vec::new();
+        // Constant across every row of this source; hashing the path per row
+        // would repeat identical work thousands of times.
+        let source_hash = blake3::hash(source.path.to_string_lossy().as_bytes()).to_hex();
         for row in rows {
             let (
                 row_id,
@@ -217,7 +224,7 @@ impl ProviderAdapter for QoderAdapter {
                 project_path,
                 source_event_id: Some(format!(
                     "{}:{}:{}",
-                    blake3::hash(source.path.to_string_lossy().as_bytes()).to_hex(),
+                    source_hash,
                     request_id.or(session_id).unwrap_or_default(),
                     event_key
                 )),
@@ -266,35 +273,37 @@ fn qoder_model(
     record_extra: Option<&str>,
     preferred: Option<&str>,
 ) -> String {
-    let values = [model_info, record_extra, preferred]
-        .map(|raw| raw.and_then(|raw| serde_json::from_str::<Value>(raw).ok()));
-    values[0]
-        .as_ref()
-        .and_then(|v| v.get("model_key").or_else(|| v.get("modelKey")))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            values[1]
-                .as_ref()
-                .and_then(|v| {
-                    v.pointer("/modelConfig/key")
-                        .or_else(|| v.pointer("/model_config/key"))
-                })
-                .and_then(Value::as_str)
+    // Each fallback source is parsed only if the earlier ones produced nothing.
+    fn model_from<F>(raw: Option<&str>, pick: F) -> Option<String>
+    where
+        F: FnOnce(&Value) -> Option<&Value>,
+    {
+        let value: Value = serde_json::from_str(raw?).ok()?;
+        pick(&value)
+            .and_then(Value::as_str)
+            .filter(|model| !model.trim().is_empty())
+            .map(str::to_string)
+    }
+    model_from(model_info, |value| {
+        value.get("model_key").or_else(|| value.get("modelKey"))
+    })
+    .or_else(|| {
+        model_from(record_extra, |value| {
+            value
+                .pointer("/modelConfig/key")
+                .or_else(|| value.pointer("/model_config/key"))
         })
-        .or_else(|| {
-            values[2]
-                .as_ref()
-                .and_then(|v| {
-                    v.get("model_key")
-                        .or_else(|| v.get("modelKey"))
-                        .or_else(|| v.get("preferred_model"))
-                        .or_else(|| v.get("preferredModel"))
-                })
-                .and_then(Value::as_str)
+    })
+    .or_else(|| {
+        model_from(preferred, |value| {
+            value
+                .get("model_key")
+                .or_else(|| value.get("modelKey"))
+                .or_else(|| value.get("preferred_model"))
+                .or_else(|| value.get("preferredModel"))
         })
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("qoder-agent")
-        .to_string()
+    })
+    .unwrap_or_else(|| "qoder-agent".to_string())
 }
 
 fn file_uri_path(raw: &str) -> Option<PathBuf> {

@@ -155,7 +155,7 @@ impl FromStr for Provider {
             "hermes" | "hermes-agent" | "hermes_agent" => Ok(Self::Hermes),
             "antigravity" | "agy" | "google-antigravity" | "google_antigravity" => {
                 Ok(Self::Antigravity)
-            },
+            }
             other => Err(format!("unsupported provider: {other}")),
         }
     }

@@ -43,11 +43,19 @@ impl PricingSource {
     }
 }
 
+/// Cached lookup result keyed by the raw model string. `None` means the
+/// catalog has no rates for that model.
+type LookupCache = HashMap<String, Option<ModelRates>>;
+
 #[derive(Clone, Debug, Default)]
 pub struct PricingCatalog {
     rates: HashMap<String, ModelRates>,
     suffix_index: HashMap<String, Vec<(String, ModelRates)>>,
     source: PricingSource,
+    /// Lookups run for every synced event and again on full repricing, but the
+    /// set of distinct model strings is tiny; memoizing them skips the
+    /// normalization allocations and O(rates) fallback scans per event.
+    lookup_cache: std::sync::Arc<RwLock<LookupCache>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -125,6 +133,7 @@ impl PricingCatalog {
             rates: HashMap::new(),
             suffix_index: HashMap::new(),
             source: PricingSource::Fallback,
+            lookup_cache: Default::default(),
         }
     }
 
@@ -135,6 +144,7 @@ impl PricingCatalog {
                 rates,
                 suffix_index: HashMap::new(),
                 source,
+                lookup_cache: Default::default(),
             };
         };
         for (name, entry) in object {
@@ -150,6 +160,7 @@ impl PricingCatalog {
             rates,
             suffix_index,
             source,
+            lookup_cache: Default::default(),
         }
     }
 
@@ -162,6 +173,24 @@ impl PricingCatalog {
     }
 
     pub fn lookup(&self, model: &str) -> Option<ModelRates> {
+        let cache = self
+            .lookup_cache
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(cached) = cache.get(model) {
+            return *cached;
+        }
+        drop(cache);
+        let result = self.lookup_uncached(model);
+        let mut cache = self
+            .lookup_cache
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        cache.insert(model.to_string(), result);
+        result
+    }
+
+    fn lookup_uncached(&self, model: &str) -> Option<ModelRates> {
         let normalized = normalize_model(model);
         if normalized.is_empty() {
             return None;

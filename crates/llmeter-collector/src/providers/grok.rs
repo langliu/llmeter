@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use super::{
     ParsedUsage, ProviderAdapter, data_status, home_dir, json_value, nested, project_name,
+    walk_matching,
 };
 
 const GROK_PARSER_VERSION: u32 = 2;
@@ -38,10 +39,9 @@ impl GrokAdapter {
     }
 
     fn files(&self) -> Result<Vec<PathBuf>> {
-        let mut files = Vec::new();
-        collect_updates(&self.sessions_root(), &mut files)?;
-        files.sort();
-        Ok(files)
+        Ok(walk_matching(&self.sessions_root(), |path, _| {
+            path.file_name().is_some_and(|name| name == "updates.jsonl")
+        })?)
     }
 }
 
@@ -136,28 +136,6 @@ impl ProviderAdapter for GrokAdapter {
             reported_cost_usd,
         }))
     }
-}
-
-fn collect_updates(path: &std::path::Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
-        return Ok(());
-    }
-    if metadata.is_file() {
-        if path.file_name().is_some_and(|name| name == "updates.jsonl") {
-            files.push(path.to_path_buf());
-        }
-        return Ok(());
-    }
-    if metadata.is_dir() {
-        for entry in fs::read_dir(path)? {
-            collect_updates(&entry?.path(), files)?;
-        }
-    }
-    Ok(())
 }
 
 fn read_summary(path: PathBuf) -> Option<Value> {

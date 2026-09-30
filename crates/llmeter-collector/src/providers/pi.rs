@@ -1,49 +1,66 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use llmeter_core::{Provider, ProviderDetection, SourceFile, SourceFormat, SourceMetadata};
+use llmeter_core::{Provider, ProviderDetection, SourceFile, SourceMetadata};
 use serde_json::Value;
 
 use super::{
-    ParsedUsage, ProviderAdapter, counts_from_usage, data_status, home_dir, json_value,
-    jsonl_exists, project_name, project_path, session_id, source_event_id, timestamp, walk_jsonl,
+    ParsedUsage, ProviderAdapter, counts_from_usage, data_status, json_value, jsonl_exists,
+    jsonl_session_sources, project_name, project_path, session_id, source_event_id, timestamp,
+    walk_jsonl,
 };
 
 const PI_PARSER_VERSION: u32 = 4;
+const OMP_PARSER_VERSION: u32 = 2;
 
+/// One adapter for the pi and omp agents: omp is a pi derivative that stores
+/// sessions under `~/.omp` with its own parser version.
 #[derive(Clone, Debug)]
-pub struct PiAdapter {
+pub struct PiCompatibleAdapter {
     home: PathBuf,
+    provider: Provider,
 }
 
-impl Default for PiAdapter {
-    fn default() -> Self {
-        Self { home: home_dir() }
-    }
-}
-
-impl PiAdapter {
-    pub fn with_home(home: PathBuf) -> Self {
-        Self { home }
+impl PiCompatibleAdapter {
+    pub fn pi(home: PathBuf) -> Self {
+        Self {
+            home,
+            provider: Provider::Pi,
+        }
     }
 
-    fn roots(&self) -> Vec<PathBuf> {
-        vec![self.home.join(".pi").join("agent").join("sessions")]
-    }
-
-    fn files(&self) -> Result<Vec<PathBuf>> {
-        Ok(walk_jsonl(&self.roots()[0])?)
-    }
-}
-
-impl ProviderAdapter for PiAdapter {
-    fn provider(&self) -> Provider {
-        Provider::Pi
+    pub fn omp(home: PathBuf) -> Self {
+        Self {
+            home,
+            provider: Provider::Omp,
+        }
     }
 
     fn parser_version(&self) -> u32 {
-        PI_PARSER_VERSION
+        match self.provider {
+            Provider::Pi => PI_PARSER_VERSION,
+            _ => OMP_PARSER_VERSION,
+        }
     }
+
+    fn roots(&self) -> Vec<PathBuf> {
+        let agent = match self.provider {
+            Provider::Pi => ".pi",
+            _ => ".omp",
+        };
+        vec![self.home.join(agent).join("agent").join("sessions")]
+    }
+}
+
+impl ProviderAdapter for PiCompatibleAdapter {
+    fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    fn parser_version(&self) -> u32 {
+        self.parser_version()
+    }
+
     fn watch_roots(&self) -> Vec<PathBuf> {
         self.roots()
     }
@@ -61,7 +78,7 @@ impl ProviderAdapter for PiAdapter {
     fn detect(&self) -> Result<ProviderDetection> {
         let roots = self.roots();
         Ok(data_status(
-            Provider::Pi,
+            self.provider,
             roots.clone(),
             jsonl_exists(&roots[0])?,
             None,
@@ -69,20 +86,11 @@ impl ProviderAdapter for PiAdapter {
     }
 
     fn discover_sources(&self) -> Result<Vec<SourceFile>> {
-        Ok(self
-            .files()?
-            .into_iter()
-            .map(|path| SourceFile {
-                session_id: path
-                    .file_stem()
-                    .map(|value| value.to_string_lossy().to_string()),
-                path,
-                provider: Provider::Pi,
-                format: SourceFormat::Jsonl,
-                project_path: None,
-                project_name: None,
-            })
-            .collect())
+        Ok(jsonl_session_sources(
+            walk_jsonl(&self.roots()[0])?,
+            self.provider,
+            |_| None,
+        ))
     }
 
     fn parse_line(&self, source: &SourceFile, line: &[u8]) -> Result<Option<ParsedUsage>> {
@@ -179,7 +187,7 @@ mod tests {
 
     #[test]
     fn parses_pi_usage() {
-        let adapter = PiAdapter::with_home(PathBuf::from("/tmp"));
+        let adapter = PiCompatibleAdapter::pi(PathBuf::from("/tmp"));
         let source = SourceFile::new(PathBuf::from("/tmp/pi.jsonl"), Provider::Pi);
         let line = include_bytes!("../../../../fixtures/pi/basic.jsonl");
         let parsed = adapter.parse_line(&source, line).unwrap().unwrap();
@@ -189,7 +197,7 @@ mod tests {
 
     #[test]
     fn parses_pi_cache_read_and_write_usage() {
-        let adapter = PiAdapter::with_home(PathBuf::from("/tmp"));
+        let adapter = PiCompatibleAdapter::pi(PathBuf::from("/tmp"));
         let source = SourceFile::new(PathBuf::from("/tmp/pi.jsonl"), Provider::Pi);
         let line = br#"{"type":"message_end","sessionId":"pi-cache","model":"gpt-5.6-sol","usage":{"input":100,"output":50,"cacheRead":300,"cacheWrite":20,"totalTokens":470}}"#;
 
@@ -204,7 +212,7 @@ mod tests {
 
     #[test]
     fn ignores_nested_tool_search_usage() {
-        let adapter = PiAdapter::with_home(PathBuf::from("/tmp"));
+        let adapter = PiCompatibleAdapter::pi(PathBuf::from("/tmp"));
         let source = SourceFile::new(PathBuf::from("/tmp/pi.jsonl"), Provider::Pi);
         let line = br#"{"type":"message","message":{"role":"toolResult","toolName":"web_search","details":{"response":{"model":"gpt-5.6-luna","requestId":"resp_search","usage":{"inputTokens":24826,"outputTokens":628,"totalTokens":29038}}}}}"#;
         assert!(adapter.parse_line(&source, line).unwrap().is_none());
@@ -212,7 +220,7 @@ mod tests {
 
     #[test]
     fn parses_assistant_message_usage() {
-        let adapter = PiAdapter::with_home(PathBuf::from("/tmp"));
+        let adapter = PiCompatibleAdapter::pi(PathBuf::from("/tmp"));
         let source = SourceFile::new(PathBuf::from("/tmp/pi.jsonl"), Provider::Pi);
         let line = br#"{"type":"message","timestamp":"2026-08-25T08:50:19Z","message":{"role":"assistant","model":"grok-4.6","usage":{"input":10,"output":3,"cacheRead":4,"totalTokens":17}}}"#;
         let parsed = adapter.parse_line(&source, line).unwrap().unwrap();
@@ -221,5 +229,44 @@ mod tests {
         assert_eq!(parsed.counts.output_tokens, 3);
         assert_eq!(parsed.counts.cached_input_tokens, 4);
         assert_eq!(parsed.counts.total_tokens, 17);
+    }
+
+    // --- omp (pi-compatible) ---
+
+    #[test]
+    fn omp_root_is_not_discovered_by_pi() {
+        let home = std::env::temp_dir().join(format!("llmeter-omp-not-pi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let omp_root = home.join(".omp").join("agent").join("sessions");
+        std::fs::create_dir_all(&omp_root).unwrap();
+        std::fs::write(omp_root.join("session.jsonl"), "{}\n").unwrap();
+
+        let pi = PiCompatibleAdapter::pi(home.clone());
+        let omp = PiCompatibleAdapter::omp(home.clone());
+        assert!(pi.discover_sources().unwrap().is_empty());
+        assert_eq!(omp.discover_sources().unwrap().len(), 1);
+        assert_eq!(omp.discover_sources().unwrap()[0].provider, Provider::Omp);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn parses_omp_usage_as_omp_provider() {
+        let adapter = PiCompatibleAdapter::omp(PathBuf::from("/tmp"));
+        let source = SourceFile::new(PathBuf::from("/tmp/omp.jsonl"), Provider::Omp);
+        let line = br#"{"type":"message_end","sessionId":"01a037cb-3329-7000-baff-3ec556899770","model":"grok-4.6","usage":{"input":10,"output":3,"totalTokens":13}}"#;
+        let parsed = adapter.parse_line(&source, line).unwrap().unwrap();
+        assert_eq!(
+            parsed.session_id.as_deref(),
+            Some("01a037cb-3329-7000-baff-3ec556899770")
+        );
+        assert_eq!(parsed.model.as_deref(), Some("grok-4.6"));
+    }
+
+    #[test]
+    fn ignores_web_search_tool_usage() {
+        let adapter = PiCompatibleAdapter::omp(PathBuf::from("/tmp"));
+        let source = SourceFile::new(PathBuf::from("/tmp/omp.jsonl"), Provider::Omp);
+        let line = br#"{"type":"message","message":{"role":"toolResult","details":{"response":{"model":"gpt-5.6-luna","usage":{"inputTokens":24826,"outputTokens":628,"totalTokens":29038}}}}}"#;
+        assert!(adapter.parse_line(&source, line).unwrap().is_none());
     }
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -76,6 +76,13 @@ pub struct SyncEngine {
     adapters: Arc<Vec<Box<dyn ProviderAdapter>>>,
 }
 
+/// Per-provider state shared by the sync loop: the adapter under sync and its
+/// cursors preloaded in one query.
+struct ProviderSyncContext<'a> {
+    adapter: &'a dyn ProviderAdapter,
+    cursors: &'a HashMap<String, FileCursor>,
+}
+
 impl SyncEngine {
     pub fn new(database: Database) -> Self {
         let adapters = default_adapters(&database);
@@ -142,21 +149,7 @@ impl SyncEngine {
     pub fn sync(&self, options: SyncOptions) -> Result<SyncResult> {
         let started = Instant::now();
         let mut result = SyncResult::default();
-        for adapter in self.adapters.iter() {
-            if adapter.uses_remote_snapshot() {
-                if !options.include_remote_snapshots {
-                    continue;
-                }
-            } else if !options.include_local {
-                continue;
-            }
-            if options
-                .providers
-                .as_ref()
-                .is_some_and(|providers| !providers.contains(&adapter.provider()))
-            {
-                continue;
-            }
+        for adapter in self.selected_adapters(&options) {
             match self.sync_provider(adapter.as_ref(), &mut result) {
                 Ok(()) => {}
                 Err(error) => {
@@ -172,9 +165,43 @@ impl SyncEngine {
         Ok(result)
     }
 
+    fn selected_adapters(
+        &self,
+        options: &SyncOptions,
+    ) -> impl Iterator<Item = &Box<dyn ProviderAdapter>> {
+        self.adapters.iter().filter(|adapter| {
+            let included = if adapter.uses_remote_snapshot() {
+                options.include_remote_snapshots
+            } else {
+                options.include_local
+            };
+            included
+                && options
+                    .providers
+                    .as_ref()
+                    .is_none_or(|providers| providers.contains(&adapter.provider()))
+        })
+    }
+
+    /// Which sync locks a run of `options` needs: `(local, remote)`. Local
+    /// file syncing and slow remote snapshot fetching use separate locks so a
+    /// long Trae/Cursor fetch never delays watcher-triggered local syncs.
+    pub fn sync_lock_scope(&self, options: &SyncOptions) -> (bool, bool) {
+        let mut scope = (false, false);
+        for adapter in self.selected_adapters(options) {
+            if adapter.uses_remote_snapshot() {
+                scope.1 = true;
+            } else {
+                scope.0 = true;
+            }
+        }
+        scope
+    }
+
     fn sync_provider(&self, adapter: &dyn ProviderAdapter, result: &mut SyncResult) -> Result<()> {
-        let detection = adapter.detect()?;
-        if detection.status == ProviderStatus::UnsupportedVersion {
+        if let Some(detection) = adapter.sync_detection()?
+            && detection.status == ProviderStatus::UnsupportedVersion
+        {
             result.warnings.push(format!(
                 "{} data detected but this storage version is not supported: {}",
                 adapter.provider(),
@@ -182,18 +209,22 @@ impl SyncEngine {
             ));
             return Ok(());
         }
+        let context = ProviderSyncContext {
+            adapter,
+            cursors: &self.database.get_cursors_by_provider(adapter.provider())?,
+        };
         let sources = adapter.discover_sources()?;
         for source in sources {
             match source.format {
-                SourceFormat::Jsonl => self.sync_source(adapter, &source, result)?,
+                SourceFormat::Jsonl => self.sync_source(&context, &source, result)?,
                 SourceFormat::Sqlite => {
-                    if self.should_skip_unchanged_source(adapter, &source)? {
+                    if self.should_skip_unchanged_source(&context, &source)? {
                         result.files_scanned += 1;
                         continue;
                     }
-                    let parsed = adapter.parse_sqlite(&source)?;
+                    let parsed = context.adapter.parse_sqlite(&source)?;
                     self.sync_batch_source(
-                        adapter,
+                        &context,
                         &source,
                         parsed,
                         SnapshotPolicy::Upsert,
@@ -202,15 +233,15 @@ impl SyncEngine {
                     )?;
                 }
                 SourceFormat::Snapshot => {
-                    if !adapter.uses_remote_snapshot()
-                        && self.should_skip_unchanged_source(adapter, &source)?
+                    if !context.adapter.uses_remote_snapshot()
+                        && self.should_skip_unchanged_source(&context, &source)?
                     {
                         result.files_scanned += 1;
                         continue;
                     }
-                    let snapshot = adapter.parse_snapshot(&source)?;
+                    let snapshot = context.adapter.parse_snapshot(&source)?;
                     self.sync_batch_source(
-                        adapter,
+                        &context,
                         &source,
                         snapshot.usages,
                         snapshot.policy,
@@ -225,31 +256,35 @@ impl SyncEngine {
 
     fn should_skip_unchanged_source(
         &self,
-        adapter: &dyn ProviderAdapter,
+        context: &ProviderSyncContext<'_>,
         source: &SourceFile,
     ) -> Result<bool> {
-        let Some(cursor) = self.database.get_cursor(&source.path)? else {
+        let Some(cursor) = context.cursors.get(source.path.to_string_lossy().as_ref()) else {
             return Ok(false);
         };
-        if cursor.parser_version != adapter.parser_version() {
+        if cursor.parser_version != context.adapter.parser_version() {
             return Ok(false);
         }
-        Ok(IncrementalJsonlReader::is_unchanged(&source.path, &cursor).unwrap_or(false))
+        Ok(IncrementalJsonlReader::is_unchanged(&source.path, cursor).unwrap_or(false))
     }
 
     fn sync_batch_source(
         &self,
-        adapter: &dyn ProviderAdapter,
+        context: &ProviderSyncContext<'_>,
         source: &SourceFile,
         parsed: Vec<ParsedUsage>,
         policy: SnapshotPolicy,
         snapshot_scope: Option<&str>,
         result: &mut SyncResult,
     ) -> Result<()> {
+        let adapter = context.adapter;
         result.files_scanned += 1;
 
         result.events_seen += parsed.len();
-        let existing_cursor = self.database.get_cursor(&source.path)?;
+        let existing_cursor = context
+            .cursors
+            .get(source.path.to_string_lossy().as_ref())
+            .cloned();
         let parser_changed = existing_cursor
             .as_ref()
             .is_some_and(|cursor| cursor.parser_version != adapter.parser_version());
@@ -310,12 +345,16 @@ impl SyncEngine {
 
     fn sync_source(
         &self,
-        adapter: &dyn ProviderAdapter,
+        context: &ProviderSyncContext<'_>,
         source: &SourceFile,
         result: &mut SyncResult,
     ) -> Result<()> {
+        let adapter = context.adapter;
         result.files_scanned += 1;
-        let existing = self.database.get_cursor(&source.path)?;
+        let existing = context
+            .cursors
+            .get(source.path.to_string_lossy().as_ref())
+            .cloned();
         let mut cursor = existing.unwrap_or_else(|| {
             FileCursor::new(
                 source.path.clone(),
@@ -408,8 +447,8 @@ impl SyncEngine {
                 continue;
             }
             events.push(self.to_usage_event(source, &parsed, counts, line.byte_start, None));
-            cursor.last_event_hash = events.last().map(|event| event.id.clone());
         }
+        cursor.last_event_hash = events.last().map(|event| event.id.clone());
 
         let InsertSummary {
             inserted,

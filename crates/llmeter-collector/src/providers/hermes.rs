@@ -155,6 +155,10 @@ impl ProviderAdapter for HermesAdapter {
         })
     }
 
+    fn sync_detection(&self) -> Result<Option<ProviderDetection>> {
+        self.detect().map(Some)
+    }
+
     fn discover_sources(&self) -> Result<Vec<SourceFile>> {
         self.databases()?
             .into_iter()

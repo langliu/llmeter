@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use llmeter_core::{Provider, ProviderDetection, SourceFile, SourceFormat};
+use llmeter_core::{Provider, ProviderDetection, SourceFile};
 
 use super::{
     PARSER_VERSION, ParsedUsage, ProviderAdapter, counts_from_usage, data_status, home_dir,
-    json_value, jsonl_exists, model, object_for_key, project_name, project_path, session_id,
-    source_event_id, timestamp, walk_jsonl,
+    json_value, jsonl_exists, jsonl_session_sources, model, object_for_key, project_name,
+    project_path, session_id, source_event_id, timestamp, walk_jsonl,
 };
 
 #[derive(Clone, Debug)]
@@ -55,25 +55,15 @@ impl ProviderAdapter for ClaudeAdapter {
 
     fn discover_sources(&self) -> Result<Vec<SourceFile>> {
         let root = self.projects_root();
-        Ok(walk_jsonl(&root)?
-            .into_iter()
-            .map(|path| {
-                let project_name = path
-                    .parent()
+        Ok(jsonl_session_sources(
+            walk_jsonl(&root)?,
+            Provider::Claude,
+            |path| {
+                path.parent()
                     .and_then(|value| value.file_name())
-                    .map(|value| value.to_string_lossy().to_string());
-                SourceFile {
-                    session_id: path
-                        .file_stem()
-                        .map(|value| value.to_string_lossy().to_string()),
-                    path,
-                    provider: Provider::Claude,
-                    format: SourceFormat::Jsonl,
-                    project_path: None,
-                    project_name,
-                }
-            })
-            .collect())
+                    .map(|value| value.to_string_lossy().to_string())
+            },
+        ))
     }
 
     fn parse_line(&self, source: &SourceFile, line: &[u8]) -> Result<Option<ParsedUsage>> {

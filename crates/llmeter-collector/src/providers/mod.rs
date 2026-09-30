@@ -7,8 +7,8 @@ use std::{
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use llmeter_core::{
-    Provider, ProviderDetection, SourceFile, SourceMetadata, TokenCounts, UsageSnapshot,
-    parse_timestamp,
+    Provider, ProviderDetection, SourceFile, SourceFormat, SourceMetadata, TokenCounts,
+    UsageSnapshot, parse_timestamp,
 };
 use serde_json::Value;
 
@@ -20,7 +20,6 @@ mod codex;
 mod cursor;
 mod grok;
 mod hermes;
-mod omp;
 mod opencode;
 mod pi;
 mod qoder;
@@ -34,9 +33,8 @@ pub use cursor::CursorAdapter;
 pub(crate) use cursor::{cursor_root, cursor_session_cookie};
 pub use grok::GrokAdapter;
 pub use hermes::HermesAdapter;
-pub use omp::OmpAdapter;
 pub use opencode::OpenCodeAdapter;
-pub use pi::PiAdapter;
+pub use pi::PiCompatibleAdapter;
 pub use qoder::QoderAdapter;
 pub(crate) use qoder::qoder_root;
 pub use trae::{TRAE_CN_USAGE_SETTING, TraeAdapter};
@@ -91,6 +89,13 @@ pub trait ProviderAdapter: Send + Sync {
         Vec::new()
     }
     fn detect(&self) -> Result<ProviderDetection>;
+    /// Pre-flight probe used by the sync loop to bail on unsupported storage
+    /// versions. Adapters without a schema version (plain JSONL readers)
+    /// return `None` by default so their `detect()` tree walk does not
+    /// duplicate `discover_sources()`.
+    fn sync_detection(&self) -> Result<Option<ProviderDetection>> {
+        Ok(None)
+    }
     fn discover_sources(&self) -> Result<Vec<SourceFile>>;
     fn update_source_metadata(
         &self,
@@ -135,8 +140,8 @@ pub fn default_adapters(database: &Database) -> Vec<Box<dyn ProviderAdapter>> {
         Box::new(QoderAdapter::default()),
         Box::new(TraeAdapter::with_database(database.clone())),
         Box::new(OpenCodeAdapter::default()),
-        Box::new(PiAdapter::default()),
-        Box::new(OmpAdapter::default()),
+        Box::new(PiCompatibleAdapter::pi(home_dir())),
+        Box::new(PiCompatibleAdapter::omp(home_dir())),
         Box::new(ZedAdapter::default()),
         Box::new(GrokAdapter::default()),
         Box::new(HermesAdapter::default()),
@@ -160,37 +165,6 @@ pub(crate) fn nested<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
         })?;
     }
     Some(current)
-}
-
-pub(crate) fn first_number(value: &Value, keys: &[&str]) -> Option<u64> {
-    if let Some(object) = value.as_object() {
-        for key in keys {
-            if let Some(found) = object
-                .get(*key)
-                .or_else(|| {
-                    object
-                        .iter()
-                        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
-                        .map(|(_, value)| value)
-                })
-                .and_then(as_u64)
-            {
-                return Some(found);
-            }
-        }
-        for child in object.values() {
-            if let Some(found) = first_number(child, keys) {
-                return Some(found);
-            }
-        }
-    } else if let Some(array) = value.as_array() {
-        for child in array {
-            if let Some(found) = first_number(child, keys) {
-                return Some(found);
-            }
-        }
-    }
-    None
 }
 
 pub(crate) fn first_string(value: &Value, keys: &[&str]) -> Option<String> {
@@ -289,49 +263,7 @@ pub(crate) fn counts_from_usage(
     value: &Value,
     include_cached_in_total: bool,
 ) -> Option<TokenCounts> {
-    let counts = TokenCounts {
-        input_tokens: first_number(value, &["input_tokens", "inputTokens", "input"])
-            .unwrap_or_default(),
-        cached_input_tokens: first_number(
-            value,
-            &[
-                "cached_input_tokens",
-                "cachedInputTokens",
-                "cache_read_input_tokens",
-                "cacheReadInputTokens",
-                "cacheRead",
-                "cache_read",
-            ],
-        )
-        .unwrap_or_default(),
-        cache_creation_input_tokens: first_number(
-            value,
-            &[
-                "cache_creation_input_tokens",
-                "cacheCreationInputTokens",
-                "cache_write_input_tokens",
-                "cacheWriteInputTokens",
-                "cache_creation",
-                "cacheWrite",
-                "cache_write",
-            ],
-        )
-        .unwrap_or_default(),
-        output_tokens: first_number(value, &["output_tokens", "outputTokens", "output"])
-            .unwrap_or_default(),
-        reasoning_tokens: first_number(
-            value,
-            &[
-                "reasoning_output_tokens",
-                "reasoning_tokens",
-                "reasoningTokens",
-                "reasoning",
-            ],
-        )
-        .unwrap_or_default(),
-        total_tokens: first_number(value, &["total_tokens", "totalTokens", "total"])
-            .unwrap_or_default(),
-    };
+    let counts = UsageFields::default().extract(value);
     if counts.is_zero() {
         return None;
     }
@@ -349,6 +281,130 @@ pub(crate) fn counts_from_usage(
         }
     }
     Some(counts)
+}
+
+const INPUT_KEYS: &[&str] = &["input_tokens", "inputTokens", "input"];
+const CACHED_KEYS: &[&str] = &[
+    "cached_input_tokens",
+    "cachedInputTokens",
+    "cache_read_input_tokens",
+    "cacheReadInputTokens",
+    "cacheRead",
+    "cache_read",
+];
+const CACHE_CREATION_KEYS: &[&str] = &[
+    "cache_creation_input_tokens",
+    "cacheCreationInputTokens",
+    "cache_write_input_tokens",
+    "cacheWriteInputTokens",
+    "cache_creation",
+    "cacheWrite",
+    "cache_write",
+];
+const OUTPUT_KEYS: &[&str] = &["output_tokens", "outputTokens", "output"];
+const REASONING_KEYS: &[&str] = &[
+    "reasoning_output_tokens",
+    "reasoning_tokens",
+    "reasoningTokens",
+    "reasoning",
+];
+const TOTAL_KEYS: &[&str] = &["total_tokens", "totalTokens", "total"];
+
+/// Extracts all six token counters in a single traversal. Equivalent to
+/// running `first_number` once per field, but each node is visited once
+/// instead of once per field.
+#[derive(Default)]
+struct UsageFields {
+    input: Option<u64>,
+    cached: Option<u64>,
+    cache_creation: Option<u64>,
+    output: Option<u64>,
+    reasoning: Option<u64>,
+    total: Option<u64>,
+}
+
+impl UsageFields {
+    fn extract(mut self, value: &Value) -> TokenCounts {
+        self.visit(value);
+        TokenCounts {
+            input_tokens: self.input.unwrap_or_default(),
+            cached_input_tokens: self.cached.unwrap_or_default(),
+            cache_creation_input_tokens: self.cache_creation.unwrap_or_default(),
+            output_tokens: self.output.unwrap_or_default(),
+            reasoning_tokens: self.reasoning.unwrap_or_default(),
+            total_tokens: self.total.unwrap_or_default(),
+        }
+    }
+
+    fn visit(&mut self, value: &Value) {
+        match value {
+            Value::Object(object) => {
+                if self.input.is_none() {
+                    self.input = number_for(object, INPUT_KEYS);
+                }
+                if self.cached.is_none() {
+                    self.cached = number_for(object, CACHED_KEYS);
+                }
+                if self.cache_creation.is_none() {
+                    self.cache_creation = number_for(object, CACHE_CREATION_KEYS);
+                }
+                if self.output.is_none() {
+                    self.output = number_for(object, OUTPUT_KEYS);
+                }
+                if self.reasoning.is_none() {
+                    self.reasoning = number_for(object, REASONING_KEYS);
+                }
+                if self.total.is_none() {
+                    self.total = number_for(object, TOTAL_KEYS);
+                }
+                if self.complete() {
+                    return;
+                }
+                for child in object.values() {
+                    if self.complete() {
+                        return;
+                    }
+                    self.visit(child);
+                }
+            }
+            Value::Array(array) => {
+                for child in array {
+                    if self.complete() {
+                        return;
+                    }
+                    self.visit(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.input.is_some()
+            && self.cached.is_some()
+            && self.cache_creation.is_some()
+            && self.output.is_some()
+            && self.reasoning.is_some()
+            && self.total.is_some()
+    }
+}
+
+fn number_for(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u64> {
+    for key in keys {
+        if let Some(found) = object
+            .get(*key)
+            .or_else(|| {
+                object
+                    .iter()
+                    .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+                    .map(|(_, value)| value)
+            })
+            .and_then(as_u64)
+        {
+            return Some(found);
+        }
+    }
+    None
 }
 
 pub(crate) fn usage_snapshot(value: &Value) -> Option<UsageSnapshot> {
@@ -418,32 +474,49 @@ pub(crate) fn timestamp(value: &Value) -> DateTime<Utc> {
 }
 
 pub(crate) fn walk_jsonl(root: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    if !root.exists() {
-        return Ok(files);
-    }
-    walk_jsonl_inner(root, &mut files)?;
-    files.sort();
-    Ok(files)
+    walk_matching(root, |path, _| {
+        path.extension()
+            .is_some_and(|extension| extension == "jsonl")
+    })
 }
 
 pub(crate) fn jsonl_exists(root: &Path) -> std::io::Result<bool> {
     if !root.exists() {
         return Ok(false);
     }
-    jsonl_exists_inner(root)
+    exists_matching(root, |path, _| {
+        path.extension()
+            .is_some_and(|extension| extension == "jsonl")
+    })
 }
 
-fn walk_jsonl_inner(path: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+/// Recursively walks `root`, skipping symlinks, collecting matching file
+/// paths. Shared by every filesystem-based provider so walk semantics stay
+/// identical (symlink handling, recursion order, sorted results).
+pub(crate) fn walk_matching(
+    root: &Path,
+    filter: impl Fn(&Path, &fs::Metadata) -> bool,
+) -> std::io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if !root.exists() {
+        return Ok(files);
+    }
+    walk_matching_inner(root, &filter, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn walk_matching_inner(
+    path: &Path,
+    filter: &impl Fn(&Path, &fs::Metadata) -> bool,
+    files: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         return Ok(());
     }
     if metadata.is_file() {
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "jsonl")
-        {
+        if filter(path, &metadata) {
             files.push(path.to_path_buf());
         }
         return Ok(());
@@ -452,30 +525,63 @@ fn walk_jsonl_inner(path: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()
         return Ok(());
     }
     for entry in fs::read_dir(path)? {
-        walk_jsonl_inner(&entry?.path(), files)?;
+        walk_matching_inner(&entry?.path(), filter, files)?;
     }
     Ok(())
 }
 
-fn jsonl_exists_inner(path: &Path) -> std::io::Result<bool> {
+/// Early-exit variant of [`walk_matching`] that stops at the first match.
+pub(crate) fn exists_matching(
+    root: &Path,
+    filter: impl Fn(&Path, &fs::Metadata) -> bool,
+) -> std::io::Result<bool> {
+    exists_matching_inner(root, &filter)
+}
+
+fn exists_matching_inner(
+    path: &Path,
+    filter: &impl Fn(&Path, &fs::Metadata) -> bool,
+) -> std::io::Result<bool> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         return Ok(false);
     }
     if metadata.is_file() {
-        return Ok(path
-            .extension()
-            .is_some_and(|extension| extension == "jsonl"));
+        return Ok(filter(path, &metadata));
     }
     if !metadata.is_dir() {
         return Ok(false);
     }
     for entry in fs::read_dir(path)? {
-        if jsonl_exists_inner(&entry?.path())? {
+        if exists_matching_inner(&entry?.path(), filter)? {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Maps discovered JSONL files to session sources keyed by file stem.
+pub(crate) fn jsonl_session_sources(
+    files: Vec<PathBuf>,
+    provider: Provider,
+    project_name: impl Fn(&Path) -> Option<String>,
+) -> Vec<SourceFile> {
+    files
+        .into_iter()
+        .map(|path| {
+            let session_id = path
+                .file_stem()
+                .map(|value| value.to_string_lossy().to_string());
+            SourceFile {
+                session_id,
+                project_name: project_name(&path),
+                path,
+                provider,
+                format: SourceFormat::Jsonl,
+                project_path: None,
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn deduplicate_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
@@ -520,4 +626,69 @@ fn as_u64(value: &Value) -> Option<u64> {
     value
         .as_u64()
         .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn counts_from_usage_reads_flat_and_nested_objects() {
+        let flat = json!({
+            "input_tokens": 10,
+            "cache_read_input_tokens": 5,
+            "cache_creation_input_tokens": 2,
+            "output_tokens": 7,
+            "reasoning_tokens": 3,
+            "total_tokens": 27,
+        });
+        assert_eq!(
+            counts_from_usage(&flat, false).map(|counts| counts.total_tokens),
+            Some(27)
+        );
+
+        // Usage nested under an intermediate object with camelCase aliases.
+        let nested = json!({
+            "payload": {
+                "usage": {
+                    "inputTokens": 10,
+                    "cacheRead": 5,
+                    "cacheWrite": 2,
+                    "outputTokens": 7,
+                    "reasoning": 3,
+                }
+            }
+        });
+        let counts = counts_from_usage(&nested, false).expect("nested usage");
+        assert_eq!(counts.input_tokens, 10);
+        assert_eq!(counts.cached_input_tokens, 5);
+        assert_eq!(counts.cache_creation_input_tokens, 2);
+        assert_eq!(counts.output_tokens, 7);
+        assert_eq!(counts.reasoning_tokens, 3);
+        // Total falls back to input+output+reasoning+cache_creation.
+        assert_eq!(counts.total_tokens, 22);
+        assert_eq!(
+            counts_from_usage(&nested, true).unwrap().total_tokens,
+            27,
+            "cached tokens join the total when included"
+        );
+    }
+
+    #[test]
+    fn counts_from_usage_skips_non_numeric_values_and_prefers_closer_nodes() {
+        // A string under a usage key must be ignored, not counted.
+        let ignored = json!({ "input_tokens": "many", "output_tokens": 4 });
+        let counts = counts_from_usage(&ignored, false).expect("usage found");
+        assert_eq!(counts.input_tokens, 0);
+        assert_eq!(counts.output_tokens, 4);
+
+        // The first matching node in traversal order wins. serde_json maps
+        // iterate alphabetically by default, so "a" is visited before "b".
+        let shadowed = json!({
+            "a": { "input_tokens": 1 },
+            "b": { "input_tokens": 999 },
+        });
+        assert_eq!(counts_from_usage(&shadowed, false).unwrap().input_tokens, 1);
+    }
 }

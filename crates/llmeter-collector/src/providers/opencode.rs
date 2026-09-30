@@ -1,7 +1,4 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -12,7 +9,7 @@ use serde_json::Value;
 use super::{
     ParsedUsage, ProviderAdapter, counts_from_usage, data_status, deduplicate_paths, home_dir,
     json_value, jsonl_exists, model, object_for_key, object_with_usage, project_name, project_path,
-    session_id, source_event_id, timestamp, walk_jsonl,
+    session_id, source_event_id, timestamp, walk_jsonl, walk_matching,
 };
 
 const OPENCODE_PARSER_VERSION: u32 = 2;
@@ -69,7 +66,11 @@ impl OpenCodeAdapter {
     fn sqlite_files(&self) -> Result<Vec<PathBuf>> {
         let mut files = Vec::new();
         for root in self.roots() {
-            collect_extensions(&root, &mut files)?;
+            files.extend(walk_matching(&root, |path, _| {
+                path.extension().is_some_and(|extension| {
+                    extension == "db" || extension == "sqlite" || extension == "sqlite3"
+                })
+            })?);
         }
         Ok(deduplicate_paths(files))
     }
@@ -132,6 +133,10 @@ impl ProviderAdapter for OpenCodeAdapter {
             });
         }
         Ok(data_status(Provider::OpenCode, roots, false, None))
+    }
+
+    fn sync_detection(&self) -> Result<Option<ProviderDetection>> {
+        self.detect().map(Some)
     }
 
     fn discover_sources(&self) -> Result<Vec<SourceFile>> {
@@ -243,30 +248,6 @@ impl ProviderAdapter for OpenCodeAdapter {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
-}
-
-fn collect_extensions(root: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    if !root.exists() {
-        return Ok(());
-    }
-    let metadata = fs::symlink_metadata(root)?;
-    if metadata.file_type().is_symlink() {
-        return Ok(());
-    }
-    if metadata.is_file() {
-        if root.extension().is_some_and(|extension| {
-            extension == "db" || extension == "sqlite" || extension == "sqlite3"
-        }) {
-            files.push(root.to_path_buf());
-        }
-        return Ok(());
-    }
-    if metadata.is_dir() {
-        for entry in fs::read_dir(root)? {
-            collect_extensions(&entry?.path(), files)?;
-        }
-    }
-    Ok(())
 }
 
 fn find_session_table(path: &Path) -> Result<Option<String>> {
