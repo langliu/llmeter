@@ -232,12 +232,7 @@ fn grok_timestamp(value: &Value) -> DateTime<Utc> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        fs,
-        path::{Path, PathBuf},
-        sync::Mutex,
-    };
+    use std::{fs, path::PathBuf};
 
     use chrono::Utc;
     use llmeter_core::{FileCursor, UsageEvent};
