@@ -6,7 +6,9 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use llmeter_core::{FileCursor, Provider, TokenCounts, UsageEvent};
-use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, params, params_from_iter, types::Value,
+};
 use thiserror::Error;
 
 use crate::migrations;
@@ -144,6 +146,17 @@ impl Database {
         self.readers.with(f)
     }
 
+    /// Best-effort WAL checkpoint. Frequent short reads (UI polling on the
+    /// reader pool) keep postponing the automatic checkpoint, so the WAL grows
+    /// unbounded during active syncs; calling this after a sync run lets the
+    /// WAL shrink back toward the autocheckpoint target. PASSIVE mode never
+    /// blocks and simply gives up if readers are still active.
+    pub fn checkpoint(&self) {
+        if let Ok(connection) = self.connection.lock() {
+            let _ = connection.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+        }
+    }
+
     pub fn insert_usage_events(&self, events: &[UsageEvent]) -> Result<usize, StorageError> {
         Ok(self.insert_usage_events_with_summary(events)?.inserted)
     }
@@ -211,7 +224,8 @@ impl Database {
         }
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
-        let summary = upsert_usage_events(&transaction, events)?;
+        let existing = ExistingEventIndex::load(&transaction, events)?;
+        let summary = upsert_usage_events(&transaction, events, &existing)?;
         transaction.commit()?;
         Ok(summary)
     }
@@ -267,23 +281,32 @@ impl Database {
                 params![provider.as_str(), snapshot_scope],
             )?;
         }
+        // Only include active predicates so the planner can use
+        // (provider, source_file) or (provider, timestamp) directly instead of
+        // evaluating OR-NULL residuals per row.
+        let mut where_clause = String::from("provider = ?1");
+        let mut params_vec = vec![Value::Text(provider.as_str().to_string())];
+        if let Some(source) = &source {
+            where_clause.push_str(&format!(" AND source_file = ?{}", params_vec.len() + 1));
+            params_vec.push(Value::Text(source.clone()));
+        }
+        if let Some(since) = since {
+            where_clause.push_str(&format!(" AND timestamp >= ?{}", params_vec.len() + 1));
+            params_vec.push(Value::Integer(since.timestamp()));
+        }
+        if let Some(snapshot_scope) = snapshot_scope {
+            where_clause.push_str(&format!(" AND snapshot_scope = ?{}", params_vec.len() + 1));
+            params_vec.push(Value::Text(snapshot_scope.to_string()));
+        }
+
+        let identities = ExistingEventIndex::load(&transaction, events)?;
         let (existing_ids, previous_tokens) = {
-            let mut statement = transaction.prepare(
-                "SELECT id, total_tokens FROM usage_events
-                WHERE provider = ?1
-                   AND (?2 IS NULL OR source_file = ?2)
-                   AND (?3 IS NULL OR timestamp >= ?3)
-                   AND (?4 IS NULL OR snapshot_scope = ?4)",
-            )?;
-            let rows = statement.query_map(
-                params![
-                    provider.as_str(),
-                    source,
-                    since.map(|value| value.timestamp()),
-                    snapshot_scope,
-                ],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-            )?;
+            let mut statement = transaction.prepare(&format!(
+                "SELECT id, total_tokens FROM usage_events WHERE {where_clause}"
+            ))?;
+            let rows = statement.query_map(params_from_iter(params_vec.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
             let mut database_ids = HashSet::new();
             let mut event_ids = HashSet::new();
             let mut tokens = 0_u64;
@@ -295,7 +318,6 @@ impl Database {
             }
             drop(statement);
 
-            let identities = ExistingEventIndex::load(&transaction, events)?;
             for event in events {
                 if let Some((database_id, total)) = identities.get(event) {
                     event_ids.insert(event.id.clone());
@@ -306,20 +328,10 @@ impl Database {
             }
             (event_ids, tokens)
         };
-        transaction.execute(
-            "DELETE FROM usage_events
-             WHERE provider = ?1
-               AND (?2 IS NULL OR source_file = ?2)
-               AND (?3 IS NULL OR timestamp >= ?3)
-               AND (?4 IS NULL OR snapshot_scope = ?4)",
-            params![
-                provider.as_str(),
-                source,
-                since.map(|value| value.timestamp()),
-                snapshot_scope,
-            ],
-        )?;
-        upsert_usage_events(&transaction, events)?;
+        transaction
+            .prepare_cached(&format!("DELETE FROM usage_events WHERE {where_clause}"))?
+            .execute(params_from_iter(params_vec.iter()))?;
+        upsert_usage_events(&transaction, events, &identities)?;
         let inserted = events
             .iter()
             .filter(|event| !existing_ids.contains(&event.id))
@@ -693,8 +705,8 @@ fn cursor_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileCursor> {
 fn upsert_usage_events(
     transaction: &Transaction<'_>,
     events: &[UsageEvent],
+    existing: &ExistingEventIndex,
 ) -> Result<UpsertSummary, StorageError> {
-    let existing = ExistingEventIndex::load(transaction, events)?;
     let mut statement = transaction.prepare_cached(
         "INSERT INTO usage_events (
             id, provider, model, session_id, project_path, project_name, timestamp,
