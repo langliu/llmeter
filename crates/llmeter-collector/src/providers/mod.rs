@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -595,6 +595,69 @@ pub(crate) fn deduplicate_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec
     }
     result.sort();
     result
+}
+
+/// Size + mtime fingerprint of a file, used to skip unchanged re-reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StorageFingerprint {
+    pub(crate) size: u64,
+    pub(crate) modified: Option<std::time::SystemTime>,
+}
+
+pub(crate) fn storage_fingerprint(path: &Path) -> Option<StorageFingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(StorageFingerprint {
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+/// In-process memo keyed by file path, invalidated when the file fingerprint
+/// changes. Bounds memory by dropping everything past 1024 entries.
+#[derive(Debug)]
+pub(crate) struct PathMemo<T> {
+    entries: std::sync::Mutex<HashMap<PathBuf, (Option<StorageFingerprint>, T)>>,
+}
+
+impl<T: Clone> PathMemo<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn get(&self, path: &Path) -> Option<T> {
+        let fingerprint = storage_fingerprint(path);
+        let mut guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if guard.len() > 1024 {
+            guard.clear();
+        }
+        match guard.get(path) {
+            Some((cached, value)) if *cached == fingerprint => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn insert(&self, path: &Path, value: T) {
+        let fingerprint = storage_fingerprint(path);
+        let mut guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        guard.insert(path.to_path_buf(), (fingerprint, value));
+    }
+
+    pub(crate) fn get_or_compute(&self, path: &Path, compute: impl FnOnce() -> T) -> T {
+        if let Some(value) = self.get(path) {
+            return value;
+        }
+        let value = compute();
+        self.insert(path, value.clone());
+        value
+    }
 }
 
 pub(crate) fn home_dir() -> PathBuf {

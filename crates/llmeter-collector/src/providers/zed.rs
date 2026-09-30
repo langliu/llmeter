@@ -20,12 +20,34 @@ const TELEMETRY_USAGE_MARKER: &str = "Agent Thread Completion Usage Updated";
 
 type PromptTimes = HashMap<String, Vec<DateTime<Utc>>>;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PromptLogFingerprint {
     path: PathBuf,
     identity: Option<String>,
     size: u64,
     modified_at: Option<i64>,
+}
+
+/// Identifies one row of the threads table by its logical content: Zed bumps
+/// `updated_at` whenever a thread is rewritten, and the blob length guards
+/// against same-timestamp rewrites.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ThreadKey {
+    thread_id: String,
+    updated_at: String,
+    data_type: String,
+    data_len: usize,
+}
+
+/// The expensive part of a thread parse (zstd decode, JSON parse, usage
+/// extraction) hoisted out of the timestamp pass, which depends on
+/// still-changing prompt log data.
+#[derive(Clone, Debug)]
+struct CachedThread {
+    model: Option<String>,
+    project_path: Option<PathBuf>,
+    user_message_ids: Vec<String>,
+    requests: Vec<(String, TokenCounts)>,
 }
 
 pub struct ZedAdapter {
@@ -35,7 +57,75 @@ pub struct ZedAdapter {
     prompt_logs: Mutex<Vec<PromptLogFingerprint>>,
     prompt_index: Mutex<HashMap<PathBuf, HashMap<String, usize>>>,
     prompt_stamps: Mutex<HashMap<(PathBuf, String, String), DateTime<Utc>>>,
-    telemetry_ids: Mutex<Option<(Vec<PromptLogFingerprint>, HashSet<String>)>>,
+    telemetry_ids: Mutex<HashMap<PathBuf, TelemetryLogScan>>,
+    prompt_scans: Mutex<HashMap<PathBuf, PromptLogScan>>,
+    thread_cache: Mutex<HashMap<PathBuf, HashMap<ThreadKey, CachedThread>>>,
+}
+
+/// Per-log incremental scan state for telemetry.log thread ids.
+#[derive(Default)]
+struct TelemetryLogScan {
+    fingerprint: PromptLogFingerprint,
+    /// Byte offset just past the last fully consumed line.
+    offset: u64,
+    ids: HashSet<String>,
+}
+
+/// Per-log incremental scan state for Zed.log prompt request times.
+#[derive(Clone, Debug, Default)]
+struct PromptLogScan {
+    fingerprint: PromptLogFingerprint,
+    offset: u64,
+    times: HashMap<String, Vec<DateTime<Utc>>>,
+}
+
+/// What a fingerprint change means for the stored scan of one log.
+enum LogScanAction {
+    Unchanged,
+    Append(u64),
+    Full,
+}
+
+fn log_scan_action(
+    scan: Option<(&PromptLogFingerprint, u64)>,
+    next: &PromptLogFingerprint,
+) -> LogScanAction {
+    match scan {
+        Some((fingerprint, offset))
+            if fingerprint.identity == next.identity && next.size >= fingerprint.size =>
+        {
+            if next.size == fingerprint.size {
+                if next.modified_at == fingerprint.modified_at {
+                    LogScanAction::Unchanged
+                } else {
+                    // Same length but touched: treat as an in-place rewrite.
+                    LogScanAction::Full
+                }
+            } else {
+                LogScanAction::Append(offset)
+            }
+        }
+        _ => LogScanAction::Full,
+    }
+}
+
+/// Reads complete lines appended after `from`, holding back a trailing
+/// partial line. Returns `None` when the file shrank below `from` (the caller
+/// must re-read from the start).
+fn read_appended_lines(path: &Path, from: u64) -> std::io::Result<Option<(u64, String)>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    if file.metadata()?.len() < from {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(from))?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
+    let Some(last_newline) = buffer.iter().rposition(|&byte| byte == b'\n') else {
+        return Ok(Some((from, String::new())));
+    };
+    let complete = String::from_utf8_lossy(&buffer[..=last_newline]).into_owned();
+    Ok(Some((from + last_newline as u64 + 1, complete)))
 }
 
 impl Default for ZedAdapter {
@@ -78,7 +168,9 @@ impl ZedAdapter {
             prompt_logs: Mutex::new(Vec::new()),
             prompt_index: Mutex::new(HashMap::new()),
             prompt_stamps: Mutex::new(HashMap::new()),
-            telemetry_ids: Mutex::new(None),
+            telemetry_ids: Mutex::new(HashMap::new()),
+            prompt_scans: Mutex::new(HashMap::new()),
+            thread_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -113,42 +205,70 @@ impl ZedAdapter {
 
     fn telemetry_usage_thread_ids(&self) -> HashSet<String> {
         let logs = self.existing_telemetry();
-        let fingerprint = prompt_log_fingerprints(&logs);
-        if let Some((previous, ids)) = self
+        let fingerprints = prompt_log_fingerprints(&logs);
+        let mut scans = self
             .telemetry_ids
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            && previous == &fingerprint
-        {
-            return ids.clone();
-        }
-        let mut ids = HashSet::new();
-        for path in logs {
-            let Ok(text) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            for line in text.lines() {
-                if !line.contains(TELEMETRY_USAGE_MARKER) {
-                    continue;
+            .unwrap_or_else(|error| error.into_inner());
+        scans.retain(|path, _| fingerprints.iter().any(|fp| &fp.path == path));
+        for fp in fingerprints {
+            let action = log_scan_action(
+                scans
+                    .get(&fp.path)
+                    .map(|scan| (&scan.fingerprint, scan.offset)),
+                &fp,
+            );
+            match action {
+                LogScanAction::Unchanged => {}
+                LogScanAction::Append(offset) => {
+                    let scan = scans.get_mut(&fp.path).expect("append requires a scan");
+                    match read_appended_lines(&fp.path, offset) {
+                        Ok(Some((new_offset, lines))) if new_offset >= offset => {
+                            for line in lines.lines() {
+                                if let Some(id) = telemetry_thread_id(line) {
+                                    scan.ids.insert(id);
+                                }
+                            }
+                            scan.offset = new_offset;
+                            scan.fingerprint = fp;
+                        }
+                        // Shrank under us or unreadable: fall back to a full
+                        // re-read of this log.
+                        _ => self.rescan_telemetry_log(&mut scans, &fp),
+                    }
                 }
-                let Ok(value) = serde_json::from_str::<Value>(line) else {
-                    continue;
-                };
-                if let Some(thread_id) = value
-                    .get("event_properties")
-                    .and_then(|properties| properties.get("thread_id"))
-                    .and_then(Value::as_str)
-                {
-                    ids.insert(thread_id.to_string());
-                }
+                LogScanAction::Full => self.rescan_telemetry_log(&mut scans, &fp),
             }
         }
-        *self
-            .telemetry_ids
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some((fingerprint, ids.clone()));
+        let mut ids = HashSet::new();
+        for scan in scans.values() {
+            ids.extend(scan.ids.iter().cloned());
+        }
         ids
+    }
+
+    fn rescan_telemetry_log(
+        &self,
+        scans: &mut HashMap<PathBuf, TelemetryLogScan>,
+        fingerprint: &PromptLogFingerprint,
+    ) {
+        match read_appended_lines(&fingerprint.path, 0) {
+            Ok(Some((offset, lines))) => {
+                let mut scan = TelemetryLogScan::default();
+                for line in lines.lines() {
+                    if let Some(id) = telemetry_thread_id(line) {
+                        scan.ids.insert(id);
+                    }
+                }
+                scan.offset = offset;
+                scan.fingerprint = fingerprint.clone();
+                scans.insert(fingerprint.path.clone(), scan);
+            }
+            // Unreadable: drop the stale scan so a later sync retries.
+            _ => {
+                scans.remove(&fingerprint.path);
+            }
+        }
     }
 
     fn refresh_prompt_times(&self) {
@@ -167,11 +287,43 @@ impl ZedAdapter {
         if cached && previous == fingerprint {
             return;
         }
-        *self
-            .prompt_times
+        let mut scans = self
+            .prompt_scans
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) =
-            Some(Arc::new(all_prompt_request_times(&logs)));
+            .unwrap_or_else(|error| error.into_inner());
+        scans.retain(|path, _| fingerprint.iter().any(|fp| &fp.path == path));
+        for fp in &fingerprint {
+            let action = log_scan_action(
+                scans
+                    .get(&fp.path)
+                    .map(|scan| (&scan.fingerprint, scan.offset)),
+                fp,
+            );
+            match action {
+                LogScanAction::Unchanged => {}
+                LogScanAction::Append(offset) => {
+                    let scan = scans.get_mut(&fp.path).expect("append requires a scan");
+                    match read_appended_lines(&fp.path, offset) {
+                        Ok(Some((new_offset, lines))) if new_offset >= offset => {
+                            for line in lines.lines() {
+                                if let Some((thread_id, stamp)) = parse_prompt_line(line) {
+                                    scan.times
+                                        .entry(thread_id)
+                                        .or_default()
+                                        .push(parse_timestamp(Some(&Value::String(stamp))));
+                                }
+                            }
+                            scan.offset = new_offset;
+                            scan.fingerprint = fp.clone();
+                        }
+                        _ => self.rescan_prompt_log(&mut scans, fp),
+                    }
+                }
+                LogScanAction::Full => self.rescan_prompt_log(&mut scans, fp),
+            }
+        }
+        drop(scans);
+        self.rebuild_prompt_times();
         if prompt_logs_rewound(&previous, &fingerprint) {
             self.reset_prompt_indexes(None);
         }
@@ -179,6 +331,56 @@ impl ZedAdapter {
             .prompt_logs
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = fingerprint;
+    }
+
+    fn rescan_prompt_log(
+        &self,
+        scans: &mut HashMap<PathBuf, PromptLogScan>,
+        fingerprint: &PromptLogFingerprint,
+    ) {
+        match read_appended_lines(&fingerprint.path, 0) {
+            Ok(Some((offset, lines))) => {
+                let mut scan = PromptLogScan::default();
+                for line in lines.lines() {
+                    if let Some((thread_id, stamp)) = parse_prompt_line(line) {
+                        scan.times
+                            .entry(thread_id)
+                            .or_default()
+                            .push(parse_timestamp(Some(&Value::String(stamp))));
+                    }
+                }
+                scan.offset = offset;
+                scan.fingerprint = fingerprint.clone();
+                scans.insert(fingerprint.path.clone(), scan);
+            }
+            _ => {
+                scans.remove(&fingerprint.path);
+            }
+        }
+    }
+
+    /// Merges every per-log scan into the shared prompt-time index.
+    fn rebuild_prompt_times(&self) {
+        let scans = self
+            .prompt_scans
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut times: PromptTimes = HashMap::new();
+        for scan in scans.values() {
+            for (thread_id, stamps) in &scan.times {
+                times
+                    .entry(thread_id.clone())
+                    .or_default()
+                    .extend(stamps.iter().copied());
+            }
+        }
+        for stamps in times.values_mut() {
+            stamps.sort();
+        }
+        *self
+            .prompt_times
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Arc::new(times));
     }
 
     fn prompt_times(&self) -> Arc<HashMap<String, Vec<DateTime<Utc>>>> {
@@ -336,8 +538,10 @@ impl ProviderAdapter for ZedAdapter {
             });
         }
 
+        let mut has_thread_data = false;
         for path in &databases {
-            if !supported_schema(path)? {
+            let (supported, thread_count) = schema_thread_count(path)?;
+            if !supported {
                 return Ok(ProviderDetection {
                     provider: Provider::Zed,
                     status: ProviderStatus::UnsupportedVersion,
@@ -348,13 +552,8 @@ impl ProviderAdapter for ZedAdapter {
                     )),
                 });
             }
+            has_thread_data |= thread_count > 0;
         }
-        let has_thread_data = databases
-            .iter()
-            .map(|path| supported_thread_count(path))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .any(|count| count > 0);
         let has_data = has_thread_data || !telemetry.is_empty();
         Ok(ProviderDetection {
             provider: Provider::Zed,
@@ -437,28 +636,32 @@ impl ProviderAdapter for ZedAdapter {
         })?;
 
         let mut parsed = Vec::new();
+        let mut fresh_cache = HashMap::new();
+        let mut cache_guard = self
+            .thread_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let cache = cache_guard.entry(source.path.clone()).or_default();
         for row in rows {
             let (thread_id, updated_at, data_type, data, folder_paths) = row?;
             if skip_threads.contains(&thread_id) {
                 continue;
             }
-            let json = match data_type.as_str() {
-                "json" => data,
-                "zstd" => zstd::decode_all(data.as_slice())
-                    .with_context(|| format!("decompress Zed thread {thread_id}"))?,
-                other => anyhow::bail!("unsupported Zed thread data type: {other}"),
+            let key = ThreadKey {
+                thread_id: thread_id.clone(),
+                updated_at: updated_at.clone(),
+                data_type: data_type.clone(),
+                data_len: data.len(),
             };
-            let thread: Value = serde_json::from_slice(&json)
-                .with_context(|| format!("decode Zed thread {thread_id}"))?;
-            let model = thread
-                .get("model")
-                .and_then(|value| value.get("model"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let project_path = folder_paths.as_deref().and_then(first_folder_path);
+            // Unchanged threads skip the zstd decode, JSON parse, and usage
+            // walk entirely; only the timestamp pass reruns.
+            let cached = match cache.remove(&key) {
+                Some(cached) => cached,
+                None => parse_thread_blob(&thread_id, &data_type, &data, folder_paths.as_deref())?,
+            };
             let fallback = parse_timestamp(Some(&Value::String(updated_at)));
             let request_times = request_timestamps(
-                &user_message_ids(&thread),
+                &cached.user_message_ids,
                 prompt_times
                     .get(&thread_id)
                     .map(Vec::as_slice)
@@ -466,61 +669,115 @@ impl ProviderAdapter for ZedAdapter {
                 fallback,
             );
 
-            let mut requests = request_usages(&thread);
-            if requests.is_empty()
-                && let Some(counts) = thread.get("cumulative_token_usage").and_then(zed_counts)
-            {
-                requests.push(("cumulative".into(), counts));
-            }
-            for (request_id, counts) in requests {
+            for (request_id, counts) in &cached.requests {
                 parsed.push(ParsedUsage {
-                    counts,
+                    counts: *counts,
                     cumulative_snapshot: None,
-                    timestamp: request_times.get(&request_id).copied().unwrap_or(fallback),
-                    model: model.clone(),
+                    timestamp: request_times.get(request_id).copied().unwrap_or(fallback),
+                    model: cached.model.clone(),
                     session_id: Some(thread_id.clone()),
-                    project_name: project_name(project_path.as_deref()),
-                    project_path: project_path.clone(),
+                    project_name: project_name(cached.project_path.as_deref()),
+                    project_path: cached.project_path.clone(),
                     source_event_id: Some(format!("thread:{thread_id}:request:{request_id}")),
                     reported_cost_usd: None,
                 });
             }
+            fresh_cache.insert(key, cached);
         }
+        // Replace wholesale so threads deleted from the database drop their
+        // cache entries too.
+        *cache = fresh_cache;
         Ok(parsed)
     }
 }
 
+/// Decompresses and parses one thread blob into its stable, timestamp-free
+/// parts.
+fn parse_thread_blob(
+    thread_id: &str,
+    data_type: &str,
+    data: &[u8],
+    folder_paths: Option<&str>,
+) -> Result<CachedThread> {
+    let json = match data_type {
+        "json" => data.to_vec(),
+        "zstd" => {
+            zstd::decode_all(data).with_context(|| format!("decompress Zed thread {thread_id}"))?
+        }
+        other => anyhow::bail!("unsupported Zed thread data type: {other}"),
+    };
+    let thread: Value =
+        serde_json::from_slice(&json).with_context(|| format!("decode Zed thread {thread_id}"))?;
+    let model = thread
+        .get("model")
+        .and_then(|value| value.get("model"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let project_path = folder_paths.and_then(first_folder_path);
+    let mut requests = request_usages(&thread);
+    if requests.is_empty()
+        && let Some(counts) = thread.get("cumulative_token_usage").and_then(zed_counts)
+    {
+        requests.push(("cumulative".into(), counts));
+    }
+    Ok(CachedThread {
+        model,
+        project_path,
+        user_message_ids: user_message_ids(&thread),
+        requests,
+    })
+}
+
 fn all_prompt_request_times(logs: &[PathBuf]) -> HashMap<String, Vec<DateTime<Utc>>> {
-    const MARKER: &str = "Received prompt request for session: ";
     let mut times = HashMap::<String, Vec<DateTime<Utc>>>::new();
     for path in logs {
         let Ok(text) = std::fs::read_to_string(path) else {
             continue;
         };
         for line in text.lines() {
-            let Some(marker_at) = line.find(MARKER) else {
-                continue;
-            };
-            let Some(stamp) = line.split_whitespace().next() else {
-                continue;
-            };
-            let thread_id = line[marker_at + MARKER.len()..]
-                .split_whitespace()
-                .next()
-                .unwrap_or_default();
-            if thread_id.is_empty() {
-                continue;
+            if let Some((thread_id, stamp)) = parse_prompt_line(line) {
+                times
+                    .entry(thread_id)
+                    .or_default()
+                    .push(parse_timestamp(Some(&Value::String(stamp))));
             }
-            times
-                .entry(thread_id.to_string())
-                .or_default()
-                .push(parse_timestamp(Some(&Value::String(stamp.to_string()))));
         }
     }
     for list in times.values_mut() {
         list.sort();
     }
     times
+}
+
+const PROMPT_REQUEST_MARKER: &str = "Received prompt request for session: ";
+
+/// Extracts `(thread_id, timestamp text)` from one Zed.log prompt line. The
+/// stamp is returned unparsed so callers keep pushing an entry even when it
+/// cannot be parsed (matching the original line-walk behavior).
+fn parse_prompt_line(line: &str) -> Option<(String, String)> {
+    let marker_at = line.find(PROMPT_REQUEST_MARKER)?;
+    let stamp = line.split_whitespace().next()?.to_string();
+    let thread_id = line[marker_at + PROMPT_REQUEST_MARKER.len()..]
+        .split_whitespace()
+        .next()
+        .unwrap_or_default();
+    if thread_id.is_empty() {
+        return None;
+    }
+    Some((thread_id.to_string(), stamp))
+}
+
+/// Extracts the thread id from one telemetry.log usage line.
+fn telemetry_thread_id(line: &str) -> Option<String> {
+    if !line.contains(TELEMETRY_USAGE_MARKER) {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    value
+        .get("event_properties")?
+        .get("thread_id")?
+        .as_str()
+        .map(str::to_string)
 }
 
 fn supported_schema(path: &Path) -> Result<bool> {
@@ -544,14 +801,36 @@ fn supported_schema(path: &Path) -> Result<bool> {
         .all(|required| columns.iter().any(|column| column == required)))
 }
 
-fn supported_thread_count(path: &Path) -> Result<u64> {
+/// Checks the threads schema and counts usable threads with a single
+/// connection so detect() opens each database once.
+fn schema_thread_count(path: &Path) -> Result<(bool, u64)> {
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads'",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if !exists {
+        return Ok((false, 0));
+    }
+    let mut statement = connection.prepare("PRAGMA table_info('threads')")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let supported = REQUIRED_COLUMNS
+        .iter()
+        .all(|required| columns.iter().any(|column| column == required));
+    if !supported {
+        return Ok((false, 0));
+    }
     let count = connection.query_row(
         "SELECT count(*) FROM threads WHERE data_type IN ('json', 'zstd')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
-    Ok(count.max(0) as u64)
+    Ok((true, count.max(0) as u64))
 }
 
 fn request_usages(thread: &Value) -> Vec<(String, TokenCounts)> {

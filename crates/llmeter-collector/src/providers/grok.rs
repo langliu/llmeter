@@ -1,4 +1,7 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -6,16 +9,19 @@ use llmeter_core::{Provider, ProviderDetection, SourceFile, SourceFormat, TokenC
 use serde_json::Value;
 
 use super::{
-    ParsedUsage, ProviderAdapter, data_status, home_dir, json_value, nested, project_name,
-    walk_matching,
+    ParsedUsage, PathMemo, ProviderAdapter, data_status, home_dir, json_value, nested,
+    project_name, walk_matching,
 };
 
 const GROK_PARSER_VERSION: u32 = 2;
 const USD_TICKS_PER_DOLLAR: f64 = 10_000_000_000.0;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct GrokAdapter {
     root: PathBuf,
+    /// summary.json contents, refreshed only when the file fingerprint
+    /// changes; discovery walks every session on each sync.
+    summaries: PathMemo<Option<Value>>,
 }
 
 impl Default for GrokAdapter {
@@ -23,7 +29,10 @@ impl Default for GrokAdapter {
         let root = std::env::var_os("GROK_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home_dir().join(".grok"));
-        Self { root }
+        Self {
+            root,
+            summaries: PathMemo::new(),
+        }
     }
 }
 
@@ -31,7 +40,13 @@ impl GrokAdapter {
     pub fn with_home(home: PathBuf) -> Self {
         Self {
             root: home.join(".grok"),
+            summaries: PathMemo::new(),
         }
+    }
+
+    fn cached_summary(&self, path: &Path) -> Option<Value> {
+        self.summaries
+            .get_or_compute(path, || read_summary(path.to_path_buf()))
     }
 
     fn sessions_root(&self) -> PathBuf {
@@ -74,7 +89,7 @@ impl ProviderAdapter for GrokAdapter {
                 let session_dir = path
                     .parent()
                     .ok_or_else(|| anyhow::anyhow!("Grok updates file has no session directory"))?;
-                let summary = read_summary(session_dir.join("summary.json"));
+                let summary = self.cached_summary(&session_dir.join("summary.json"));
                 let session_id = summary
                     .as_ref()
                     .and_then(|value| nested(value, &["info", "id"]))
@@ -217,7 +232,12 @@ fn grok_timestamp(value: &Value) -> DateTime<Utc> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        collections::HashMap,
+        fs,
+        path::{Path, PathBuf},
+        sync::Mutex,
+    };
 
     use chrono::Utc;
     use llmeter_core::{FileCursor, UsageEvent};

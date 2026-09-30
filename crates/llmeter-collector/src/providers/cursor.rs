@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     io::Read,
     path::{Path, PathBuf},
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -13,8 +14,8 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
 use super::{
-    ParsedSnapshot, ParsedUsage, ProviderAdapter, SnapshotPolicy, data_status, home_dir,
-    snapshot_scope,
+    ParsedSnapshot, ParsedUsage, PathMemo, ProviderAdapter, SnapshotPolicy, StorageFingerprint,
+    data_status, home_dir, snapshot_scope, storage_fingerprint,
 };
 
 const CURSOR_PARSER_VERSION: u32 = 2;
@@ -68,7 +69,31 @@ pub(crate) fn cursor_account_scope(home: &Path, platform: &str) -> Option<String
     Some(snapshot_scope(Provider::Cursor, &subject))
 }
 
+/// Memoized Cursor identity (state.vscdb open + JWT decode), keyed by the
+/// fingerprints of state.vscdb and cli-config.json. Each sync otherwise
+/// derives the identity up to four times across detect, discovery, and
+/// snapshot parsing.
 fn cursor_identity(home: &Path, state: &Path) -> Option<(String, String)> {
+    /// Fingerprint of both files the identity derives from.
+    type IdentityKey = (Option<StorageFingerprint>, Option<StorageFingerprint>);
+    type IdentityEntry = (IdentityKey, Option<(String, String)>);
+    static CACHE: OnceLock<PathMemo<IdentityEntry>> = OnceLock::new();
+    let cache = CACHE.get_or_init(PathMemo::new);
+    let key: IdentityKey = (
+        storage_fingerprint(state),
+        storage_fingerprint(&home.join(".cursor/cli-config.json")),
+    );
+    if let Some((cached_key, identity)) = cache.get(state)
+        && cached_key == key
+    {
+        return identity;
+    }
+    let identity = cursor_identity_uncached(home, state);
+    cache.insert(state, (key, identity.clone()));
+    identity
+}
+
+fn cursor_identity_uncached(home: &Path, state: &Path) -> Option<(String, String)> {
     let token = read_cursor_access_token(state)?;
     let subject = read_json_file(&home.join(".cursor/cli-config.json"))
         .and_then(|value| {

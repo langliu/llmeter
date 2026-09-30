@@ -162,6 +162,10 @@ impl SyncEngine {
             }
         }
         result.duration_ms = started.elapsed().as_millis();
+        // Keep the WAL small: short UI reads on the reader pool keep
+        // postponing the automatic checkpoint, so give SQLite a chance to
+        // flush after the write burst.
+        self.database.checkpoint();
         Ok(result)
     }
 

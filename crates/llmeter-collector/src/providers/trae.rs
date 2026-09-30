@@ -3,6 +3,7 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -20,7 +21,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha512};
 
 use super::{
-    ParsedSnapshot, ParsedUsage, ProviderAdapter, SnapshotPolicy, data_status, home_dir,
+    ParsedSnapshot, ParsedUsage, PathMemo, ProviderAdapter, SnapshotPolicy, data_status, home_dir,
     snapshot_scope,
 };
 
@@ -226,7 +227,21 @@ fn read_trae_cn_token(storage: &Path) -> Result<Option<String>> {
     Ok(read_trae_cn_identity(storage)?.map(|(token, _)| token))
 }
 
+/// Memoized TRAE CN identity: the base64+SHA-512+AES decryption otherwise
+/// reruns on every detect/discover; the token only ever lives in process
+/// memory, keyed by the storage file fingerprint.
 fn read_trae_cn_identity(storage: &Path) -> Result<Option<(String, String)>> {
+    static CACHE: OnceLock<PathMemo<Option<(String, String)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(PathMemo::new);
+    if let Some(identity) = cache.get(storage) {
+        return Ok(identity);
+    }
+    let identity = read_trae_cn_identity_uncached(storage)?;
+    cache.insert(storage, identity.clone());
+    Ok(identity)
+}
+
+fn read_trae_cn_identity_uncached(storage: &Path) -> Result<Option<(String, String)>> {
     let bytes = match fs::read(storage) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
