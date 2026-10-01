@@ -2,16 +2,18 @@ use std::{collections::HashSet, rc::Rc};
 
 use chrono::{Datelike, Duration, Local, Timelike};
 use gpui::{
-    AnyElement, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement,
-    Pixels, Render, SharedString, Size, Window, deferred, div, prelude::*, px, size,
+    AnyElement, Context, Entity, FontWeight, HighlightStyle, InteractiveElement, IntoElement,
+    ParentElement, Pixels, Render, SharedString, Size, Window, deferred, div, prelude::*, px, rems,
+    size,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, VirtualListScrollHandle,
     button::{Button, ButtonGroup, ButtonVariants},
     h_flex,
+    highlighter::HighlightTheme,
     input::Input,
     sheet::Sheet,
-    text::TextView,
+    text::{TextView, TextViewStyle},
     v_flex, v_virtual_list,
 };
 use llmeter_collector::{SessionTranscript, TranscriptMessage, TranscriptRole};
@@ -859,12 +861,36 @@ fn user_bubble(message: &TranscriptMessage, p: Palette) -> AnyElement {
 }
 
 fn assistant_text(message: &TranscriptMessage, index: usize, p: Palette) -> AnyElement {
+    // The renderer defaults shout: 1.5rem headings, 1rem paragraph gaps, and
+    // inline code tinted with the theme accent. ZCode keeps everything
+    // compact — headings barely above body size, neutral chips, tight
+    // paragraphs — so rein all three in.
+    let chip_ground = p.foreground.opacity(if p.is_dark { 0.12 } else { 0.08 });
+    let mut style = TextViewStyle::default();
+    style.is_dark = p.is_dark;
+    style.highlight_theme = if p.is_dark {
+        HighlightTheme::default_dark()
+    } else {
+        HighlightTheme::default_light()
+    };
+    let style = style
+        .paragraph_gap(rems(0.5))
+        .heading_font_size(|level, base| match level {
+            1 => base + px(3.0),
+            2 => base + px(2.0),
+            _ => base + px(1.0),
+        })
+        .inline_code(HighlightStyle {
+            background_color: Some(chip_ground),
+            ..HighlightStyle::default()
+        });
     // Assistant replies carry Markdown (bold, headings, inline code, lists);
     // render them richly like ZCode instead of showing the raw source.
     TextView::markdown(
         SharedString::from(format!("assistant-md-{index}")),
         &message.content,
     )
+    .style(style)
     .w_full()
     .text_sm()
     .text_color(p.foreground)
