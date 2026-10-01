@@ -11,6 +11,7 @@ use gpui_component::{
     h_flex,
     input::Input,
     sheet::Sheet,
+    text::TextView,
     v_flex, v_virtual_list,
 };
 use llmeter_collector::{SessionTranscript, TranscriptMessage, TranscriptRole};
@@ -505,11 +506,52 @@ enum TranscriptLoadState {
     Failed(String),
 }
 
+/// One renderable row of the transcript. Consecutive thinking/tool messages
+/// collapse into a single `Steps` row so a work phase reads as one entry
+/// ("worked 6m 46s") instead of one line per step, matching ZCode's layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TranscriptRow {
+    Message(usize),
+    Steps {
+        /// Inclusive index of the first thinking/tool message.
+        start: usize,
+        /// Exclusive index past the last thinking/tool message.
+        end: usize,
+    },
+}
+
+fn transcript_rows(messages: &[TranscriptMessage]) -> Vec<TranscriptRow> {
+    let mut rows = Vec::new();
+    let mut index = 0;
+    while index < messages.len() {
+        if matches!(
+            messages[index].role,
+            TranscriptRole::Thinking | TranscriptRole::Tool
+        ) {
+            let start = index;
+            while index < messages.len()
+                && matches!(
+                    messages[index].role,
+                    TranscriptRole::Thinking | TranscriptRole::Tool
+                )
+            {
+                index += 1;
+            }
+            rows.push(TranscriptRow::Steps { start, end: index });
+        } else {
+            rows.push(TranscriptRow::Message(index));
+            index += 1;
+        }
+    }
+    rows
+}
+
 pub(crate) struct SessionDetailView {
     palette: Palette,
     transcript: TranscriptLoadState,
+    transcript_rows: Rc<Vec<TranscriptRow>>,
     transcript_item_sizes: Rc<Vec<Size<Pixels>>>,
-    /// Message indices whose thinking/tool rows the user expanded.
+    /// Step-group start indices whose detail block the user expanded.
     expanded_transcript_items: HashSet<usize>,
     transcript_scroll: VirtualListScrollHandle,
 }
@@ -519,6 +561,7 @@ impl SessionDetailView {
         Self {
             palette,
             transcript: TranscriptLoadState::Loading,
+            transcript_rows: Rc::new(Vec::new()),
             transcript_item_sizes: Rc::new(Vec::new()),
             expanded_transcript_items: HashSet::new(),
             transcript_scroll: VirtualListScrollHandle::new(),
@@ -533,16 +576,17 @@ impl SessionDetailView {
         self.transcript = match transcript {
             Ok(transcript) => {
                 self.expanded_transcript_items.clear();
+                self.transcript_rows = Rc::new(transcript_rows(&transcript.messages));
                 self.transcript_item_sizes = Rc::new(
-                    transcript
-                        .messages
+                    self.transcript_rows
                         .iter()
-                        .map(|message| estimated_transcript_message_size(message, false))
+                        .map(|row| estimated_transcript_row_size(row, &transcript.messages, false))
                         .collect(),
                 );
                 TranscriptLoadState::Loaded(transcript)
             }
             Err(error) => {
+                self.transcript_rows = Rc::new(Vec::new());
                 self.transcript_item_sizes = Rc::new(Vec::new());
                 TranscriptLoadState::Failed(error)
             }
@@ -557,21 +601,28 @@ impl SessionDetailView {
         // Collapsing changes a row's height, so the virtual list's size
         // table has to move with the expanded set.
         if let TranscriptLoadState::Loaded(transcript) = &self.transcript {
+            let rows = self.transcript_rows.clone();
             self.transcript_item_sizes = Rc::new(
-                transcript
-                    .messages
-                    .iter()
-                    .enumerate()
-                    .map(|(position, message)| {
-                        estimated_transcript_message_size(
-                            message,
-                            self.expanded_transcript_items.contains(&position),
+                rows.iter()
+                    .map(|row| {
+                        estimated_transcript_row_size(
+                            row,
+                            &transcript.messages,
+                            self.expanded_transcript_items.contains(&row_key(row)),
                         )
                     })
                     .collect(),
             );
         }
         cx.notify();
+    }
+}
+
+/// Expansion key of a row; only step groups are toggleable.
+fn row_key(row: &TranscriptRow) -> usize {
+    match row {
+        TranscriptRow::Message(index) => *index,
+        TranscriptRow::Steps { start, .. } => *start,
     }
 }
 
@@ -653,15 +704,21 @@ fn transcript_section(
                         };
                         let expanded = &detail.expanded_transcript_items;
                         visible_range
-                            .filter_map(|index| {
-                                transcript.messages.get(index).map(|message| {
-                                    transcript_message(
-                                        message,
-                                        index,
-                                        expanded.contains(&index),
+                            .filter_map(|row_index| {
+                                let row = detail.transcript_rows.get(row_index)?;
+                                Some(match row {
+                                    TranscriptRow::Message(index) => transcript_message(
+                                        transcript.messages.get(*index)?,
+                                        *index,
+                                        p,
+                                    ),
+                                    TranscriptRow::Steps { start, end } => collapsible_steps(
+                                        transcript.messages.get(*start..*end)?,
+                                        *start,
+                                        expanded.contains(start),
                                         p,
                                         cx,
-                                    )
+                                    ),
                                 })
                             })
                             .collect()
@@ -696,25 +753,56 @@ fn transcript_section(
         .child(content)
 }
 
-fn estimated_transcript_message_size(message: &TranscriptMessage, expanded: bool) -> Size<Pixels> {
+fn estimated_transcript_row_size(
+    row: &TranscriptRow,
+    messages: &[TranscriptMessage],
+    expanded: bool,
+) -> Size<Pixels> {
     const CHARS_PER_LINE: usize = 70;
     const LINE_HEIGHT: f32 = 20.0;
     const COLLAPSED_ROW_HEIGHT: f32 = 30.0;
     const EXPANDED_LINE_HEIGHT: f32 = 18.0;
     const EXPANDED_PADDING: f32 = 10.0;
     const BUBBLE_PADDING: f32 = 22.0;
+    const SEPARATOR_HEIGHT: f32 = 5.0;
+    const STEP_HEADER_HEIGHT: f32 = 20.0;
+    const STEP_GAP: f32 = 8.0;
+    const MARKDOWN_BLOCK_PADDING: f32 = 12.0;
 
-    let lines = content_lines(&message.content, CHARS_PER_LINE);
-    match message.role {
-        TranscriptRole::User => size(px(1.0), px(BUBBLE_PADDING + lines as f32 * LINE_HEIGHT)),
-        TranscriptRole::Assistant => size(px(1.0), px(lines as f32 * LINE_HEIGHT)),
-        TranscriptRole::Thinking | TranscriptRole::Tool => {
-            let expanded_height = if expanded {
-                EXPANDED_PADDING + lines as f32 * EXPANDED_LINE_HEIGHT
-            } else {
-                0.0
+    match row {
+        TranscriptRow::Message(index) => {
+            let Some(message) = messages.get(*index) else {
+                return size(px(1.0), px(0.0));
             };
-            size(px(1.0), px(COLLAPSED_ROW_HEIGHT + expanded_height))
+            let lines = content_lines(&message.content, CHARS_PER_LINE);
+            match message.role {
+                TranscriptRole::User => {
+                    size(px(1.0), px(BUBBLE_PADDING + lines as f32 * LINE_HEIGHT))
+                }
+                // Markdown blocks (headings, code fences, lists) add vertical
+                // padding a plain line count misses.
+                TranscriptRole::Assistant => size(
+                    px(1.0),
+                    px(lines as f32 * LINE_HEIGHT + MARKDOWN_BLOCK_PADDING),
+                ),
+                TranscriptRole::Thinking | TranscriptRole::Tool => {
+                    size(px(1.0), px(lines as f32 * LINE_HEIGHT))
+                }
+            }
+        }
+        TranscriptRow::Steps { start, end } => {
+            let mut height = SEPARATOR_HEIGHT + COLLAPSED_ROW_HEIGHT;
+            if expanded {
+                if let Some(steps) = messages.get(*start..*end) {
+                    for message in steps {
+                        let lines = content_lines(&message.content, CHARS_PER_LINE);
+                        height +=
+                            STEP_HEADER_HEIGHT + lines as f32 * EXPANDED_LINE_HEIGHT + STEP_GAP;
+                    }
+                }
+                height += EXPANDED_PADDING;
+            }
+            size(px(1.0), px(height))
         }
     }
 }
@@ -735,40 +823,24 @@ fn content_lines(content: &str, chars_per_line: usize) -> usize {
 }
 
 /// ZCode-style conversation rendering: user messages sit in a right-aligned
-/// bubble, assistant text flows full width without a card, and thinking/tool
-/// steps collapse to a single clickable row that expands in place.
-fn transcript_message(
-    message: &TranscriptMessage,
-    index: usize,
-    expanded: bool,
-    p: Palette,
-    cx: &mut Context<SessionDetailView>,
-) -> AnyElement {
+/// bubble, assistant text flows full width as rendered Markdown without a
+/// card, and each run of thinking/tool steps collapses to one hairline-topped
+/// row that expands in place.
+fn transcript_message(message: &TranscriptMessage, index: usize, p: Palette) -> AnyElement {
     match message.role {
         TranscriptRole::User => user_bubble(message, p),
-        TranscriptRole::Assistant => assistant_text(message, p),
-        TranscriptRole::Thinking => collapsible_step(
-            message,
-            index,
-            expanded,
-            t!("sessions.transcript_thinking").to_string(),
-            IconName::Cpu,
-            p,
-            cx,
-        ),
-        TranscriptRole::Tool => collapsible_step(
-            message,
-            index,
-            expanded,
-            tool_summary(message),
-            IconName::SquareTerminal,
-            p,
-            cx,
-        ),
+        // Step messages reach the renderer only through a Steps row; keep a
+        // safe fallback in case grouping ever misses one.
+        TranscriptRole::Assistant | TranscriptRole::Thinking | TranscriptRole::Tool => {
+            assistant_text(message, index, p)
+        }
     }
 }
 
 fn user_bubble(message: &TranscriptMessage, p: Palette) -> AnyElement {
+    // A foreground-tinted ground keeps the bubble clearly elevated on both
+    // themes; muted is barely distinguishable from the sheet background.
+    let ground = p.foreground.opacity(if p.is_dark { 0.14 } else { 0.08 });
     h_flex()
         .w_full()
         .justify_end()
@@ -776,7 +848,7 @@ fn user_bubble(message: &TranscriptMessage, p: Palette) -> AnyElement {
             div()
                 .max_w(px(560.0))
                 .rounded_2xl()
-                .bg(p.muted.opacity(0.55))
+                .bg(ground)
                 .px_3p5()
                 .py_2p5()
                 .text_sm()
@@ -786,22 +858,25 @@ fn user_bubble(message: &TranscriptMessage, p: Palette) -> AnyElement {
         .into_any_element()
 }
 
-fn assistant_text(message: &TranscriptMessage, p: Palette) -> AnyElement {
-    div()
-        .w_full()
-        .whitespace_normal()
-        .text_sm()
-        .text_color(p.foreground)
-        .child(message.content.clone())
-        .into_any_element()
+fn assistant_text(message: &TranscriptMessage, index: usize, p: Palette) -> AnyElement {
+    // Assistant replies carry Markdown (bold, headings, inline code, lists);
+    // render them richly like ZCode instead of showing the raw source.
+    TextView::markdown(
+        SharedString::from(format!("assistant-md-{index}")),
+        &message.content,
+    )
+    .w_full()
+    .text_sm()
+    .text_color(p.foreground)
+    .into_any_element()
 }
 
-fn collapsible_step(
-    message: &TranscriptMessage,
-    index: usize,
+/// One collapsed entry for a whole run of thinking/tool messages: a hairline
+/// separator, a duration summary line, and an expandable step list underneath.
+fn collapsible_steps(
+    steps: &[TranscriptMessage],
+    key: usize,
     expanded: bool,
-    label: String,
-    icon: IconName,
     p: Palette,
     cx: &mut Context<SessionDetailView>,
 ) -> AnyElement {
@@ -810,43 +885,136 @@ fn collapsible_step(
     } else {
         IconName::ChevronRight
     };
-    let mut step = v_flex().w_full().gap_1().child(
-        h_flex()
-            .id(SharedString::from(format!("transcript-step-{index}")))
-            .w_full()
-            .cursor_pointer()
-            .items_center()
-            .gap_1p5()
-            .rounded_md()
-            .px_1p5()
-            .py_1()
-            .hover(|style| style.bg(p.muted.opacity(0.4)))
-            .on_click(cx.listener(move |detail, _, _, cx| {
-                detail.toggle_transcript_item(index, cx);
-            }))
-            .child(Icon::new(icon).size_4().text_color(p.muted_foreground))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_xs()
-                    .text_color(p.muted_foreground)
-                    .child(label),
-            )
-            .child(Icon::new(chevron).size_3().text_color(p.muted_foreground)),
-    );
+    let mut block = v_flex()
+        .w_full()
+        .gap_1()
+        .child(div().mt_1().h(px(1.0)).w_full().bg(p.border.opacity(0.6)))
+        .child(
+            h_flex()
+                .id(SharedString::from(format!("transcript-steps-{key}")))
+                .w_full()
+                .cursor_pointer()
+                .items_center()
+                .gap_1p5()
+                .rounded_md()
+                .px_1p5()
+                .py_1()
+                .hover(|style| style.bg(p.muted.opacity(0.4)))
+                .on_click(cx.listener(move |detail, _, _, cx| {
+                    detail.toggle_transcript_item(key, cx);
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(p.muted_foreground)
+                        .child(steps_label(steps)),
+                )
+                .child(Icon::new(chevron).size_3().text_color(p.muted_foreground)),
+        );
     if expanded {
-        step = step.child(
+        let mut list = v_flex().w_full().gap_2().pl_1p5();
+        for message in steps {
+            list = list.child(step_detail(message, p));
+        }
+        block = block.child(list);
+    }
+    block.into_any_element()
+}
+
+/// Expanded view of one message inside a step group: an icon plus its title,
+/// with the raw content underneath.
+fn step_detail(message: &TranscriptMessage, p: Palette) -> AnyElement {
+    let (icon, title) = match message.role {
+        TranscriptRole::Thinking => (
+            IconName::Cpu,
+            t!("sessions.transcript_thinking").to_string(),
+        ),
+        _ => (IconName::SquareTerminal, tool_summary(message)),
+    };
+    v_flex()
+        .w_full()
+        .gap_0p5()
+        .child(
+            h_flex()
+                .items_center()
+                .gap_1p5()
+                .child(Icon::new(icon).size_3().text_color(p.muted_foreground))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_xs()
+                        .text_color(p.muted_foreground)
+                        .child(title),
+                ),
+        )
+        .child(
             div()
-                .pl_6()
+                .pl_5()
                 .whitespace_normal()
                 .text_xs()
                 .text_color(p.muted_foreground)
                 .child(message.content.clone()),
-        );
+        )
+        .into_any_element()
+}
+
+/// Collapsed summary of a step run: the wall-clock span between its first and
+/// last message when timestamps are available, the lone step's own title for
+/// single untimed steps, otherwise the step count.
+fn steps_label(steps: &[TranscriptMessage]) -> String {
+    let first = steps.iter().filter_map(|message| message.timestamp).min();
+    let last = steps.iter().filter_map(|message| message.timestamp).max();
+    if let (Some(first), Some(last)) = (first, last)
+        && last > first
+    {
+        let seconds = (last - first).num_seconds();
+        return t!(
+            "sessions.transcript_worked",
+            duration = work_duration(seconds)
+        )
+        .to_string();
     }
-    step.into_any_element()
+    if steps.len() == 1 {
+        return match steps[0].role {
+            TranscriptRole::Thinking => t!("sessions.transcript_thinking").to_string(),
+            _ => tool_summary(&steps[0]),
+        };
+    }
+    t!("sessions.transcript_steps", count = steps.len() as i64).to_string()
+}
+
+/// Compact wall-clock span ("6 分 46 秒") for step-run labels.
+fn work_duration(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    if seconds < 60 {
+        t!("sessions.seconds", count = seconds).to_string()
+    } else if seconds < 3600 {
+        let minutes = seconds / 60;
+        let remainder = seconds % 60;
+        if remainder == 0 {
+            t!("sessions.minutes", count = minutes).to_string()
+        } else {
+            t!(
+                "sessions.minutes_seconds",
+                minutes = minutes,
+                seconds = remainder
+            )
+            .to_string()
+        }
+    } else {
+        let hours = seconds / 3600;
+        let minutes = (seconds % 3600) / 60;
+        if minutes == 0 {
+            t!("sessions.hours", count = hours).to_string()
+        } else {
+            t!("sessions.hours_minutes", hours = hours, minutes = minutes).to_string()
+        }
+    }
 }
 
 fn tool_summary(message: &TranscriptMessage) -> String {
@@ -1015,5 +1183,75 @@ fn format_duration(seconds: i64) -> String {
         } else {
             t!("sessions.hours_minutes", hours = hours, minutes = minutes).to_string()
         }
+    }
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    use super::*;
+
+    fn message(
+        role: TranscriptRole,
+        timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> TranscriptMessage {
+        TranscriptMessage {
+            role,
+            content: "step content".into(),
+            timestamp,
+        }
+    }
+
+    #[test]
+    fn consecutive_step_messages_group_into_single_rows() {
+        let base = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let messages = vec![
+            message(TranscriptRole::User, Some(base)),
+            message(TranscriptRole::Thinking, Some(base)),
+            message(TranscriptRole::Tool, Some(base)),
+            message(TranscriptRole::Thinking, Some(base)),
+            message(TranscriptRole::Assistant, Some(base)),
+            message(TranscriptRole::Tool, Some(base)),
+        ];
+        let rows = transcript_rows(&messages);
+        assert_eq!(
+            rows,
+            vec![
+                TranscriptRow::Message(0),
+                TranscriptRow::Steps { start: 1, end: 4 },
+                TranscriptRow::Message(4),
+                TranscriptRow::Steps { start: 5, end: 6 },
+            ]
+        );
+    }
+
+    #[test]
+    fn steps_label_reports_span_then_falls_back_to_count() {
+        let start = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let end = start + chrono::Duration::seconds(406);
+        let timed = vec![
+            message(TranscriptRole::Thinking, Some(start)),
+            message(TranscriptRole::Tool, Some(end)),
+        ];
+        let label = steps_label(&timed);
+        assert!(label.contains('6') && label.contains('4'), "label: {label}");
+
+        let untimed = vec![
+            message(TranscriptRole::Thinking, None),
+            message(TranscriptRole::Tool, None),
+        ];
+        let count_label = steps_label(&untimed);
+        assert!(count_label.contains('2'), "label: {count_label}");
+    }
+
+    #[test]
+    fn expanded_step_rows_estimate_taller_than_collapsed() {
+        let messages = vec![
+            message(TranscriptRole::Thinking, None),
+            message(TranscriptRole::Tool, None),
+        ];
+        let row = TranscriptRow::Steps { start: 0, end: 2 };
+        let collapsed = estimated_transcript_row_size(&row, &messages, false);
+        let expanded = estimated_transcript_row_size(&row, &messages, true);
+        assert!(expanded.height > collapsed.height);
     }
 }

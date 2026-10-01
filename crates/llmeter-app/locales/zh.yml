@@ -153,6 +153,8 @@ sessions:
   transcript_user: "用户"
   transcript_assistant: "AI 回复"
   transcript_thinking: "思考"
+  transcript_worked: "已工作 %{duration}"
+  transcript_steps: "%{count} 个步骤"
   transcript_tool: "工具调用"
   all: "全部"
   all_time: "全部时间"
@@ -177,6 +179,7 @@ sessions:
   minutes: "%{count} 分"
   hours: "%{count} 时"
   hours_minutes: "%{hours} 时 %{minutes} 分"
+  minutes_seconds: "%{minutes} 分 %{seconds} 秒"
 settings:
   title: "设置"
   appearance: "外观"

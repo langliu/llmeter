@@ -153,6 +153,8 @@ sessions:
   transcript_user: "User"
   transcript_assistant: "AI response"
   transcript_thinking: "Thinking"
+  transcript_worked: "Worked %{duration}"
+  transcript_steps: "%{count} steps"
   transcript_tool: "Tool call"
   all: "All"
   all_time: "All time"
@@ -177,6 +179,7 @@ sessions:
   minutes: "%{count} min"
   hours: "%{count} hr"
   hours_minutes: "%{hours} hr %{minutes} min"
+  minutes_seconds: "%{minutes}m %{seconds}s"
 settings:
   title: "Settings"
   appearance: "Appearance"
