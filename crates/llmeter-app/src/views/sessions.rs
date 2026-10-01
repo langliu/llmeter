@@ -655,6 +655,11 @@ fn row_key(row: &TranscriptRow) -> usize {
 
 impl Render for SessionDetailView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Measure from the previous frame's layout (zero until the list has
+        // painted once). This must stay out of the list's item closure: that
+        // closure also runs during request_layout, and notifying there
+        // invalidates the frame being built — the list never paints.
+        self.sync_transcript_width(self.transcript_scroll.base_handle().bounds().size.width, cx);
         session_detail_content(self, cx.entity())
     }
 }
@@ -726,13 +731,6 @@ fn transcript_section(
                     "session-transcript-items",
                     item_sizes,
                     move |detail, visible_range, _, cx| {
-                        // The list's laid-out width is the ground truth for
-                        // text wrapping; pick up resizes here so the size
-                        // table follows the dragged sheet width.
-                        detail.sync_transcript_width(
-                            detail.transcript_scroll.base_handle().bounds().size.width,
-                            cx,
-                        );
                         let TranscriptLoadState::Loaded(transcript) = &detail.transcript else {
                             return Vec::new();
                         };
