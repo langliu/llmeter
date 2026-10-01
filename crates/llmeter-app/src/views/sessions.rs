@@ -555,8 +555,19 @@ pub(crate) struct SessionDetailView {
     transcript_item_sizes: Rc<Vec<Size<Pixels>>>,
     /// Step-group start indices whose detail block the user expanded.
     expanded_transcript_items: HashSet<usize>,
+    /// Content width the row-size estimates were computed for. The sheet is
+    /// user-resizable, so this is measured from the laid-out list and the
+    /// size table is rebuilt whenever it moves.
+    transcript_width: Pixels,
     transcript_scroll: VirtualListScrollHandle,
 }
+
+/// Row-height estimates before the list has been laid out once: the default
+/// 680px sheet minus its horizontal padding.
+const TRANSCRIPT_FALLBACK_WIDTH: f32 = 656.0;
+/// Average glyph width at the transcript's 14px body size, slightly wide so
+/// estimates err toward a few spare pixels rather than clipped rows.
+const TRANSCRIPT_GLYPH_UNIT: f32 = 7.5;
 
 impl SessionDetailView {
     pub(crate) fn new(palette: Palette) -> Self {
@@ -566,6 +577,7 @@ impl SessionDetailView {
             transcript_rows: Rc::new(Vec::new()),
             transcript_item_sizes: Rc::new(Vec::new()),
             expanded_transcript_items: HashSet::new(),
+            transcript_width: px(TRANSCRIPT_FALLBACK_WIDTH),
             transcript_scroll: VirtualListScrollHandle::new(),
         }
     }
@@ -579,12 +591,7 @@ impl SessionDetailView {
             Ok(transcript) => {
                 self.expanded_transcript_items.clear();
                 self.transcript_rows = Rc::new(transcript_rows(&transcript.messages));
-                self.transcript_item_sizes = Rc::new(
-                    self.transcript_rows
-                        .iter()
-                        .map(|row| estimated_transcript_row_size(row, &transcript.messages, false))
-                        .collect(),
-                );
+                self.rebuild_transcript_sizes();
                 TranscriptLoadState::Loaded(transcript)
             }
             Err(error) => {
@@ -602,6 +609,24 @@ impl SessionDetailView {
         }
         // Collapsing changes a row's height, so the virtual list's size
         // table has to move with the expanded set.
+        self.rebuild_transcript_sizes();
+        cx.notify();
+    }
+
+    /// The virtual list positions rows by estimated size, and text wraps by
+    /// the real container width — which the user can drag wider or narrower.
+    /// Measure it from the laid-out list each frame and rebuild the size
+    /// table when it moved; the notify settles after one correction frame.
+    fn sync_transcript_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
+        if width <= px(0.0) || (width - self.transcript_width).abs() <= px(0.5) {
+            return;
+        }
+        self.transcript_width = width;
+        self.rebuild_transcript_sizes();
+        cx.notify();
+    }
+
+    fn rebuild_transcript_sizes(&mut self) {
         if let TranscriptLoadState::Loaded(transcript) = &self.transcript {
             let rows = self.transcript_rows.clone();
             self.transcript_item_sizes = Rc::new(
@@ -611,12 +636,12 @@ impl SessionDetailView {
                             row,
                             &transcript.messages,
                             self.expanded_transcript_items.contains(&row_key(row)),
+                            self.transcript_width,
                         )
                     })
                     .collect(),
             );
         }
-        cx.notify();
     }
 }
 
@@ -701,6 +726,13 @@ fn transcript_section(
                     "session-transcript-items",
                     item_sizes,
                     move |detail, visible_range, _, cx| {
+                        // The list's laid-out width is the ground truth for
+                        // text wrapping; pick up resizes here so the size
+                        // table follows the dragged sheet width.
+                        detail.sync_transcript_width(
+                            detail.transcript_scroll.base_handle().bounds().size.width,
+                            cx,
+                        );
                         let TranscriptLoadState::Loaded(transcript) = &detail.transcript else {
                             return Vec::new();
                         };
@@ -759,35 +791,50 @@ fn estimated_transcript_row_size(
     row: &TranscriptRow,
     messages: &[TranscriptMessage],
     expanded: bool,
+    content_width: Pixels,
 ) -> Size<Pixels> {
-    const CHARS_PER_LINE: usize = 70;
     const LINE_HEIGHT: f32 = 20.0;
     const COLLAPSED_ROW_HEIGHT: f32 = 30.0;
     const EXPANDED_LINE_HEIGHT: f32 = 18.0;
     const EXPANDED_PADDING: f32 = 10.0;
     const BUBBLE_PADDING: f32 = 22.0;
+    const BUBBLE_HORIZONTAL_PADDING: f32 = 28.0;
+    const BUBBLE_MAX_WIDTH: f32 = 560.0;
     const SEPARATOR_HEIGHT: f32 = 5.0;
     const STEP_HEADER_HEIGHT: f32 = 20.0;
     const STEP_GAP: f32 = 8.0;
     const MARKDOWN_BLOCK_PADDING: f32 = 12.0;
+    /// Small safety margin so slight wrapping differences leave a hair of
+    /// space instead of clipping the last line.
+    const WIDTH_MARGIN: f32 = 6.0;
+
+    let width = f32::from(content_width);
+    let full_units = ((width - WIDTH_MARGIN).max(120.0) / TRANSCRIPT_GLYPH_UNIT) as usize;
+    let bubble_units = (((width.min(BUBBLE_MAX_WIDTH) - BUBBLE_HORIZONTAL_PADDING).max(120.0))
+        / TRANSCRIPT_GLYPH_UNIT) as usize;
+    let step_units = ((width - WIDTH_MARGIN - 12.0).max(120.0) / TRANSCRIPT_GLYPH_UNIT) as usize;
 
     match row {
         TranscriptRow::Message(index) => {
             let Some(message) = messages.get(*index) else {
                 return size(px(1.0), px(0.0));
             };
-            let lines = content_lines(&message.content, CHARS_PER_LINE);
             match message.role {
                 TranscriptRole::User => {
+                    let lines = content_lines(&message.content, bubble_units);
                     size(px(1.0), px(BUBBLE_PADDING + lines as f32 * LINE_HEIGHT))
                 }
                 // Markdown blocks (headings, code fences, lists) add vertical
                 // padding a plain line count misses.
-                TranscriptRole::Assistant => size(
-                    px(1.0),
-                    px(lines as f32 * LINE_HEIGHT + MARKDOWN_BLOCK_PADDING),
-                ),
+                TranscriptRole::Assistant => {
+                    let lines = content_lines(&message.content, full_units);
+                    size(
+                        px(1.0),
+                        px(lines as f32 * LINE_HEIGHT + MARKDOWN_BLOCK_PADDING),
+                    )
+                }
                 TranscriptRole::Thinking | TranscriptRole::Tool => {
+                    let lines = content_lines(&message.content, full_units);
                     size(px(1.0), px(lines as f32 * LINE_HEIGHT))
                 }
             }
@@ -797,7 +844,7 @@ fn estimated_transcript_row_size(
             if expanded {
                 if let Some(steps) = messages.get(*start..*end) {
                     for message in steps {
-                        let lines = content_lines(&message.content, CHARS_PER_LINE);
+                        let lines = content_lines(&message.content, step_units);
                         height +=
                             STEP_HEADER_HEIGHT + lines as f32 * EXPANDED_LINE_HEIGHT + STEP_GAP;
                     }
@@ -866,12 +913,14 @@ fn assistant_text(message: &TranscriptMessage, index: usize, p: Palette) -> AnyE
     // compact — headings barely above body size, neutral chips, tight
     // paragraphs — so rein all three in.
     let chip_ground = p.foreground.opacity(if p.is_dark { 0.12 } else { 0.08 });
-    let mut style = TextViewStyle::default();
-    style.is_dark = p.is_dark;
-    style.highlight_theme = if p.is_dark {
-        HighlightTheme::default_dark()
-    } else {
-        HighlightTheme::default_light()
+    let style = TextViewStyle {
+        is_dark: p.is_dark,
+        highlight_theme: if p.is_dark {
+            HighlightTheme::default_dark()
+        } else {
+            HighlightTheme::default_light()
+        },
+        ..Default::default()
     };
     let style = style
         .paragraph_gap(rems(0.5))
@@ -1276,8 +1325,26 @@ mod transcript_tests {
             message(TranscriptRole::Tool, None),
         ];
         let row = TranscriptRow::Steps { start: 0, end: 2 };
-        let collapsed = estimated_transcript_row_size(&row, &messages, false);
-        let expanded = estimated_transcript_row_size(&row, &messages, true);
+        let width = px(656.0);
+        let collapsed = estimated_transcript_row_size(&row, &messages, false, width);
+        let expanded = estimated_transcript_row_size(&row, &messages, true, width);
         assert!(expanded.height > collapsed.height);
+    }
+
+    #[test]
+    fn wider_content_estimates_fewer_lines() {
+        let long_assistant = TranscriptMessage {
+            role: TranscriptRole::Assistant,
+            content: "三路深入审查完成。".repeat(60),
+            timestamp: None,
+        };
+        let row = TranscriptRow::Message(0);
+        let messages = std::slice::from_ref(&long_assistant);
+        let narrow = estimated_transcript_row_size(&row, messages, false, px(500.0));
+        let wide = estimated_transcript_row_size(&row, messages, false, px(900.0));
+        assert!(
+            wide.height < narrow.height,
+            "same text at a wider container must estimate shorter: {wide} vs {narrow}"
+        );
     }
 }
