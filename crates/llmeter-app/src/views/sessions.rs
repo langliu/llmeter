@@ -933,15 +933,20 @@ fn assistant_text(message: &TranscriptMessage, index: usize, p: Palette) -> AnyE
         });
     // Assistant replies carry Markdown (bold, headings, inline code, lists);
     // render them richly like ZCode instead of showing the raw source.
-    TextView::markdown(
-        SharedString::from(format!("assistant-md-{index}")),
-        &message.content,
-    )
-    .style(style)
-    .w_full()
-    .text_sm()
-    .text_color(p.foreground)
-    .into_any_element()
+    div()
+        .w_full()
+        .debug_selector(move || format!("transcript-assistant-{index}"))
+        .child(
+            TextView::markdown(
+                SharedString::from(format!("assistant-md-{index}")),
+                &message.content,
+            )
+            .style(style)
+            .w_full()
+            .text_sm()
+            .text_color(p.foreground),
+        )
+        .into_any_element()
 }
 
 /// One collapsed entry for a whole run of thinking/tool messages: a hairline
@@ -1343,6 +1348,58 @@ mod transcript_tests {
         assert!(
             wide.height < narrow.height,
             "same text at a wider container must estimate shorter: {wide} vs {narrow}"
+        );
+    }
+
+    /// Regression test: the transcript must keep painting across width
+    /// re-measurement. An earlier version measured the laid-out width inside
+    /// the virtual list's item closure, which also runs during
+    /// `request_layout`; notifying there invalidated every frame while it was
+    /// being built and the sheet rendered completely blank.
+    #[gpui::test]
+    fn transcript_keeps_painting_while_width_converges(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext as _, size};
+
+        cx.update(gpui_component::init);
+        let palette = cx.update(|cx| Palette::from_app(cx));
+        let (view, cx) = cx.add_window_view(|_, _| SessionDetailView::new(palette));
+
+        let transcript = SessionTranscript {
+            truncated: false,
+            messages: vec![
+                TranscriptMessage {
+                    role: TranscriptRole::User,
+                    content: "看一下有什么可以优化的地方".into(),
+                    timestamp: None,
+                },
+                TranscriptMessage {
+                    role: TranscriptRole::Assistant,
+                    content: "## 高影响（建议优先处理）\n\n**架构基础是好的**——增量 JSONL 读取、`WAL`、批量事务这些都做对了。".repeat(8),
+                    timestamp: None,
+                },
+            ],
+        };
+        view.update(cx, |detail, cx| detail.set_transcript(Ok(transcript), cx));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+
+        let first = cx
+            .debug_bounds("transcript-assistant-1")
+            .expect("assistant row must paint");
+        assert!(first.size.height > px(0.0), "painted row has height");
+
+        cx.simulate_resize(size(px(1400.0), px(768.0)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let second = cx
+            .debug_bounds("transcript-assistant-1")
+            .expect("assistant row must survive a width re-measurement");
+        assert!(second.size.height > px(0.0), "resized row has height");
+        assert!(
+            second.size.width < first.size.width,
+            "row follows the narrower window: {first} -> {second}"
         );
     }
 }
