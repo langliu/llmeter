@@ -7,9 +7,9 @@ use rusqlite::Connection;
 use serde_json::Value;
 
 use super::{
-    ParsedUsage, ProviderAdapter, counts_from_usage, data_status, deduplicate_paths, home_dir,
-    json_value, jsonl_exists, model, object_for_key, object_with_usage, project_name, project_path,
-    session_id, source_event_id, timestamp, walk_jsonl, walk_matching,
+    ParsedUsage, PathMemo, ProviderAdapter, counts_from_usage, data_status, deduplicate_paths,
+    home_dir, json_value, jsonl_exists, model, object_for_key, object_with_usage, project_name,
+    project_path, session_id, source_event_id, timestamp, walk_jsonl, walk_matching,
 };
 use crate::sqlite::{open_read_only, table_has_columns};
 
@@ -28,20 +28,29 @@ const REQUIRED_SESSION_COLUMNS: &[&str] = &[
     "tokens_cache_write",
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct OpenCodeAdapter {
     home: PathBuf,
+    /// SQLite candidates are probed by detect, discover, and parse on every
+    /// sync; the memo keeps those probes to one open per changed database.
+    tables: PathMemo<Option<String>>,
 }
 
 impl Default for OpenCodeAdapter {
     fn default() -> Self {
-        Self { home: home_dir() }
+        Self {
+            home: home_dir(),
+            tables: PathMemo::new(),
+        }
     }
 }
 
 impl OpenCodeAdapter {
     pub fn with_home(home: PathBuf) -> Self {
-        Self { home }
+        Self {
+            home,
+            tables: PathMemo::new(),
+        }
     }
 
     fn roots(&self) -> Vec<PathBuf> {
@@ -78,11 +87,22 @@ impl OpenCodeAdapter {
 
     fn supported_sqlite_source(&self) -> Result<Option<(PathBuf, String)>> {
         for path in self.sqlite_files()? {
-            if let Some(table) = find_session_table(&open_read_only(&path)?)? {
+            if let Some(table) = self.cached_session_table(&path)? {
                 return Ok(Some((path, table)));
             }
         }
         Ok(None)
+    }
+
+    /// Cached per-file session-table probe; open/PRAGMA failures are not
+    /// memoized so a locked database is retried on the next sync.
+    fn cached_session_table(&self, path: &Path) -> Result<Option<String>> {
+        if let Some(cached) = self.tables.get(path) {
+            return Ok(cached);
+        }
+        let table = find_session_table(&open_read_only(path)?)?;
+        self.tables.insert(path, table.clone());
+        Ok(table)
     }
 }
 
@@ -192,9 +212,10 @@ impl ProviderAdapter for OpenCodeAdapter {
     }
 
     fn parse_sqlite(&self, source: &SourceFile) -> Result<Vec<ParsedUsage>> {
-        let connection = open_read_only(&source.path)?;
-        let table = find_session_table(&connection)?
+        let table = self
+            .cached_session_table(&source.path)?
             .ok_or_else(|| anyhow::anyhow!("OpenCode session token schema is unsupported"))?;
+        let connection = open_read_only(&source.path)?;
         let query = format!(
             "SELECT id, directory, model, tokens_input, tokens_output, tokens_reasoning,
                     tokens_cache_read, tokens_cache_write, time_created, time_updated

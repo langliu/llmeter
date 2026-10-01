@@ -1,8 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Instant,
+    sync::{Arc, Mutex},
+    time::{Instant, SystemTime},
 };
 
 use anyhow::Result;
@@ -74,6 +74,7 @@ impl SyncOptions {
 pub struct SyncEngine {
     database: Database,
     adapters: Arc<Vec<Box<dyn ProviderAdapter>>>,
+    wal_fingerprints: Arc<Mutex<HashMap<PathBuf, Option<(u64, SystemTime)>>>>,
 }
 
 /// Per-provider state shared by the sync loop: the adapter under sync and its
@@ -93,6 +94,7 @@ impl SyncEngine {
         Self {
             database,
             adapters: Arc::new(adapters),
+            wal_fingerprints: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -226,6 +228,7 @@ impl SyncEngine {
                         result.files_scanned += 1;
                         continue;
                     }
+                    let wal = sqlite_wal_fingerprint(&source.path);
                     let parsed = context.adapter.parse_sqlite(&source)?;
                     self.sync_batch_source(
                         &context,
@@ -235,6 +238,10 @@ impl SyncEngine {
                         None,
                         result,
                     )?;
+                    self.wal_fingerprints
+                        .lock()
+                        .unwrap()
+                        .insert(source.path.clone(), wal);
                 }
                 SourceFormat::Snapshot => {
                     if !context.adapter.uses_remote_snapshot()
@@ -268,6 +275,12 @@ impl SyncEngine {
         };
         if cursor.parser_version != context.adapter.parser_version() {
             return Ok(false);
+        }
+        if source.format == SourceFormat::Sqlite {
+            let current = sqlite_wal_fingerprint(&source.path);
+            if self.wal_fingerprints.lock().unwrap().get(&source.path) != Some(&current) {
+                return Ok(false);
+            }
         }
         Ok(IncrementalJsonlReader::is_unchanged(&source.path, cursor).unwrap_or(false))
     }
@@ -559,6 +572,14 @@ fn sqlite_event_id(source: &SourceFile, parsed: &ParsedUsage, session_id: Option
             .unwrap_or_default()
     );
     blake3::hash(value.as_bytes()).to_hex().to_string()
+}
+
+/// Capture the sidecar before parsing so writes during parsing trigger another pass.
+fn sqlite_wal_fingerprint(path: &Path) -> Option<(u64, SystemTime)> {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push("-wal");
+    let metadata = std::fs::metadata(Path::new(&sidecar)).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
 }
 
 fn event_id(
@@ -886,6 +907,59 @@ mod tests {
         );
         upgraded.sync_all().unwrap();
         assert_eq!(parses.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn newer_wal_sidecar_forces_sqlite_reparse() {
+        let home = test_home("sqlite-wal");
+        let source_path = home.join("db.sqlite");
+        fs::write(&source_path, "v1").unwrap();
+        let parses = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let database = Database::open_in_memory().unwrap();
+        let engine = SyncEngine::with_adapters(
+            database.clone(),
+            vec![Box::new(CountingSqliteAdapter {
+                path: source_path.clone(),
+                parser_version: 1,
+                parses: parses.clone(),
+            })],
+        );
+
+        engine.sync_all().unwrap();
+        assert_eq!(parses.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Simulate a commit that only reached the WAL sidecar: the main file
+        // fingerprint still matches, but the sidecar was written afterwards.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        fs::write(source_path.with_extension("sqlite-wal"), "wal rows").unwrap();
+
+        assert_eq!(engine.sync_all().unwrap().files_scanned, 1);
+        assert_eq!(
+            parses.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a -wal sidecar newer than the cursor must trigger a reparse"
+        );
+
+        engine.sync_all().unwrap();
+        assert_eq!(
+            parses.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "an unchanged WAL must not trigger another parse"
+        );
+
+        // Once the recorded cursor catches up (source file rewritten after the
+        // sidecar), an untouched sidecar no longer forces extra parses.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        fs::write(&source_path, "v2-checkpointed").unwrap();
+        engine.sync_all().unwrap();
+        assert_eq!(parses.load(std::sync::atomic::Ordering::SeqCst), 3);
+        engine.sync_all().unwrap();
+        assert_eq!(
+            parses.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "a sidecar older than the cursor mtime should not reparse"
+        );
         let _ = fs::remove_dir_all(home);
     }
 

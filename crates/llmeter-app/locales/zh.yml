@@ -147,6 +147,7 @@ sessions:
   subtitle: "浏览本地 AI 编程代理会话，点击会话查看详情，一键复制恢复命令。"
   transcript_details: "对话记录"
   transcript_loading: "正在从本地会话日志读取对话…"
+  transcript_image_unavailable: "图片附件不可用（本地文件缺失或格式不支持）"
   transcript_empty: "该会话没有可显示的对话内容。"
   transcript_unavailable: "无法读取会话内容"
   transcript_truncated: "内容较长，仅显示前一部分。"

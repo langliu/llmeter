@@ -76,23 +76,13 @@ pub enum SnapshotPolicy {
     ReplaceSince(DateTime<Utc>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ParsedSnapshot {
     pub usages: Vec<ParsedUsage>,
     pub policy: SnapshotPolicy,
     /// Stable identity of the signed-in account that produced this snapshot.
     /// Local file parsers leave this unset.
     pub scope: Option<String>,
-}
-
-impl Default for ParsedSnapshot {
-    fn default() -> Self {
-        Self {
-            usages: Vec::new(),
-            policy: SnapshotPolicy::default(),
-            scope: None,
-        }
-    }
 }
 
 pub(crate) fn snapshot_scope(provider: Provider, identity: &str) -> String {

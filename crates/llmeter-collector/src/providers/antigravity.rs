@@ -7,6 +7,7 @@ use llmeter_core::{Provider, ProviderDetection, SourceFile, SourceFormat, TokenC
 use rusqlite::{Connection, OpenFlags};
 
 use super::{ParsedUsage, ProviderAdapter, data_status, home_dir, project_name};
+use crate::sqlite::table_has_columns;
 
 const ANTIGRAVITY_PARSER_VERSION: u32 = 1;
 
@@ -201,6 +202,20 @@ pub(crate) fn parse_antigravity_sqlite(path: &Path) -> Result<Vec<ParsedUsage>> 
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("failed to open Antigravity database {}", path.display()))?;
 
+    // Antigravity creates the conversation file before its schema, so
+    // abandoned conversations can stay table-less forever. They hold no
+    // usage; skipping them keeps one empty file from failing (and, via the
+    // sync loop's `?`, aborting) every other conversation database.
+    let supported = table_has_columns(&connection, "steps", &["idx", "metadata", "step_payload"])?
+        && table_has_columns(&connection, "gen_metadata", &["idx", "data"])?;
+    if !supported {
+        tracing::debug!(
+            path = %path.display(),
+            "antigravity conversation has no usage schema; skipping"
+        );
+        return Ok(Vec::new());
+    }
+
     // Step 1: read project path and name if present
     let (project_path, project_name) = extract_project_info(&connection);
 
@@ -314,10 +329,10 @@ pub(crate) fn parse_antigravity_sqlite(path: &Path) -> Result<Vec<ParsedUsage>> 
                                 ProtoValue::Bytes(b) => std::str::from_utf8(b).ok(),
                                 _ => None,
                             });
-                    if k == Some("last_step_index") {
-                        if let Some(s) = val_str {
-                            last_step_index = s.parse::<i64>().ok();
-                        }
+                    if k == Some("last_step_index")
+                        && let Some(s) = val_str
+                    {
+                        last_step_index = s.parse::<i64>().ok();
                     }
                 }
             }
@@ -358,30 +373,26 @@ fn extract_project_info(connection: &Connection) -> (Option<PathBuf>, Option<Str
     // Try trajectory_metadata_blob first
     if let Ok(mut stmt) =
         connection.prepare("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'")
+        && let Ok(mut rows) = stmt.query([])
+        && let Ok(Some(row)) = rows.next()
+        && let Ok(data) = row.get::<_, Vec<u8>>(0)
+        && !data.is_empty()
     {
-        if let Ok(mut rows) = stmt.query([]) {
-            if let Ok(Some(row)) = rows.next() {
-                if let Ok(data) = row.get::<_, Vec<u8>>(0) {
-                    if !data.is_empty() {
-                        let fields = parse_proto_fields(&data);
-                        for vals in fields.values() {
-                            for v in vals {
-                                if let ProtoValue::Bytes(b) = v {
-                                    if let Ok(s) = std::str::from_utf8(b) {
-                                        if let Some(stripped) = s.strip_prefix("file://") {
-                                            let path = PathBuf::from(stripped);
-                                            let name = project_name(Some(&path));
-                                            return (Some(path), name);
-                                        }
-                                        if s.starts_with('/') && !s.contains('\n') {
-                                            let path = PathBuf::from(s);
-                                            let name = project_name(Some(&path));
-                                            return (Some(path), name);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+        let fields = parse_proto_fields(&data);
+        for vals in fields.values() {
+            for v in vals {
+                if let ProtoValue::Bytes(b) = v
+                    && let Ok(s) = std::str::from_utf8(b)
+                {
+                    if let Some(stripped) = s.strip_prefix("file://") {
+                        let path = PathBuf::from(stripped);
+                        let name = project_name(Some(&path));
+                        return (Some(path), name);
+                    }
+                    if s.starts_with('/') && !s.contains('\n') {
+                        let path = PathBuf::from(s);
+                        let name = project_name(Some(&path));
+                        return (Some(path), name);
                     }
                 }
             }
@@ -391,17 +402,16 @@ fn extract_project_info(connection: &Connection) -> (Option<PathBuf>, Option<Str
     // Fallback: search for Cwd or DirectoryPath or absolute_path in tool call arguments in steps
     if let Ok(mut stmt) =
         connection.prepare("SELECT metadata, step_payload FROM steps ORDER BY idx LIMIT 30")
+        && let Ok(mut rows) = stmt.query([])
     {
-        if let Ok(mut rows) = stmt.query([]) {
-            while let Ok(Some(row)) = rows.next() {
-                let metadata: Vec<u8> = row.get(0).unwrap_or_default();
-                let payload: Vec<u8> = row.get(1).unwrap_or_default();
+        while let Ok(Some(row)) = rows.next() {
+            let metadata: Vec<u8> = row.get(0).unwrap_or_default();
+            let payload: Vec<u8> = row.get(1).unwrap_or_default();
 
-                for blob in [&metadata, &payload] {
-                    if let Some(path) = find_project_path_in_json(blob) {
-                        let name = project_name(Some(&path));
-                        return (Some(path), name);
-                    }
+            for blob in [&metadata, &payload] {
+                if let Some(path) = find_project_path_in_json(blob) {
+                    let name = project_name(Some(&path));
+                    return (Some(path), name);
                 }
             }
         }
@@ -426,10 +436,10 @@ fn find_project_path_in_json(data: &[u8]) -> Option<PathBuf> {
                 let candidate = &text[start..start + end];
                 if candidate.starts_with('/') && !candidate.contains('\n') {
                     let mut path = PathBuf::from(candidate);
-                    if path.is_file() {
-                        if let Some(parent) = path.parent() {
-                            path = parent.to_path_buf();
-                        }
+                    if path.is_file()
+                        && let Some(parent) = path.parent()
+                    {
+                        path = parent.to_path_buf();
                     }
                     return Some(path);
                 }
@@ -450,24 +460,24 @@ fn read_step_timestamps(connection: &Connection) -> Result<HashMap<i64, DateTime
         let metadata: Vec<u8> = row.get(1)?;
 
         let fields = parse_proto_fields(&metadata);
-        if let Some(f1_list) = fields.get(&1) {
-            if let Some(ProtoValue::Bytes(time_bytes)) = f1_list.first() {
-                let time_fields = parse_proto_fields(time_bytes);
-                if let Some(f1_sec) = time_fields.get(&1) {
-                    if let Some(ProtoValue::Varint(seconds)) = f1_sec.first() {
-                        let nanos = time_fields
-                            .get(&2)
-                            .and_then(|vals| vals.first())
-                            .map(|v| match v {
-                                ProtoValue::Varint(n) => *n as u32,
-                                _ => 0,
-                            })
-                            .unwrap_or(0);
+        if let Some(f1_list) = fields.get(&1)
+            && let Some(ProtoValue::Bytes(time_bytes)) = f1_list.first()
+        {
+            let time_fields = parse_proto_fields(time_bytes);
+            if let Some(f1_sec) = time_fields.get(&1)
+                && let Some(ProtoValue::Varint(seconds)) = f1_sec.first()
+            {
+                let nanos = time_fields
+                    .get(&2)
+                    .and_then(|vals| vals.first())
+                    .map(|v| match v {
+                        ProtoValue::Varint(n) => *n as u32,
+                        _ => 0,
+                    })
+                    .unwrap_or(0);
 
-                        if let Some(dt) = DateTime::<Utc>::from_timestamp(*seconds as i64, nanos) {
-                            map.insert(idx, dt);
-                        }
-                    }
+                if let Some(dt) = DateTime::<Utc>::from_timestamp(*seconds as i64, nanos) {
+                    map.insert(idx, dt);
                 }
             }
         }
@@ -484,5 +494,18 @@ mod tests {
     fn parses_varint_and_fields() {
         let mut reader = ProtoReader::new(&[0x08, 0x96, 0x01]);
         assert_eq!(reader.next_field(), Some((1, ProtoValue::Varint(150))));
+    }
+
+    #[test]
+    fn table_less_conversation_databases_parse_to_nothing() {
+        // Antigravity leaves files like this behind for abandoned
+        // conversations: created, never given a schema.
+        let path = std::env::temp_dir().join(format!(
+            "llmeter-antigravity-empty-{}.db",
+            std::process::id()
+        ));
+        Connection::open(&path).unwrap().execute_batch("").unwrap();
+        assert!(parse_antigravity_sqlite(&path).unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
     }
 }

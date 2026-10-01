@@ -18,5 +18,6 @@ pub use parsers::jsonl::{IncrementalJsonlReader, IncrementalRead, ParsedLine};
 pub use providers::{ParsedUsage, ProviderAdapter};
 pub use sync::{SyncEngine, SyncOptions};
 pub use transcript::{
-    SessionTranscript, TranscriptMessage, TranscriptRole, load_session_transcript,
+    SessionTranscript, TranscriptImage, TranscriptMessage, TranscriptPhase, TranscriptRole,
+    load_session_transcript,
 };

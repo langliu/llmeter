@@ -3,6 +3,7 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, Read},
     path::Path,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -29,11 +30,28 @@ pub enum TranscriptRole {
     Tool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TranscriptPhase {
+    #[default]
+    Unspecified,
+    Progress,
+    Final,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranscriptMessage {
     pub role: TranscriptRole,
+    pub phase: TranscriptPhase,
     pub content: String,
     pub timestamp: Option<DateTime<Utc>>,
+    pub images: Vec<TranscriptImage>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranscriptImage {
+    pub source: String,
+    pub mime: String,
+    pub data: Option<Arc<[u8]>>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -56,7 +74,7 @@ pub fn load_session_transcript(session: &SessionSummary) -> Result<SessionTransc
         bail!("the local session source is no longer available");
     }
 
-    match session.provider {
+    let mut transcript = match session.provider {
         Provider::Claude | Provider::Codex | Provider::Pi | Provider::Omp => {
             load_jsonl(path, session)
         }
@@ -88,7 +106,9 @@ pub fn load_session_transcript(session: &SessionSummary) -> Result<SessionTransc
             "{} transcripts are not supported yet",
             session.provider.display_name()
         ),
-    }
+    }?;
+    resolve_transcript_images(&mut transcript, path);
+    Ok(transcript)
 }
 
 #[derive(Default)]
@@ -131,13 +151,119 @@ impl TranscriptBuilder {
             role,
             content,
             timestamp,
+            images: Vec::new(),
+            phase: TranscriptPhase::Unspecified,
         });
+    }
+
+    fn push_image(
+        &mut self,
+        role: TranscriptRole,
+        image: TranscriptImage,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
+        if let Some(last) = self.messages.last_mut().filter(|last| last.role == role) {
+            last.images.push(image);
+        } else if self.messages.len() < MAX_MESSAGES {
+            self.messages.push(TranscriptMessage {
+                role,
+                content: String::new(),
+                timestamp,
+                images: vec![image],
+                phase: TranscriptPhase::Unspecified,
+            });
+        } else {
+            self.truncated = true;
+        }
     }
 
     fn finish(self) -> SessionTranscript {
         SessionTranscript {
             messages: self.messages,
             truncated: self.truncated,
+        }
+    }
+}
+
+fn resolve_transcript_images(transcript: &mut SessionTranscript, source_path: &Path) {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let mut remaining = 64 * 1024 * 1024usize;
+    for image in transcript
+        .messages
+        .iter_mut()
+        .flat_map(|message| &mut message.images)
+    {
+        let source = if let Some(reference) = image.source.strip_prefix("zcode-artifact://") {
+            let Some((session, artifact)) = reference.split_once('/') else {
+                continue;
+            };
+            if session.contains(['/', '\\'])
+                || artifact.contains(['/', '\\'])
+                || session == ".."
+                || artifact == ".."
+            {
+                continue;
+            }
+            let Some(root) = source_path.parent().and_then(Path::parent) else {
+                continue;
+            };
+            let directory = root.join("artifacts").join(session);
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                continue;
+            };
+            let Some(path) = entries.flatten().map(|entry| entry.path()).find(|path| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| stem.ends_with(artifact))
+            }) else {
+                continue;
+            };
+            let Ok(metadata) = path.metadata() else {
+                continue;
+            };
+            if metadata.len() > MAX_SOURCE_BYTES || metadata.len() as usize > remaining {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            source
+        } else {
+            image.source.clone()
+        };
+        if let Some(uri) = source.strip_prefix("data:") {
+            let Some((header, payload)) = uri.split_once(',') else {
+                continue;
+            };
+            let Some(mime) = header.strip_suffix(";base64") else {
+                continue;
+            };
+            if !mime.starts_with("image/")
+                || payload.len() > MAX_SOURCE_BYTES as usize
+                || payload.len() > remaining
+            {
+                continue;
+            }
+            if let Ok(data) = STANDARD.decode(payload.trim()) {
+                remaining -= data.len();
+                image.mime = mime.to_string();
+                image.data = Some(data.into());
+            }
+        } else {
+            let path = Path::new(source.strip_prefix("file://").unwrap_or(&source));
+            if !path.is_absolute() {
+                continue;
+            }
+            let Ok(metadata) = path.metadata() else {
+                continue;
+            };
+            if metadata.len() > MAX_SOURCE_BYTES || metadata.len() as usize > remaining {
+                continue;
+            }
+            if let Ok(data) = std::fs::read(path) {
+                remaining -= data.len();
+                image.data = Some(data.into());
+            }
         }
     }
 }
@@ -183,7 +309,7 @@ fn parse_json_record(provider: Provider, value: &Value, builder: &mut Transcript
     if provider == Provider::Codex {
         parse_codex_record(value, builder);
     } else {
-        parse_generic_record(value, None, builder);
+        parse_generic_record(value, None, builder, None);
     }
 }
 
@@ -226,26 +352,182 @@ fn parse_codex_record(value: &Value, builder: &mut TranscriptBuilder) {
             if let Some(content) = content {
                 append_content(builder, TranscriptRole::Thinking, content, timestamp);
             }
+        } else if matches!(item_type.as_str(), "function_call" | "custom_tool_call") {
+            let mut call = payload.clone();
+            if let Some(input) = payload.get("input") {
+                call["arguments"] = input.clone();
+            }
+            builder.push(TranscriptRole::Tool, tool_call_text(&call), timestamp);
+        } else if matches!(
+            item_type.as_str(),
+            "function_call_output" | "custom_tool_call_output"
+        ) {
+            if let Some(output) = payload.get("output") {
+                append_content(builder, TranscriptRole::Tool, output, timestamp);
+            }
         } else if item_type == "message" {
-            let role = string_field(payload, "role")
-                .and_then(parse_role)
-                .unwrap_or(TranscriptRole::Assistant);
+            // Response items include hidden system/developer prompts. Only
+            // explicit conversation roles belong in the visible transcript.
+            let Some(role) = string_field(payload, "role").and_then(parse_role) else {
+                return;
+            };
             if let Some(content) = field(payload, "content") {
-                append_content(builder, role, content, timestamp);
+                if role == TranscriptRole::User {
+                    append_codex_user(builder, payload, content, timestamp);
+                } else {
+                    let phase = match payload.get("phase").and_then(Value::as_str) {
+                        Some("commentary") => TranscriptPhase::Progress,
+                        Some("final_answer") => TranscriptPhase::Final,
+                        _ => TranscriptPhase::Unspecified,
+                    };
+                    let mut parts = TranscriptBuilder::default();
+                    append_content(&mut parts, role, content, timestamp);
+                    let text = parts
+                        .messages
+                        .iter()
+                        .map(|message| message.content.as_str())
+                        .filter(|text| !text.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    let images = parts
+                        .messages
+                        .into_iter()
+                        .flat_map(|message| message.images)
+                        .collect::<Vec<_>>();
+                    if text.is_empty() && images.is_empty() {
+                        return;
+                    }
+                    builder.push(role, text, timestamp);
+                    for image in images {
+                        builder.push_image(role, image, timestamp);
+                    }
+                    if let Some(last) = builder.messages.last_mut().filter(|last| last.role == role)
+                    {
+                        last.phase = phase;
+                    }
+                }
             }
         }
         return;
     }
 
-    parse_generic_record(value, None, builder);
+    parse_generic_record(value, None, builder, None);
+}
+
+/// Recover the visible input as one message instead of one bubble per content item.
+fn append_codex_user(
+    builder: &mut TranscriptBuilder,
+    payload: &Value,
+    content: &Value,
+    timestamp: Option<DateTime<Utc>>,
+) {
+    let kinds = payload
+        .pointer("/internal_chat_message_metadata_passthrough/content_item_kinds")
+        .and_then(Value::as_array);
+    let mut input = TranscriptBuilder::default();
+    if let Some(items) = content.as_array() {
+        for (index, item) in items.iter().enumerate() {
+            if kinds.is_some_and(|kinds| {
+                !kinds
+                    .get(index)
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind.starts_with("user."))
+            }) {
+                continue;
+            }
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                let text = text.trim();
+                if text == "</image>" || (text.starts_with("<image name=") && text.ends_with('>')) {
+                    continue;
+                }
+                let text = if text.starts_with("# Files mentioned by the user:") {
+                    text.split_once("## My request:")
+                        .map_or(text, |(_, request)| request.trim())
+                } else {
+                    text
+                };
+                input.push(TranscriptRole::User, text, timestamp);
+            } else {
+                append_content(&mut input, TranscriptRole::User, item, timestamp);
+            }
+        }
+    } else {
+        append_content(&mut input, TranscriptRole::User, content, timestamp);
+    }
+    let text = input
+        .messages
+        .iter()
+        .filter(|message| !message.content.is_empty())
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let images = input
+        .messages
+        .into_iter()
+        .flat_map(|message| message.images)
+        .collect::<Vec<_>>();
+    if text.is_empty() && images.is_empty() {
+        return;
+    }
+    if builder.messages.len() >= MAX_MESSAGES {
+        builder.truncated = true;
+        return;
+    }
+    if let Some(last) = builder
+        .messages
+        .last_mut()
+        .filter(|last| last.role == TranscriptRole::User && last.content == text)
+    {
+        if last.images.is_empty() {
+            last.images = images;
+        }
+        return;
+    }
+    builder.messages.push(TranscriptMessage {
+        role: TranscriptRole::User,
+        content: text,
+        timestamp,
+        images,
+        phase: TranscriptPhase::Unspecified,
+    });
+}
+
+/// Runtime-injected user-role records are work context, not human turn boundaries.
+fn transcript_content_role(role: TranscriptRole, value: &Value) -> TranscriptRole {
+    let synthetic = value.get("synthetic").and_then(Value::as_bool) == Some(true);
+    let model_only = value.get("visibility").and_then(Value::as_str) == Some("model-only")
+        || value
+            .pointer("/metadata/visibility")
+            .and_then(Value::as_str)
+            == Some("model-only");
+    if role == TranscriptRole::User && (synthetic || model_only) {
+        TranscriptRole::Tool
+    } else {
+        role
+    }
 }
 
 fn parse_generic_record(
     value: &Value,
     fallback_role: Option<TranscriptRole>,
     builder: &mut TranscriptBuilder,
+    row_timestamp: Option<DateTime<Utc>>,
 ) {
-    let timestamp = record_timestamp(value);
+    // SQLite rows often carry the creation time in a column while the payload
+    // JSON has none; the row timestamp backstops the record's own field.
+    let timestamp = record_timestamp(value).or(row_timestamp);
+    if matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("file" | "image" | "input_image" | "image_url")
+    ) {
+        append_content_object(
+            builder,
+            fallback_role.unwrap_or(TranscriptRole::User),
+            value,
+            timestamp,
+        );
+        return;
+    }
 
     if let Some(message) = field(value, "message")
         && let Some(message_object) = message.as_object()
@@ -255,7 +537,12 @@ fn parse_generic_record(
             .or_else(|| field(message, "text"))
             .or_else(|| field(message, "output_text"));
         if let Some(content) = content {
-            append_content(builder, role, content, timestamp);
+            append_content(
+                builder,
+                transcript_content_role(role, message),
+                content,
+                timestamp,
+            );
         }
         // A few formats put the useful fields next to `role` in the message
         // object. Do not recurse through metadata when no content was found.
@@ -280,7 +567,12 @@ fn parse_generic_record(
         .or_else(|| field(value, "thinking"))
         .or_else(|| field(value, "reasoning"));
     if let Some(content) = content {
-        append_content(builder, role, content, timestamp);
+        append_content(
+            builder,
+            transcript_content_role(role, value),
+            content,
+            timestamp,
+        );
     }
 }
 
@@ -312,6 +604,62 @@ fn append_content_object(
     value: &Value,
     timestamp: Option<DateTime<Utc>>,
 ) {
+    let role = transcript_content_role(role, value);
+    let mime = string_field(value, "mime")
+        .or_else(|| string_field(value, "media_type"))
+        .or_else(|| {
+            value
+                .pointer("/source/media_type")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    let kind = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if matches!(kind, "image" | "input_image" | "image_url")
+        || (kind == "file"
+            && mime
+                .as_deref()
+                .is_some_and(|mime| mime.starts_with("image/")))
+    {
+        let source = string_field(value, "url")
+            .or_else(|| string_field(value, "image_url"))
+            .or_else(|| {
+                value
+                    .pointer("/image_url/url")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                value
+                    .pointer("/source/url")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or_else(|| string_field(value, "path"))
+            .or_else(|| {
+                value
+                    .pointer("/source/data")
+                    .and_then(Value::as_str)
+                    .map(|data| {
+                        format!(
+                            "data:{};base64,{data}",
+                            mime.as_deref().unwrap_or("image/png")
+                        )
+                    })
+            });
+        builder.push_image(
+            role,
+            TranscriptImage {
+                source: source.unwrap_or_default(),
+                mime: mime.unwrap_or_else(|| "image/png".into()),
+                data: None,
+            },
+            timestamp,
+        );
+        return;
+    }
     let kind = string_field(value, "type")
         .map(|kind| kind.to_ascii_lowercase())
         .unwrap_or_default();
@@ -806,7 +1154,7 @@ fn load_zed_sqlite(path: &Path, session: &SessionSummary) -> Result<SessionTrans
                 append_content(&mut builder, role, content, timestamp);
             }
         } else {
-            parse_generic_record(message, None, &mut builder);
+            parse_generic_record(message, None, &mut builder, None);
         }
         if builder.messages.len() >= MAX_MESSAGES {
             builder.truncated = true;
@@ -857,6 +1205,7 @@ fn infer_raw_role(
             })
         })
         .or(fallback)
+        .map(|role| data.map_or(role, |value| transcript_content_role(role, value)))
 }
 
 fn parse_raw_row(
@@ -868,7 +1217,7 @@ fn parse_raw_row(
     let timestamp = row.timestamp.as_deref().and_then(parse_timestamp_text);
     let before = builder.messages.len();
     if let Some(value) = data {
-        parse_generic_record(value, fallback, builder);
+        parse_generic_record(value, fallback, builder, timestamp);
     }
     if builder.messages.len() == before
         && let Some(content) = row.content.as_deref()
@@ -1115,6 +1464,81 @@ fn row_text(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<String>> {
     }
 }
 
+fn load_antigravity_sqlite(path: &Path, _session: &SessionSummary) -> Result<SessionTranscript> {
+    use crate::providers::antigravity::{ProtoValue, parse_proto_fields};
+
+    let connection = open_read_only(path)?;
+    let mut stmt = connection
+        .prepare("SELECT idx, step_type, step_payload, metadata FROM steps ORDER BY idx")?;
+
+    let mut builder = TranscriptBuilder::default();
+    let mut rows = stmt.query([])?;
+
+    while let Some(row) = rows.next()? {
+        let _idx: i64 = row.get(0)?;
+        let _step_type: i64 = row.get(1)?;
+        let payload: Vec<u8> = row.get(2)?;
+        let metadata: Vec<u8> = row.get(3)?;
+
+        let mut timestamp = None;
+        let meta_fields = parse_proto_fields(&metadata);
+        if let Some(f1_list) = meta_fields.get(&1)
+            && let Some(ProtoValue::Bytes(time_bytes)) = f1_list.first()
+        {
+            let time_fields = parse_proto_fields(time_bytes);
+            if let Some(f1_sec) = time_fields.get(&1)
+                && let Some(ProtoValue::Varint(sec)) = f1_sec.first()
+            {
+                let nanos = time_fields
+                    .get(&2)
+                    .and_then(|vals| vals.first())
+                    .map(|v| match v {
+                        ProtoValue::Varint(n) => *n as u32,
+                        _ => 0,
+                    })
+                    .unwrap_or(0);
+                timestamp = DateTime::<Utc>::from_timestamp(*sec as i64, nanos);
+            }
+        }
+
+        let p_fields = parse_proto_fields(&payload);
+
+        // User message: field 19 -> field 2
+        if let Some(f19_list) = p_fields.get(&19)
+            && let Some(ProtoValue::Bytes(f19_bytes)) = f19_list.first()
+        {
+            let user_fields = parse_proto_fields(f19_bytes);
+            if let Some(f2_list) = user_fields.get(&2)
+                && let Some(ProtoValue::Bytes(text_bytes)) = f2_list.first()
+                && let Ok(text) = std::str::from_utf8(text_bytes)
+                && !text.trim().is_empty()
+            {
+                builder.push(TranscriptRole::User, text, timestamp);
+            }
+        }
+
+        // Assistant message: field 20 -> field 1 (or 8)
+        if let Some(f20_list) = p_fields.get(&20)
+            && let Some(ProtoValue::Bytes(f20_bytes)) = f20_list.first()
+        {
+            let asst_fields = parse_proto_fields(f20_bytes);
+            let text_bytes = asst_fields
+                .get(&1)
+                .and_then(|vals| vals.first())
+                .or_else(|| asst_fields.get(&8).and_then(|vals| vals.first()));
+
+            if let Some(ProtoValue::Bytes(tb)) = text_bytes
+                && let Ok(text) = std::str::from_utf8(tb)
+                && !text.trim().is_empty()
+            {
+                builder.push(TranscriptRole::Assistant, text, timestamp);
+            }
+        }
+    }
+
+    Ok(builder.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, path::PathBuf};
@@ -1164,6 +1588,134 @@ mod tests {
         assert_eq!(transcript.messages[1].role, TranscriptRole::Thinking);
         assert_eq!(transcript.messages[2].role, TranscriptRole::Assistant);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_deduplicates_user_records_and_preserves_tools_and_complete_final() {
+        let mut builder = TranscriptBuilder::default();
+        parse_codex_record(
+            &serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"hello"}}),
+            &mut builder,
+        );
+        parse_codex_record(
+            &serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}),
+            &mut builder,
+        );
+        for kind in ["function_call", "custom_tool_call"] {
+            parse_codex_record(
+                &serde_json::json!({"type":"response_item","payload":{"type":kind,"name":"read","input":"file","arguments":"file"}}),
+                &mut builder,
+            );
+            parse_codex_record(
+                &serde_json::json!({"type":"response_item","payload":{"type":format!("{kind}_output"),"output":format!("{kind} result")}}),
+                &mut builder,
+            );
+        }
+        parse_codex_record(
+            &serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"First part"},{"type":"output_text","text":"Second part"}]}}),
+            &mut builder,
+        );
+        assert_eq!(
+            builder
+                .messages
+                .iter()
+                .filter(|m| m.role == TranscriptRole::User)
+                .count(),
+            1
+        );
+        assert_eq!(
+            builder
+                .messages
+                .iter()
+                .filter(|m| m.role == TranscriptRole::Tool)
+                .count(),
+            4
+        );
+        let final_reply = builder.messages.last().unwrap();
+        assert_eq!(final_reply.phase, TranscriptPhase::Final);
+        assert_eq!(final_reply.content, "First part\n\nSecond part");
+    }
+
+    #[test]
+    fn codex_attachment_wrappers_merge_into_visible_input_and_progress_is_work() {
+        let mut builder = TranscriptBuilder::default();
+        parse_codex_record(
+            &serde_json::json!({"type":"response_item", "payload":{
+                "type":"message", "role":"user", "content":[
+                    {"type":"input_text","text":"# Files mentioned by the user:\nmetadata\n## My request:\nFix the layout"},
+                    {"type":"input_text","text":"<image name=[Image #1] path=\"/tmp/image.png\">"},
+                    {"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="},
+                    {"type":"input_text","text":"</image>"}],
+                "internal_chat_message_metadata_passthrough":{"content_item_kinds":["user.text","user.text","user.image","user.text"]}
+            }}),
+            &mut builder,
+        );
+        for phase in ["commentary", "final_answer"] {
+            parse_codex_record(
+                &serde_json::json!({"type":"response_item", "payload":{
+                    "type":"message","role":"assistant","phase":phase,
+                    "content":[{"type":"output_text","text":phase}]
+                }}),
+                &mut builder,
+            );
+        }
+        let transcript = builder.finish();
+        assert_eq!(transcript.messages.len(), 3);
+        assert_eq!(transcript.messages[0].content, "Fix the layout");
+        assert_eq!(transcript.messages[0].images.len(), 1);
+        assert_eq!(transcript.messages[1].role, TranscriptRole::Assistant);
+        assert_eq!(transcript.messages[1].phase, TranscriptPhase::Progress);
+        assert_eq!(transcript.messages[2].role, TranscriptRole::Assistant);
+    }
+
+    #[test]
+    fn codex_user_origin_hides_injected_context_and_preserves_real_input() {
+        let mut builder = TranscriptBuilder::default();
+        for (kind, text) in [
+            ("agents_md.instructions", "project instructions"),
+            ("environments.environment_context", "environment"),
+            ("additional_content.codex_apps_open_page", "page metadata"),
+            (
+                "user.text",
+                "# AGENTS.md instructions for a file I want you to edit",
+            ),
+        ] {
+            parse_codex_record(
+                &serde_json::json!({"type":"response_item", "payload":{
+                    "type":"message", "role":"user", "content":[{"type":"input_text", "text":text}],
+                    "internal_chat_message_metadata_passthrough":{"content_item_kinds":[kind]}
+                }}),
+                &mut builder,
+            );
+        }
+        let transcript = builder.finish();
+        assert_eq!(transcript.messages.len(), 1);
+        assert_eq!(
+            transcript.messages[0].content,
+            "# AGENTS.md instructions for a file I want you to edit"
+        );
+    }
+
+    #[test]
+    fn codex_hidden_roles_are_not_conversation_messages() {
+        let mut builder = TranscriptBuilder::default();
+        for role in ["system", "developer", "unknown", "user", "assistant"] {
+            parse_codex_record(
+                &serde_json::json!({"type":"response_item", "payload":{
+                    "type":"message", "role":role, "content":[{"type":"input_text", "text":role}]
+                }}),
+                &mut builder,
+            );
+        }
+        let transcript = builder.finish();
+        assert_eq!(
+            transcript
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user", "assistant"]
+        );
     }
 
     #[test]
@@ -1252,6 +1804,132 @@ mod tests {
     }
 
     #[test]
+    fn zcode_image_attachment_resolves_artifact_and_stays_with_user_text() {
+        let root = std::env::temp_dir().join(format!("llmeter-image-{}", uuid::Uuid::new_v4()));
+        let artifacts = root.join("artifacts/s1");
+        fs::create_dir_all(&artifacts).unwrap();
+        fs::write(
+            artifacts.join("prompt-upload-image1.txt"),
+            "data:image/png;base64,aGVsbG8=",
+        )
+        .unwrap();
+        let mut builder = TranscriptBuilder::default();
+        builder.push(TranscriptRole::User, "Look at this image", None);
+        parse_generic_record(
+            &serde_json::json!({"type":"file", "mime":"image/jpeg",
+            "url":"zcode-artifact://s1/image1"}),
+            Some(TranscriptRole::User),
+            &mut builder,
+            None,
+        );
+        let mut transcript = builder.finish();
+        resolve_transcript_images(&mut transcript, &root.join("db/db.sqlite"));
+        assert_eq!(transcript.messages.len(), 1);
+        assert_eq!(transcript.messages[0].content, "Look at this image");
+        let image = &transcript.messages[0].images[0];
+        assert_eq!(
+            image.mime, "image/png",
+            "artifact MIME overrides original metadata"
+        );
+        assert_eq!(image.data.as_deref(), Some(b"hello".as_slice()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn image_only_and_missing_attachments_remain_in_transcript() {
+        let mut builder = TranscriptBuilder::default();
+        append_content(
+            &mut builder,
+            TranscriptRole::User,
+            &serde_json::json!([
+                {"type":"image", "source":{"type":"base64", "media_type":"image/png", "data":"aGVsbG8="}},
+                {"type":"input_image", "image_url":"/missing/image.png"}
+            ]),
+            None,
+        );
+        let mut transcript = builder.finish();
+        resolve_transcript_images(&mut transcript, Path::new("/tmp/session.jsonl"));
+        assert_eq!(transcript.messages.len(), 1);
+        assert_eq!(transcript.messages[0].images.len(), 2);
+        assert!(transcript.messages[0].images[0].data.is_some());
+        assert!(transcript.messages[0].images[1].data.is_none());
+    }
+
+    #[test]
+    fn zcode_runtime_reminders_do_not_create_user_turns() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE message (id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+            CREATE TABLE part (id TEXT, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);").unwrap();
+        let records = [
+            (
+                "user",
+                serde_json::json!({"type":"text", "text":"开始优化"}),
+                false,
+            ),
+            (
+                "assistant",
+                serde_json::json!({"type":"reasoning", "text":"inspect"}),
+                false,
+            ),
+            (
+                "assistant",
+                serde_json::json!({"type":"text", "text":"progress"}),
+                false,
+            ),
+            (
+                "user",
+                serde_json::json!({"type":"text", "text":"TodoWrite reminder", "synthetic":true,
+                "metadata":{"source":"todo_reminder", "visibility":"model-only"}}),
+                true,
+            ),
+            (
+                "assistant",
+                serde_json::json!({"type":"reasoning", "text":"continue"}),
+                false,
+            ),
+            (
+                "assistant",
+                serde_json::json!({"type":"text", "text":"done"}),
+                false,
+            ),
+        ];
+        for (index, (role, part, synthetic)) in records.into_iter().enumerate() {
+            let id = index.to_string();
+            let parent = serde_json::json!({"role":role, "synthetic":synthetic});
+            connection
+                .execute(
+                    "INSERT INTO message VALUES (?1,'s1',?2,?3)",
+                    rusqlite::params![id, index as i64, parent.to_string()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO part VALUES (?1,?1,'s1',?2,?3)",
+                    rusqlite::params![id, index as i64, part.to_string()],
+                )
+                .unwrap();
+        }
+        let transcript =
+            load_message_part_sqlite(&connection, "s1", &["message"], &["part"]).unwrap();
+        let roles = transcript
+            .messages
+            .iter()
+            .map(|message| message.role)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            vec![
+                TranscriptRole::User,
+                TranscriptRole::Thinking,
+                TranscriptRole::Assistant,
+                TranscriptRole::Tool,
+                TranscriptRole::Thinking,
+                TranscriptRole::Assistant
+            ]
+        );
+    }
+
+    #[test]
     fn reads_hermes_messages_and_reasoning_from_the_local_database() {
         let path = std::env::temp_dir().join(format!(
             "llmeter-transcript-hermes-{}.db",
@@ -1309,80 +1987,39 @@ mod tests {
     }
 }
 
-fn load_antigravity_sqlite(path: &Path, _session: &SessionSummary) -> Result<SessionTranscript> {
-    use crate::providers::antigravity::{ProtoValue, parse_proto_fields};
+#[cfg(test)]
+mod row_timestamp_tests {
+    use super::*;
 
-    let connection = open_read_only(path)?;
-    let mut stmt = connection
-        .prepare("SELECT idx, step_type, step_payload, metadata FROM steps ORDER BY idx")?;
-
-    let mut builder = TranscriptBuilder::default();
-    let mut rows = stmt.query([])?;
-
-    while let Some(row) = rows.next()? {
-        let _idx: i64 = row.get(0)?;
-        let _step_type: i64 = row.get(1)?;
-        let payload: Vec<u8> = row.get(2)?;
-        let metadata: Vec<u8> = row.get(3)?;
-
-        let mut timestamp = None;
-        let meta_fields = parse_proto_fields(&metadata);
-        if let Some(f1_list) = meta_fields.get(&1) {
-            if let Some(ProtoValue::Bytes(time_bytes)) = f1_list.first() {
-                let time_fields = parse_proto_fields(time_bytes);
-                if let Some(f1_sec) = time_fields.get(&1) {
-                    if let Some(ProtoValue::Varint(sec)) = f1_sec.first() {
-                        let nanos = time_fields
-                            .get(&2)
-                            .and_then(|vals| vals.first())
-                            .map(|v| match v {
-                                ProtoValue::Varint(n) => *n as u32,
-                                _ => 0,
-                            })
-                            .unwrap_or(0);
-                        timestamp = DateTime::<Utc>::from_timestamp(*sec as i64, nanos);
-                    }
-                }
-            }
-        }
-
-        let p_fields = parse_proto_fields(&payload);
-
-        // User message: field 19 -> field 2
-        if let Some(f19_list) = p_fields.get(&19) {
-            if let Some(ProtoValue::Bytes(f19_bytes)) = f19_list.first() {
-                let user_fields = parse_proto_fields(f19_bytes);
-                if let Some(f2_list) = user_fields.get(&2) {
-                    if let Some(ProtoValue::Bytes(text_bytes)) = f2_list.first() {
-                        if let Ok(text) = std::str::from_utf8(text_bytes) {
-                            if !text.trim().is_empty() {
-                                builder.push(TranscriptRole::User, text, timestamp);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Assistant message: field 20 -> field 1 (or 8)
-        if let Some(f20_list) = p_fields.get(&20) {
-            if let Some(ProtoValue::Bytes(f20_bytes)) = f20_list.first() {
-                let asst_fields = parse_proto_fields(f20_bytes);
-                let text_bytes = asst_fields
-                    .get(&1)
-                    .and_then(|vals| vals.first())
-                    .or_else(|| asst_fields.get(&8).and_then(|vals| vals.first()));
-
-                if let Some(ProtoValue::Bytes(tb)) = text_bytes {
-                    if let Ok(text) = std::str::from_utf8(tb) {
-                        if !text.trim().is_empty() {
-                            builder.push(TranscriptRole::Assistant, text, timestamp);
-                        }
-                    }
-                }
-            }
-        }
+    #[test]
+    fn row_timestamp_backstops_records_without_payload_time() {
+        let mut builder = TranscriptBuilder::default();
+        let row = RawRow {
+            id: None,
+            parent_id: None,
+            data: Some(r#"{"role":"assistant","content":"done"}"#.into()),
+            role: None,
+            content: None,
+            reasoning: None,
+            reasoning_content: None,
+            reasoning_details: None,
+            codex_reasoning_items: None,
+            codex_message_items: None,
+            tool_calls: None,
+            tool_name: None,
+            timestamp: Some("1790773590614".into()),
+        };
+        parse_raw_row(
+            &row,
+            parse_row_data(&row).as_ref(),
+            Some(TranscriptRole::Assistant),
+            &mut builder,
+        );
+        let transcript = builder.finish();
+        assert_eq!(transcript.messages.len(), 1);
+        assert_eq!(
+            transcript.messages[0].timestamp,
+            DateTime::<Utc>::from_timestamp_millis(1_790_773_590_614),
+        );
     }
-
-    Ok(builder.finish())
 }

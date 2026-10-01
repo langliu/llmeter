@@ -147,6 +147,7 @@ sessions:
   subtitle: "Browse local AI coding agent sessions, click one for details, and copy its resume command."
   transcript_details: "Conversation"
   transcript_loading: "Reading the conversation from the local session log…"
+  transcript_image_unavailable: "Image unavailable (local file missing or unsupported format)"
   transcript_empty: "This session has no conversation content to display."
   transcript_unavailable: "Conversation content is unavailable"
   transcript_truncated: "The session is long; only the beginning is shown."

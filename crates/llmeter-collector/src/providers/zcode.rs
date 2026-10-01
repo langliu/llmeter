@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -7,7 +7,7 @@ use llmeter_core::{
 };
 use rusqlite::Connection;
 
-use super::{ParsedUsage, ProviderAdapter, data_status, home_dir, project_name};
+use super::{ParsedUsage, PathMemo, ProviderAdapter, data_status, home_dir, project_name};
 use crate::sqlite::{open_read_only, table_has_columns};
 
 const ZCODE_PARSER_VERSION: u32 = 1;
@@ -26,9 +26,12 @@ const REQUIRED_USAGE_COLUMNS: &[&str] = &[
     "computed_total_tokens",
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ZCodeAdapter {
     root: PathBuf,
+    /// detect, discover, and parse each need the schema flags; the memo keeps
+    /// repeated syncs from reopening the database just to re-run PRAGMA.
+    schema: PathMemo<UsageSchema>,
 }
 
 impl Default for ZCodeAdapter {
@@ -36,7 +39,10 @@ impl Default for ZCodeAdapter {
         let root = std::env::var_os("ZCODE_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home_dir().join(".zcode"));
-        Self { root }
+        Self {
+            root,
+            schema: PathMemo::new(),
+        }
     }
 }
 
@@ -44,18 +50,31 @@ impl ZCodeAdapter {
     pub fn with_home(home: PathBuf) -> Self {
         Self {
             root: home.join(".zcode"),
+            schema: PathMemo::new(),
         }
     }
 
     fn database_path(&self) -> PathBuf {
         self.root.join("cli").join("db").join("db.sqlite")
     }
+
+    /// Cached schema probe; open/PRAGMA failures are not memoized so a locked
+    /// database is retried on the next sync.
+    fn schema_for(&self, path: &Path) -> Result<UsageSchema> {
+        if let Some(cached) = self.schema.get(path) {
+            return Ok(cached);
+        }
+        let connection = open_read_only(path)?;
+        let schema = inspect_schema(&connection)?;
+        self.schema.insert(path, schema.clone());
+        Ok(schema)
+    }
 }
 
 /// Schema support flags for the ZCode database. The real tables carry more
 /// columns than REQUIRED_USAGE_COLUMNS names; support only requires that every
 /// required column exists, not an exact match.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct UsageSchema {
     /// `model_usage` exists with every required usage column.
     model_usage_supported: bool,
@@ -93,9 +112,7 @@ impl ProviderAdapter for ZCodeAdapter {
         if !database.is_file() {
             return Ok(data_status(Provider::ZCode, roots, false, None));
         }
-        let connection = open_read_only(&database)?;
-        let schema = inspect_schema(&connection)?;
-        if schema.model_usage_supported {
+        if self.schema_for(&database)?.model_usage_supported {
             Ok(data_status(
                 Provider::ZCode,
                 roots,
@@ -127,8 +144,7 @@ impl ProviderAdapter for ZCodeAdapter {
         if !database.is_file() {
             return Ok(Vec::new());
         }
-        let connection = open_read_only(&database)?;
-        if !inspect_schema(&connection)?.model_usage_supported {
+        if !self.schema_for(&database)?.model_usage_supported {
             return Ok(Vec::new());
         }
         Ok(vec![SourceFile {
@@ -146,11 +162,11 @@ impl ProviderAdapter for ZCodeAdapter {
     }
 
     fn parse_sqlite(&self, source: &SourceFile) -> Result<Vec<ParsedUsage>> {
-        let connection = open_read_only(&source.path)?;
-        let schema = inspect_schema(&connection)?;
+        let schema = self.schema_for(&source.path)?;
         if !schema.model_usage_supported {
             anyhow::bail!("ZCode model_usage schema is unsupported");
         }
+        let connection = open_read_only(&source.path)?;
         let directory_expression = if schema.session_join_supported {
             "s.directory"
         } else {
