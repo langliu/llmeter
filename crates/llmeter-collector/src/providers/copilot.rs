@@ -10,7 +10,7 @@ use llmeter_core::{
 };
 use serde_json::Value;
 
-use super::{ParsedSnapshot, ParsedUsage, ProviderAdapter, SnapshotPolicy, data_status, home_dir};
+use super::{ParsedSnapshot, ParsedUsage, ProviderAdapter, data_status, home_dir};
 
 const COPILOT_PARSER_VERSION: u32 = 1;
 /// Copilot event logs are session-scoped and re-read wholesale on change;
@@ -145,17 +145,17 @@ impl ProviderAdapter for CopilotAdapter {
     }
 
     fn parse_snapshot(&self, source: &SourceFile) -> Result<ParsedSnapshot> {
-        let empty = ParsedSnapshot {
-            usages: Vec::new(),
-            policy: SnapshotPolicy::Upsert,
-            scope: None,
-        };
         if fs::metadata(&source.path)
             .map(|metadata| metadata.len())
             .unwrap_or(0)
             > MAX_EVENTS_BYTES
         {
-            return Ok(empty);
+            tracing::warn!(
+                path = %source.path.display(),
+                limit = MAX_EVENTS_BYTES,
+                "skipping oversized Copilot session event log"
+            );
+            return Ok(ParsedSnapshot::default());
         }
         let bytes = fs::read(&source.path)?;
         let session = source
@@ -197,7 +197,12 @@ impl ProviderAdapter for CopilotAdapter {
                     project_path: None,
                     project_name: None,
                     // Shutdown counters are cumulative, so the shutdown's
-                    // position in the file keys the delta stably.
+                    // position in the file keys the delta stably. This holds
+                    // because Copilot only ever appends to a session's
+                    // events.jsonl; a same-directory file rotation would
+                    // collide these ids, and a resume that opens a new
+                    // session directory with carried-over counters would
+                    // diff from zero and overcount.
                     source_event_id: Some(format!("{session}:{index}:{model}")),
                     reported_cost_usd: None,
                 });
@@ -205,8 +210,7 @@ impl ProviderAdapter for CopilotAdapter {
         }
         Ok(ParsedSnapshot {
             usages,
-            policy: SnapshotPolicy::Upsert,
-            scope: None,
+            ..ParsedSnapshot::default()
         })
     }
 }

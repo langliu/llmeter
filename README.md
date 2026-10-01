@@ -82,8 +82,9 @@ safety rescan.
   diffing the cumulative per-model counters of each `session.shutdown` so
   resumed sessions only count their increments
 - Cline: the per-task totals in `~/.cline/data/state/taskHistory.json` (or
-  `$CLINE_DATA_DIR`/`$CLINE_DIR`), with cache buckets separated and the
-  reported USD cost
+  `$CLINE_DATA_DIR`/`$CLINE_DIR/data`), plus the same file from pre-SDK
+  installs still living in the VS Code extension's globalStorage; cache
+  buckets separated and the reported USD cost included
 - Roo Code: every editor's `globalStorage/rooveterinaryinc.roo-cline` task
   history (VS Code, VSCodium, Cursor, Windsurf), one usage per task
 - Kilo Code: the `step-finish` parts of `~/.local/share/kilo/kilo.db`

@@ -99,13 +99,15 @@ impl Provider {
             Self::Omp => Some(format!("omp --resume {session_ref}")),
             Self::Grok => Some(format!("grok --resume {session_ref}")),
             Self::Hermes => Some(format!("hermes --resume {session_ref}")),
-            Self::Copilot => Some(format!("copilot resume {session_ref}")),
+            // `copilot --resume` is an interactive picker with no session
+            // argument, so there is no per-session command to offer.
             Self::Cursor
             | Self::Qoder
             | Self::Trae
             | Self::Zed
             | Self::Antigravity
             | Self::ZCode
+            | Self::Copilot
             | Self::Cline
             | Self::Roo
             | Self::Kilo => None,

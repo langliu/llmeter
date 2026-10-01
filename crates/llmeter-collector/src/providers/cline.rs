@@ -6,9 +6,15 @@ use llmeter_core::{
 };
 use serde_json::Value;
 
-use super::{ParsedSnapshot, ParsedUsage, ProviderAdapter, SnapshotPolicy, data_status, home_dir};
+use super::{
+    ParsedSnapshot, ParsedUsage, ProviderAdapter, data_status, editor_global_storage_dirs, home_dir,
+};
 
 const CLINE_PARSER_VERSION: u32 = 1;
+/// Cline records the task's working directory under
+/// `cwdOnTaskInitialization`; the Roo Code fork renamed it to `workspace`.
+pub(crate) const HISTORY_CWD_KEYS: &[&str] = &["cwdOnTaskInitialization", "workspace"];
+const CLINE_VSCODE_STORAGE_ID: &str = "saoudrizwan.claude-dev";
 
 /// Cline's per-task history record, shared (with small field variations) by
 /// the Roo Code fork. `tokensIn` is uncached input; the cache buckets and
@@ -81,28 +87,43 @@ pub(crate) fn history_item_usage(item: &HistoryItem, session_id: Option<String>)
     }
 }
 
+/// Current Cline installs keep task history under `~/.cline/data`; installs
+/// from before that SDK migration still write the same JSON array into the
+/// VS Code extension's globalStorage. Both are read.
 #[derive(Clone, Debug)]
 pub struct ClineAdapter {
-    data_root: PathBuf,
+    roots: Vec<PathBuf>,
 }
 
 impl Default for ClineAdapter {
     fn default() -> Self {
+        // Cline resolves CLINE_DATA_DIR as the data dir itself but CLINE_DIR
+        // as the parent that gains a `/data` segment.
         let data_root = std::env::var_os("CLINE_DATA_DIR")
-            .or_else(|| std::env::var_os("CLINE_DIR"))
             .map(PathBuf::from)
+            .or_else(|| std::env::var_os("CLINE_DIR").map(|dir| PathBuf::from(dir).join("data")))
             .unwrap_or_else(|| home_dir().join(".cline").join("data"));
-        Self { data_root }
+        let mut roots = vec![data_root];
+        roots.extend(
+            editor_global_storage_dirs()
+                .into_iter()
+                .map(|storage| storage.join(CLINE_VSCODE_STORAGE_ID)),
+        );
+        Self { roots }
     }
 }
 
 impl ClineAdapter {
-    pub fn with_data_root(data_root: PathBuf) -> Self {
-        Self { data_root }
+    pub fn with_roots(roots: Vec<PathBuf>) -> Self {
+        Self { roots }
     }
 
-    fn task_history(&self) -> PathBuf {
-        self.data_root.join("state").join("taskHistory.json")
+    fn history_files(&self) -> Vec<PathBuf> {
+        self.roots
+            .iter()
+            .map(|root| root.join("state").join("taskHistory.json"))
+            .filter(|path| path.is_file())
+            .collect()
     }
 }
 
@@ -116,31 +137,31 @@ impl ProviderAdapter for ClineAdapter {
     }
 
     fn watch_roots(&self) -> Vec<PathBuf> {
-        vec![self.data_root.clone()]
+        self.roots.clone()
     }
 
     fn detect(&self) -> Result<ProviderDetection> {
         Ok(data_status(
             Provider::Cline,
-            vec![self.data_root.clone()],
-            self.task_history().is_file(),
+            self.roots.clone(),
+            !self.history_files().is_empty(),
             None,
         ))
     }
 
     fn discover_sources(&self) -> Result<Vec<SourceFile>> {
-        let history = self.task_history();
-        if !history.is_file() {
-            return Ok(Vec::new());
-        }
-        Ok(vec![SourceFile {
-            path: history,
-            provider: Provider::Cline,
-            format: SourceFormat::Snapshot,
-            session_id: None,
-            project_path: None,
-            project_name: None,
-        }])
+        Ok(self
+            .history_files()
+            .into_iter()
+            .map(|path| SourceFile {
+                path,
+                provider: Provider::Cline,
+                format: SourceFormat::Snapshot,
+                session_id: None,
+                project_path: None,
+                project_name: None,
+            })
+            .collect())
     }
 
     fn parse_line(&self, _source: &SourceFile, _line: &[u8]) -> Result<Option<ParsedUsage>> {
@@ -149,10 +170,20 @@ impl ProviderAdapter for ClineAdapter {
 
     fn parse_snapshot(&self, source: &SourceFile) -> Result<ParsedSnapshot> {
         let bytes = fs::read(&source.path)?;
-        let items: Vec<Value> = serde_json::from_slice(&bytes).unwrap_or_default();
+        let items: Vec<Value> = match serde_json::from_slice(&bytes) {
+            Ok(items) => items,
+            Err(error) => {
+                tracing::warn!(
+                    path = %source.path.display(),
+                    error = %error,
+                    "skipping malformed Cline task history"
+                );
+                Vec::new()
+            }
+        };
         let usages = items
             .iter()
-            .filter_map(|item| parse_history_item(item, &["cwdOnTaskInitialization", "workspace"]))
+            .filter_map(|item| parse_history_item(item, HISTORY_CWD_KEYS))
             .map(|item| {
                 let session_id = Some(item.id.clone());
                 history_item_usage(&item, session_id)
@@ -160,8 +191,7 @@ impl ProviderAdapter for ClineAdapter {
             .collect();
         Ok(ParsedSnapshot {
             usages,
-            policy: SnapshotPolicy::Upsert,
-            scope: None,
+            ..ParsedSnapshot::default()
         })
     }
 }
@@ -189,7 +219,7 @@ mod tests {
         )
         .unwrap();
 
-        let adapter = ClineAdapter::with_data_root(home.join(".cline").join("data"));
+        let adapter = ClineAdapter::with_roots(vec![home.join(".cline").join("data")]);
         assert_eq!(adapter.detect().unwrap().status, ProviderStatus::DataFound);
         let source = adapter.discover_sources().unwrap().remove(0);
         let snapshot = adapter.parse_snapshot(&source).unwrap();
@@ -212,11 +242,43 @@ mod tests {
     }
 
     #[test]
+    fn reads_legacy_vscode_global_storage_too() {
+        let home =
+            std::env::temp_dir().join(format!("llmeter-cline-legacy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let legacy = home
+            .join("Code")
+            .join("User")
+            .join("globalStorage")
+            .join(CLINE_VSCODE_STORAGE_ID)
+            .join("state");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(
+            legacy.join("taskHistory.json"),
+            r#"[{"id":"task-7","ts":1784102040274,"tokensIn":10,"tokensOut":2,"cacheWrites":0,"cacheReads":0,"totalCost":0.0001,"cwdOnTaskInitialization":"/tmp/old"}]"#,
+        )
+        .unwrap();
+
+        let adapter = ClineAdapter::with_roots(vec![
+            home.join(".cline").join("data"),
+            legacy.parent().unwrap().to_path_buf(),
+        ]);
+        assert_eq!(adapter.detect().unwrap().status, ProviderStatus::DataFound);
+        let sources = adapter.discover_sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        let snapshot = adapter.parse_snapshot(&sources[0]).unwrap();
+        assert_eq!(snapshot.usages.len(), 1);
+        assert_eq!(snapshot.usages[0].session_id.as_deref(), Some("task-7"));
+        assert_eq!(snapshot.usages[0].counts.total_tokens, 12);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn missing_history_reports_not_installed() {
         let home =
             std::env::temp_dir().join(format!("llmeter-cline-absent-{}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
-        let adapter = ClineAdapter::with_data_root(home);
+        let adapter = ClineAdapter::with_roots(vec![home.join(".cline").join("data")]);
         assert_eq!(
             adapter.detect().unwrap().status,
             ProviderStatus::NotInstalled

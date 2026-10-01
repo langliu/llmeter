@@ -4,15 +4,13 @@ use anyhow::Result;
 use llmeter_core::{Provider, ProviderDetection, ProviderStatus, SourceFile, SourceFormat};
 
 use super::{
-    ParsedSnapshot, ParsedUsage, ProviderAdapter, SnapshotPolicy,
-    cline::{history_item_usage, parse_history_item},
-    data_status, home_dir, walk_matching,
+    ParsedSnapshot, ParsedUsage, ProviderAdapter,
+    cline::{HISTORY_CWD_KEYS, history_item_usage, parse_history_item},
+    data_status, editor_global_storage_dirs, walk_matching,
 };
 
 const ROO_PARSER_VERSION: u32 = 1;
 const ROO_STORAGE_ID: &str = "rooveterinaryinc.roo-cline";
-/// VS Code forks Roo Code can run in; each keeps its own globalStorage tree.
-const EDITOR_APP_SUPPORT_DIRS: &[&str] = &["Code", "VSCodium", "Cursor", "Windsurf"];
 
 #[derive(Clone, Debug)]
 pub struct RooAdapter {
@@ -21,17 +19,10 @@ pub struct RooAdapter {
 
 impl Default for RooAdapter {
     fn default() -> Self {
-        let app_support = home_dir().join("Library").join("Application Support");
         Self {
-            roots: EDITOR_APP_SUPPORT_DIRS
-                .iter()
-                .map(|editor| {
-                    app_support
-                        .join(editor)
-                        .join("User")
-                        .join("globalStorage")
-                        .join(ROO_STORAGE_ID)
-                })
+            roots: editor_global_storage_dirs()
+                .into_iter()
+                .map(|storage| storage.join(ROO_STORAGE_ID))
                 .collect(),
         }
     }
@@ -106,19 +97,14 @@ impl ProviderAdapter for RooAdapter {
     fn parse_snapshot(&self, source: &SourceFile) -> Result<ParsedSnapshot> {
         let bytes = fs::read(&source.path)?;
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            return Ok(ParsedSnapshot {
-                usages: Vec::new(),
-                policy: SnapshotPolicy::Upsert,
-                scope: None,
-            });
+            tracing::warn!(
+                path = %source.path.display(),
+                "skipping malformed Roo Code history item"
+            );
+            return Ok(ParsedSnapshot::default());
         };
-        let Some(item) = parse_history_item(&value, &["workspace", "cwdOnTaskInitialization"])
-        else {
-            return Ok(ParsedSnapshot {
-                usages: Vec::new(),
-                policy: SnapshotPolicy::Upsert,
-                scope: None,
-            });
+        let Some(item) = parse_history_item(&value, HISTORY_CWD_KEYS) else {
+            return Ok(ParsedSnapshot::default());
         };
         let session_id = if item.id.is_empty() {
             source.session_id.clone()
@@ -127,8 +113,7 @@ impl ProviderAdapter for RooAdapter {
         };
         Ok(ParsedSnapshot {
             usages: vec![history_item_usage(&item, session_id)],
-            policy: SnapshotPolicy::Upsert,
-            scope: None,
+            ..ParsedSnapshot::default()
         })
     }
 }

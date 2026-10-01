@@ -85,6 +85,16 @@ pub struct ParsedSnapshot {
     pub scope: Option<String>,
 }
 
+impl Default for ParsedSnapshot {
+    fn default() -> Self {
+        Self {
+            usages: Vec::new(),
+            policy: SnapshotPolicy::default(),
+            scope: None,
+        }
+    }
+}
+
 pub(crate) fn snapshot_scope(provider: Provider, identity: &str) -> String {
     let value = format!("{provider}\u{0}{identity}");
     blake3::hash(value.as_bytes()).to_hex().to_string()
@@ -677,6 +687,17 @@ impl<T: Clone> PathMemo<T> {
 
 pub(crate) fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// VS Code forks install the same extensions under per-editor globalStorage
+/// trees. LLMeter's macOS build scans every fork an agent extension commonly
+/// runs in.
+pub(crate) fn editor_global_storage_dirs() -> Vec<PathBuf> {
+    let app_support = home_dir().join("Library").join("Application Support");
+    ["Code", "VSCodium", "Cursor", "Windsurf"]
+        .iter()
+        .map(|editor| app_support.join(editor).join("User").join("globalStorage"))
+        .collect()
 }
 
 pub(crate) fn data_status(

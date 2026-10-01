@@ -41,7 +41,9 @@ The Copilot CLI, Cline, Roo Code, and Kilo Code assets are the
 provider-specific monochrome glyphs from `@lobehub/icons-static-svg@1.95.1`
 (LobeHub/lobe-icons):
 
-- Copilot CLI: https://icons.lobehub.com/components/copilot (`copilot.svg`)
+- Copilot CLI: https://icons.lobehub.com/components/github-copilot
+  (`copilot.svg`, slug `githubcopilot` — the `copilot` slug is the adjacent
+  Microsoft Copilot product and must not be substituted)
 - Cline: https://icons.lobehub.com/components/cline (`cline.svg`)
 - Roo Code: https://icons.lobehub.com/components/roo-code (`roo.svg`)
 - Kilo Code: https://icons.lobehub.com/components/kilo-code (`kilo.svg`)
