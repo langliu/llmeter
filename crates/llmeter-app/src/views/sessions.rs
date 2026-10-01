@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::{collections::HashSet, rc::Rc};
 
 use chrono::{Datelike, Duration, Local, Timelike};
 use gpui::{
@@ -233,10 +233,10 @@ fn provider_filter(
             for provider in available_providers {
                 filters.push(SessionProviderFilter::Provider(*provider));
             }
-            if let SessionProviderFilter::Provider(active) = selected {
-                if !available_providers.contains(&active) {
-                    filters.push(selected);
-                }
+            if let SessionProviderFilter::Provider(active) = selected
+                && !available_providers.contains(&active)
+            {
+                filters.push(selected);
             }
             for (index, filter) in filters.into_iter().enumerate() {
                 menu = menu.child(provider_menu_item(filter, selected == filter, index, p, cx));
@@ -509,6 +509,8 @@ pub(crate) struct SessionDetailView {
     palette: Palette,
     transcript: TranscriptLoadState,
     transcript_item_sizes: Rc<Vec<Size<Pixels>>>,
+    /// Message indices whose thinking/tool rows the user expanded.
+    expanded_transcript_items: HashSet<usize>,
     transcript_scroll: VirtualListScrollHandle,
 }
 
@@ -518,6 +520,7 @@ impl SessionDetailView {
             palette,
             transcript: TranscriptLoadState::Loading,
             transcript_item_sizes: Rc::new(Vec::new()),
+            expanded_transcript_items: HashSet::new(),
             transcript_scroll: VirtualListScrollHandle::new(),
         }
     }
@@ -529,11 +532,12 @@ impl SessionDetailView {
     ) {
         self.transcript = match transcript {
             Ok(transcript) => {
+                self.expanded_transcript_items.clear();
                 self.transcript_item_sizes = Rc::new(
                     transcript
                         .messages
                         .iter()
-                        .map(estimated_transcript_message_size)
+                        .map(|message| estimated_transcript_message_size(message, false))
                         .collect(),
                 );
                 TranscriptLoadState::Loaded(transcript)
@@ -543,6 +547,30 @@ impl SessionDetailView {
                 TranscriptLoadState::Failed(error)
             }
         };
+        cx.notify();
+    }
+
+    fn toggle_transcript_item(&mut self, index: usize, cx: &mut Context<Self>) {
+        if !self.expanded_transcript_items.remove(&index) {
+            self.expanded_transcript_items.insert(index);
+        }
+        // Collapsing changes a row's height, so the virtual list's size
+        // table has to move with the expanded set.
+        if let TranscriptLoadState::Loaded(transcript) = &self.transcript {
+            self.transcript_item_sizes = Rc::new(
+                transcript
+                    .messages
+                    .iter()
+                    .enumerate()
+                    .map(|(position, message)| {
+                        estimated_transcript_message_size(
+                            message,
+                            self.expanded_transcript_items.contains(&position),
+                        )
+                    })
+                    .collect(),
+            );
+        }
         cx.notify();
     }
 }
@@ -619,16 +647,22 @@ fn transcript_section(
                     detail,
                     "session-transcript-items",
                     item_sizes,
-                    move |detail, visible_range, _, _| {
+                    move |detail, visible_range, _, cx| {
                         let TranscriptLoadState::Loaded(transcript) = &detail.transcript else {
                             return Vec::new();
                         };
+                        let expanded = &detail.expanded_transcript_items;
                         visible_range
                             .filter_map(|index| {
-                                transcript
-                                    .messages
-                                    .get(index)
-                                    .map(|message| transcript_message(message, p))
+                                transcript.messages.get(index).map(|message| {
+                                    transcript_message(
+                                        message,
+                                        index,
+                                        expanded.contains(&index),
+                                        p,
+                                        cx,
+                                    )
+                                })
                             })
                             .collect()
                     },
@@ -662,88 +696,175 @@ fn transcript_section(
         .child(content)
 }
 
-fn estimated_transcript_message_size(message: &TranscriptMessage) -> Size<Pixels> {
+fn estimated_transcript_message_size(message: &TranscriptMessage, expanded: bool) -> Size<Pixels> {
     const CHARS_PER_LINE: usize = 70;
     const LINE_HEIGHT: f32 = 20.0;
-    const FIXED_HEIGHT: f32 = 56.0;
+    const COLLAPSED_ROW_HEIGHT: f32 = 30.0;
+    const EXPANDED_LINE_HEIGHT: f32 = 18.0;
+    const EXPANDED_PADDING: f32 = 10.0;
+    const BUBBLE_PADDING: f32 = 22.0;
 
-    let lines = message
-        .content
+    let lines = content_lines(&message.content, CHARS_PER_LINE);
+    match message.role {
+        TranscriptRole::User => size(px(1.0), px(BUBBLE_PADDING + lines as f32 * LINE_HEIGHT)),
+        TranscriptRole::Assistant => size(px(1.0), px(lines as f32 * LINE_HEIGHT)),
+        TranscriptRole::Thinking | TranscriptRole::Tool => {
+            let expanded_height = if expanded {
+                EXPANDED_PADDING + lines as f32 * EXPANDED_LINE_HEIGHT
+            } else {
+                0.0
+            };
+            size(px(1.0), px(COLLAPSED_ROW_HEIGHT + expanded_height))
+        }
+    }
+}
+
+fn content_lines(content: &str, chars_per_line: usize) -> usize {
+    content
         .lines()
         .map(|line| {
             let width = line
                 .chars()
                 .map(|character| if character.is_ascii() { 1 } else { 2 })
-                .sum::<usize>();
-            width.max(1).div_ceil(CHARS_PER_LINE)
+                .sum::<usize>()
+                .max(1);
+            width.div_ceil(chars_per_line)
         })
         .sum::<usize>()
-        .max(1);
-    size(px(1.0), px(FIXED_HEIGHT + lines as f32 * LINE_HEIGHT))
+        .max(1)
 }
 
-fn transcript_message(message: &TranscriptMessage, p: Palette) -> AnyElement {
-    let (label, foreground, background) = match message.role {
-        TranscriptRole::User => (
-            t!("sessions.transcript_user").to_string(),
-            p.link,
-            p.link.opacity(0.1),
-        ),
-        TranscriptRole::Assistant => (
-            t!("sessions.transcript_assistant").to_string(),
-            p.success,
-            p.success.opacity(0.1),
-        ),
-        TranscriptRole::Thinking => (
+/// ZCode-style conversation rendering: user messages sit in a right-aligned
+/// bubble, assistant text flows full width without a card, and thinking/tool
+/// steps collapse to a single clickable row that expands in place.
+fn transcript_message(
+    message: &TranscriptMessage,
+    index: usize,
+    expanded: bool,
+    p: Palette,
+    cx: &mut Context<SessionDetailView>,
+) -> AnyElement {
+    match message.role {
+        TranscriptRole::User => user_bubble(message, p),
+        TranscriptRole::Assistant => assistant_text(message, p),
+        TranscriptRole::Thinking => collapsible_step(
+            message,
+            index,
+            expanded,
             t!("sessions.transcript_thinking").to_string(),
-            p.muted_foreground,
-            p.muted.opacity(0.42),
+            IconName::Cpu,
+            p,
+            cx,
         ),
-        TranscriptRole::Tool => (
-            t!("sessions.transcript_tool").to_string(),
-            p.foreground,
-            p.accent.opacity(0.28),
+        TranscriptRole::Tool => collapsible_step(
+            message,
+            index,
+            expanded,
+            tool_summary(message),
+            IconName::SquareTerminal,
+            p,
+            cx,
         ),
-    };
+    }
+}
 
-    let timestamp = message.timestamp.map(format_session_time);
-    v_flex()
-        .gap_2()
-        .rounded_lg()
-        .border_1()
-        .border_color(p.border.opacity(0.68))
-        .bg(background)
-        .px_3()
-        .py_3()
-        .child(
-            h_flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(foreground)
-                        .child(label),
-                )
-                .when_some(timestamp, |this, timestamp| {
-                    this.child(
-                        div()
-                            .text_xs()
-                            .text_color(p.muted_foreground)
-                            .child(timestamp),
-                    )
-                }),
-        )
+fn user_bubble(message: &TranscriptMessage, p: Palette) -> AnyElement {
+    h_flex()
+        .w_full()
+        .justify_end()
         .child(
             div()
-                .whitespace_normal()
+                .max_w(px(560.0))
+                .rounded_2xl()
+                .bg(p.muted.opacity(0.55))
+                .px_3p5()
+                .py_2p5()
                 .text_sm()
                 .text_color(p.foreground)
-                .child(message.content.clone()),
+                .child(div().whitespace_normal().child(message.content.clone())),
         )
         .into_any_element()
+}
+
+fn assistant_text(message: &TranscriptMessage, p: Palette) -> AnyElement {
+    div()
+        .w_full()
+        .whitespace_normal()
+        .text_sm()
+        .text_color(p.foreground)
+        .child(message.content.clone())
+        .into_any_element()
+}
+
+fn collapsible_step(
+    message: &TranscriptMessage,
+    index: usize,
+    expanded: bool,
+    label: String,
+    icon: IconName,
+    p: Palette,
+    cx: &mut Context<SessionDetailView>,
+) -> AnyElement {
+    let chevron = if expanded {
+        IconName::ChevronDown
+    } else {
+        IconName::ChevronRight
+    };
+    let mut step = v_flex().w_full().gap_1().child(
+        h_flex()
+            .id(SharedString::from(format!("transcript-step-{index}")))
+            .w_full()
+            .cursor_pointer()
+            .items_center()
+            .gap_1p5()
+            .rounded_md()
+            .px_1p5()
+            .py_1()
+            .hover(|style| style.bg(p.muted.opacity(0.4)))
+            .on_click(cx.listener(move |detail, _, _, cx| {
+                detail.toggle_transcript_item(index, cx);
+            }))
+            .child(Icon::new(icon).size_4().text_color(p.muted_foreground))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(p.muted_foreground)
+                    .child(label),
+            )
+            .child(Icon::new(chevron).size_3().text_color(p.muted_foreground)),
+    );
+    if expanded {
+        step = step.child(
+            div()
+                .pl_6()
+                .whitespace_normal()
+                .text_xs()
+                .text_color(p.muted_foreground)
+                .child(message.content.clone()),
+        );
+    }
+    step.into_any_element()
+}
+
+fn tool_summary(message: &TranscriptMessage) -> String {
+    let first_line = message
+        .content
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim();
+    let mut summary: String = first_line.chars().take(80).collect();
+    if first_line.chars().count() > summary.chars().count() {
+        summary.push('…');
+    }
+    if summary.is_empty() {
+        t!("sessions.transcript_tool").to_string()
+    } else {
+        summary
+    }
 }
 
 fn session_meta(session: &SessionSummary, model: &str, project: Option<&str>) -> String {
