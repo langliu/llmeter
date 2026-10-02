@@ -8,11 +8,11 @@ use serde_json::Value;
 
 use super::{
     ParsedUsage, ProviderAdapter, counts_from_usage, data_status, home_dir, json_value,
-    jsonl_exists, jsonl_session_sources, model, nested, project_name, project_path, session_id,
+    jsonl_exists, jsonl_session_sources, model, nested, project_name, project_path,
     source_event_id, timestamp, usage_snapshot, walk_jsonl,
 };
 
-const CODEX_PARSER_VERSION: u32 = 2;
+const CODEX_PARSER_VERSION: u32 = 4;
 
 #[derive(Clone, Debug)]
 pub struct CodexAdapter {
@@ -46,13 +46,13 @@ impl CodexAdapter {
         if let Some(model) = direct_model {
             metadata.model = Some(model.to_string());
         }
-        if let Some(session_id) = session_id(payload).or_else(|| {
-            (record_type == Some("session_meta"))
-                .then(|| nested(payload, &["id"]).and_then(Value::as_str))
-                .flatten()
-                .map(str::to_string)
-        }) {
-            metadata.session_id = Some(session_id);
+        // Only the session header defines identity. Recursive searches can find
+        // the parent ID inside a subagent's source metadata.
+        if record_type == Some("session_meta") && metadata.session_id.is_none() {
+            metadata.session_id = payload
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
         }
         if let Some(path) = project_path(payload) {
             metadata.project_name = project_name(Some(&path));
@@ -60,7 +60,7 @@ impl CodexAdapter {
         }
     }
 
-    fn parse_value(&self, source: &SourceFile, value: &Value) -> Result<Option<ParsedUsage>> {
+    fn parse_value(&self, _source: &SourceFile, value: &Value) -> Result<Option<ParsedUsage>> {
         let payload = nested(value, &["payload"]).unwrap_or(value);
         let info = nested(payload, &["info"]).unwrap_or(payload);
 
@@ -95,7 +95,7 @@ impl CodexAdapter {
             cumulative_snapshot,
             timestamp: timestamp(value),
             model: model(payload).or_else(|| model(value)),
-            session_id: session_id(value).or_else(|| source.session_id.clone()),
+            session_id: None,
             project_name: project_name(project_path.as_deref()),
             project_path,
             source_event_id: source_event_id(payload).or_else(|| source_event_id(value)),
@@ -189,6 +189,38 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn usage_uses_header_identity_instead_of_filename_and_keeps_fork_identity() {
+        let adapter = CodexAdapter::default();
+        let source = SourceFile {
+            path: PathBuf::from("/tmp/rollout-child.jsonl"),
+            provider: Provider::Codex,
+            format: SourceFormat::Jsonl,
+            session_id: Some("rollout-child".into()),
+            project_path: None,
+            project_name: None,
+        };
+        let mut metadata = SourceMetadata::default();
+        for id in ["child", "parent"] {
+            let line = format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{id}","source":{{"subagent":{{"session_id":"parent"}}}}}}}}"#
+            );
+            adapter
+                .ingest_line(&source, line.as_bytes(), &mut metadata)
+                .unwrap();
+        }
+        let line = br#"{"type":"event_msg","timestamp":"2026-08-14T00:00:00Z","payload":{"info":{"last_token_usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}}}"#;
+        let parsed = adapter
+            .ingest_line(&source, line, &mut metadata)
+            .unwrap()
+            .unwrap();
+        assert!(
+            parsed.session_id.is_none(),
+            "filename fallback must not override header metadata"
+        );
+        assert_eq!(metadata.session_id.as_deref(), Some("child"));
+    }
 
     #[test]
     fn prefers_last_usage_over_total_usage() {

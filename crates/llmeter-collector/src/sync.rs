@@ -1254,6 +1254,89 @@ mod tests {
     }
 
     #[test]
+    fn codex_upgrade_removes_both_session_id_variants_and_stays_stable() {
+        let home = test_home("codex-session-identity");
+        let source_path = home.join(".codex").join("sessions").join("context.jsonl");
+        fs::write(
+            &source_path,
+            concat!(
+                "{\"type\":\"session_meta\",\"timestamp\":\"2026-08-14T00:00:00Z\",\"payload\":{\"id\":\"session-context\",\"cwd\":\"/tmp/project\"}}\n",
+                "{\"type\":\"turn_context\",\"timestamp\":\"2026-08-14T00:00:01Z\",\"payload\":{\"model\":\"gpt-5.6-sol\",\"cwd\":\"/tmp/project\"}}\n",
+                "{\"type\":\"event_msg\",\"timestamp\":\"2026-08-14T00:00:02Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":10,\"output_tokens\":3,\"total_tokens\":13}}}}\n",
+            ),
+        )
+        .unwrap();
+
+        let database = Database::open_in_memory().unwrap();
+        database
+            .insert_usage_events(&[UsageEvent {
+                id: "old-parser-event".into(),
+                provider: Provider::Codex,
+                model: None,
+                session_id: Some("session-context".into()),
+                project_path: Some(PathBuf::from("/tmp/project")),
+                project_name: Some("project".into()),
+                timestamp: Utc::now(),
+                input_tokens: 999,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                output_tokens: 0,
+                reasoning_tokens: 0,
+                total_tokens: 999,
+                reported_cost_usd: None,
+                estimated_cost_usd: None,
+                source_file: Some(source_path.clone()),
+                source_event_id: None,
+                snapshot_scope: None,
+            }])
+            .unwrap();
+        database
+            .upsert_cursor(&FileCursor::new(source_path.clone(), Provider::Codex, 2))
+            .unwrap();
+
+        let mut duplicate = stored_usage(
+            "filename-variant",
+            Provider::Codex,
+            source_path.clone(),
+            "legacy-event",
+            Utc::now(),
+            999,
+        );
+        duplicate.session_id = Some("context".into());
+        database.insert_usage_events(&[duplicate]).unwrap();
+
+        let engine = SyncEngine::with_adapters(
+            database.clone(),
+            vec![Box::new(CodexAdapter::with_home(home.clone()))],
+        );
+        let result = engine.sync_all().unwrap();
+        assert_eq!(result.events_inserted, 1);
+        assert_eq!(overview(&database).total_tokens, 13);
+
+        let sessions = UsageRepository::new(database.clone())
+            .get_sessions()
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id.as_deref(), Some("session-context"));
+        let repeated = engine.sync_all().unwrap();
+        assert_eq!(repeated.events_inserted, 0);
+        assert_eq!(overview(&database).total_tokens, 13);
+
+        let recent = UsageRepository::new(database.clone())
+            .get_recent_activity(1)
+            .unwrap();
+        assert_eq!(recent[0].model.as_deref(), Some("gpt-5.6-sol"));
+
+        let cursor = database.get_cursor(&source_path).unwrap().unwrap();
+        assert_eq!(cursor.source_metadata.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            cursor.source_metadata.project_path.as_deref(),
+            Some(std::path::Path::new("/tmp/project"))
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn codex_associates_turn_context_model_and_rebuilds_old_parser_data() {
         let home = test_home("codex-model-context");
         let source_path = home.join(".codex").join("sessions").join("context.jsonl");

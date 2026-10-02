@@ -309,8 +309,22 @@ fn parse_json_record(provider: Provider, value: &Value, builder: &mut Transcript
     if provider == Provider::Codex {
         parse_codex_record(value, builder);
     } else {
+        let start = builder.messages.len();
         parse_generic_record(value, None, builder, None);
+        if matches!(provider, Provider::Pi | Provider::Omp) {
+            for message in &mut builder.messages[start..] {
+                if message.role == TranscriptRole::User {
+                    message.content = pi_visible_request(&message.content);
+                }
+            }
+        }
     }
+}
+
+// Pi file references are serialized as editor context markers inside user text.
+// Keep the referenced path and surrounding request, removing only the wrapper.
+fn pi_visible_request(text: &str) -> String {
+    text.replace("[Context] file:///", "/").trim().to_string()
 }
 
 fn parse_codex_record(value: &Value, builder: &mut TranscriptBuilder) {
@@ -414,6 +428,49 @@ fn parse_codex_record(value: &Value, builder: &mut TranscriptBuilder) {
     parse_generic_record(value, None, builder, None);
 }
 
+/// Remove generated attachment/app envelopes while retaining the actual request.
+fn codex_visible_request(text: &str) -> String {
+    let text = if text.starts_with("# Files mentioned by the user:")
+        || text.starts_with("# Applications mentioned by the user:")
+    {
+        text.split_once("## My request:")
+            .map_or(text, |(_, request)| request.trim())
+    } else {
+        text
+    };
+    let mut result = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('[') {
+        result.push_str(&rest[..start]);
+        rest = &rest[start..];
+        // A link label must close before another opening bracket. Otherwise
+        // preserve this bracket and keep looking, rather than consuming an
+        // array, unmatched bracket, or outer wrapper as part of the label.
+        let Some(label_end) = rest[1..].find(['[', ']']).map(|offset| offset + 1) else {
+            break;
+        };
+        if !rest[label_end..].starts_with("](") {
+            result.push('[');
+            rest = &rest[1..];
+            continue;
+        }
+        let target_start = label_end + 2;
+        let Some(target_end) = rest[target_start..].find(')') else {
+            break;
+        };
+        let target_end = target_start + target_end;
+        let target = &rest[target_start..target_end];
+        if target.starts_with("plugin://") || target.starts_with("app://") {
+            result.push_str(&rest[1..label_end]);
+        } else {
+            result.push_str(&rest[..target_end + 1]);
+        }
+        rest = &rest[target_end + 1..];
+    }
+    result.push_str(rest);
+    result
+}
+
 /// Recover the visible input as one message instead of one bubble per content item.
 fn append_codex_user(
     builder: &mut TranscriptBuilder,
@@ -440,12 +497,7 @@ fn append_codex_user(
                 if text == "</image>" || (text.starts_with("<image name=") && text.ends_with('>')) {
                     continue;
                 }
-                let text = if text.starts_with("# Files mentioned by the user:") {
-                    text.split_once("## My request:")
-                        .map_or(text, |(_, request)| request.trim())
-                } else {
-                    text
-                };
+                let text = codex_visible_request(text);
                 input.push(TranscriptRole::User, text, timestamp);
             } else {
                 append_content(&mut input, TranscriptRole::User, item, timestamp);
@@ -1541,6 +1593,42 @@ fn load_antigravity_sqlite(path: &Path, _session: &SessionSummary) -> Result<Ses
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pi_file_context_wrappers_preserve_the_request_and_reference() {
+        for provider in [Provider::Pi, Provider::Omp] {
+            let mut builder = TranscriptBuilder::default();
+            let value = serde_json::json!({"type":"message", "message":{
+                "role":"user", "content":[{"type":"text",
+                    "text":"\n[Context] file:///Users/test/transcript.rs 的更改的作用是什么？"}]}});
+            parse_json_record(provider, &value, &mut builder);
+            let transcript = builder.finish();
+            assert_eq!(transcript.messages.len(), 1);
+            assert_eq!(
+                transcript.messages[0].content,
+                "/Users/test/transcript.rs 的更改的作用是什么？"
+            );
+        }
+        assert_eq!(
+            pi_visible_request("将 \n[Context] file:///tmp/ui/ 改为公共组件"),
+            "将 \n/tmp/ui/ 改为公共组件"
+        );
+        assert_eq!(
+            pi_visible_request("普通 [Context] 文字和 file:///tmp/file"),
+            "普通 [Context] 文字和 file:///tmp/file"
+        );
+        let mut builder = TranscriptBuilder::default();
+        parse_json_record(
+            Provider::Pi,
+            &serde_json::json!({"message":{
+            "role":"assistant", "content":"[Context] file:///tmp/example"}}),
+            &mut builder,
+        );
+        assert_eq!(
+            builder.finish().messages[0].content,
+            "[Context] file:///tmp/example"
+        );
+    }
+
     use std::{fs, path::PathBuf};
 
     use rusqlite::Connection;
@@ -1588,6 +1676,60 @@ mod tests {
         assert_eq!(transcript.messages[1].role, TranscriptRole::Thinking);
         assert_eq!(transcript.messages[2].role, TranscriptRole::Assistant);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_app_links_do_not_consume_preceding_brackets() {
+        for (input, expected) in [
+            (
+                "数组 [1, 2]，然后使用 [Notion](app://notion)",
+                "数组 [1, 2]，然后使用 Notion",
+            ),
+            ("[broken and [Notion](plugin://notion)", "[broken and Notion"),
+            ("[[Notion](app://notion)]", "[Notion]"),
+            (
+                "[array] [docs](https://example.com) [App](app://example)",
+                "[array] [docs](https://example.com) App",
+            ),
+            ("[App](app://incomplete", "[App](app://incomplete"),
+        ] {
+            assert_eq!(codex_visible_request(input), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn codex_app_envelopes_display_only_request_and_app_names() {
+        let wrapped = "# Applications mentioned by the user:\n\n[@Notion](plugin://computer-use@app:notion.id)\n\n## My request:\n[@Notion](plugin://notion@openai-curated-remote) 帮我新建一篇文章，介绍一下 pi Agent。";
+        assert_eq!(
+            codex_visible_request(wrapped),
+            "@Notion 帮我新建一篇文章，介绍一下 pi Agent。"
+        );
+        assert_eq!(
+            codex_visible_request("Use [Notion](app://notion) and [docs](https://example.com)."),
+            "Use Notion and [docs](https://example.com)."
+        );
+        assert_eq!(
+            codex_visible_request("Please explain ## My request: and [broken"),
+            "Please explain ## My request: and [broken"
+        );
+        assert_eq!(
+            codex_visible_request(
+                "# Applications mentioned by the user:\nquoted heading without envelope"
+            ),
+            "# Applications mentioned by the user:\nquoted heading without envelope"
+        );
+        let mut builder = TranscriptBuilder::default();
+        parse_codex_record(
+            &serde_json::json!({"type":"response_item","payload":{
+                "type":"message","role":"user","content":[{"type":"input_text","text":wrapped}]
+            }}),
+            &mut builder,
+        );
+        assert_eq!(builder.messages.len(), 1);
+        assert_eq!(
+            builder.messages[0].content,
+            "@Notion 帮我新建一篇文章，介绍一下 pi Agent。"
+        );
     }
 
     #[test]
