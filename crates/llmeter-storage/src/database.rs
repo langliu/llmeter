@@ -464,6 +464,47 @@ impl Database {
             .map_err(StorageError::from)
     }
 
+    /// Transfer a moved local log without leaving its historical usage under two paths.
+    pub fn relocate_usage_source(
+        &self,
+        provider: Provider,
+        old_path: &Path,
+        new_path: &Path,
+    ) -> Result<(), StorageError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let old = old_path.to_string_lossy();
+        let new = new_path.to_string_lossy();
+        let has_origin: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM file_cursors WHERE provider = ?1 AND path = ?2)",
+            params![provider.as_str(), old],
+            |row| row.get(0),
+        )?;
+        if old_path == new_path || !has_origin {
+            return Ok(());
+        }
+        // If an earlier sync already imported the destination, rebuild its tail
+        // from the original cursor rather than retaining a duplicate snapshot.
+        transaction.execute(
+            "DELETE FROM usage_events WHERE provider = ?1 AND source_file = ?2",
+            params![provider.as_str(), new],
+        )?;
+        transaction.execute(
+            "DELETE FROM file_cursors WHERE provider = ?1 AND path = ?2",
+            params![provider.as_str(), new],
+        )?;
+        transaction.execute(
+            "UPDATE usage_events SET source_file = ?3 WHERE provider = ?1 AND source_file = ?2",
+            params![provider.as_str(), old, new],
+        )?;
+        transaction.execute(
+            "UPDATE file_cursors SET path = ?3 WHERE provider = ?1 AND path = ?2",
+            params![provider.as_str(), old, new],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn clear_usage_and_cursors(&self) -> Result<(), StorageError> {
         let connection = self.lock()?;
         connection.execute_batch("DELETE FROM usage_events; DELETE FROM file_cursors;")?;

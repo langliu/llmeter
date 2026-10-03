@@ -12,7 +12,8 @@ use super::{
     source_event_id, timestamp, usage_snapshot, walk_jsonl,
 };
 
-const CODEX_PARSER_VERSION: u32 = 4;
+// Rebuild legacy records, including identities left by concurrent older app instances.
+const CODEX_PARSER_VERSION: u32 = 5;
 
 #[derive(Clone, Debug)]
 pub struct CodexAdapter {

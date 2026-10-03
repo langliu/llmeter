@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     rc::Rc,
     sync::Arc,
@@ -575,6 +576,26 @@ fn transcript_rows(messages: &[TranscriptMessage]) -> Vec<TranscriptRow> {
     rows
 }
 
+/// Reuse encoded image objects across layout passes and fullscreen previews.
+#[derive(Default)]
+struct TranscriptImageCache(RefCell<HashMap<(usize, usize), Arc<Image>>>);
+
+impl TranscriptImageCache {
+    fn image(
+        &self,
+        message: usize,
+        attachment: usize,
+        format: ImageFormat,
+        data: &[u8],
+    ) -> Arc<Image> {
+        self.0
+            .borrow_mut()
+            .entry((message, attachment))
+            .or_insert_with(|| Arc::new(Image::from_bytes(format, data.to_vec())))
+            .clone()
+    }
+}
+
 pub(crate) struct SessionDetailView {
     palette: Palette,
     transcript: TranscriptLoadState,
@@ -584,6 +605,7 @@ pub(crate) struct SessionDetailView {
     transcript_list: ListState,
     expanded_thinking: HashSet<usize>,
     thinking_scroll: HashMap<usize, ScrollHandle>,
+    image_cache: TranscriptImageCache,
 }
 
 impl SessionDetailView {
@@ -596,6 +618,7 @@ impl SessionDetailView {
             transcript_list: ListState::new(0, ListAlignment::Top, px(400.0)),
             expanded_thinking: HashSet::new(),
             thinking_scroll: HashMap::new(),
+            image_cache: TranscriptImageCache::default(),
         }
     }
 
@@ -604,6 +627,7 @@ impl SessionDetailView {
         transcript: Result<SessionTranscript, String>,
         cx: &mut Context<Self>,
     ) {
+        self.image_cache.0.borrow_mut().clear();
         self.transcript = match transcript {
             Ok(transcript) => {
                 self.expanded_transcript_items.clear();
@@ -732,15 +756,19 @@ fn transcript_section(
                         };
                         let row = &detail.transcript_rows[row_index];
                         let content = match row {
-                            TranscriptRow::Message(index) => {
-                                transcript_message(&transcript.messages[*index], *index, p)
-                            }
+                            TranscriptRow::Message(index) => transcript_message(
+                                &transcript.messages[*index],
+                                *index,
+                                p,
+                                &detail.image_cache,
+                            ),
                             TranscriptRow::Steps { start, end } => collapsible_steps(
                                 &transcript.messages[*start..*end],
                                 *start,
                                 detail.expanded_transcript_items.contains(start),
                                 &detail.expanded_thinking,
                                 &detail.thinking_scroll,
+                                &detail.image_cache,
                                 p,
                                 cx,
                             ),
@@ -772,18 +800,28 @@ fn transcript_section(
 /// bubble, assistant text flows full width as rendered Markdown without a
 /// card, and each run of thinking/tool steps collapses to one hairline-topped
 /// row that expands in place.
-fn transcript_message(message: &TranscriptMessage, index: usize, p: Palette) -> AnyElement {
+fn transcript_message(
+    message: &TranscriptMessage,
+    index: usize,
+    p: Palette,
+    image_cache: &TranscriptImageCache,
+) -> AnyElement {
     match message.role {
-        TranscriptRole::User => user_bubble(message, index, p),
+        TranscriptRole::User => user_bubble(message, index, p, image_cache),
         // Step messages reach the renderer only through a Steps row; keep a
         // safe fallback in case grouping ever misses one.
         TranscriptRole::Assistant | TranscriptRole::Thinking | TranscriptRole::Tool => {
-            assistant_text(message, index, p)
+            assistant_text(message, index, p, image_cache)
         }
     }
 }
 
-fn user_bubble(message: &TranscriptMessage, index: usize, p: Palette) -> AnyElement {
+fn user_bubble(
+    message: &TranscriptMessage,
+    index: usize,
+    p: Palette,
+    image_cache: &TranscriptImageCache,
+) -> AnyElement {
     // A foreground-tinted ground keeps the bubble clearly elevated on both
     // themes; muted is barely distinguishable from the sheet background.
     let ground = p.foreground.opacity(if p.is_dark { 0.14 } else { 0.08 });
@@ -792,7 +830,7 @@ fn user_bubble(message: &TranscriptMessage, index: usize, p: Palette) -> AnyElem
         .w_full()
         .items_end()
         .gap_2()
-        .child(transcript_images(message, index, p))
+        .child(transcript_images(message, index, p, image_cache))
         .when(!message.content.is_empty(), |this| {
             this.child(
                 div()
@@ -809,7 +847,12 @@ fn user_bubble(message: &TranscriptMessage, index: usize, p: Palette) -> AnyElem
         .into_any_element()
 }
 
-fn transcript_images(message: &TranscriptMessage, index: usize, p: Palette) -> AnyElement {
+fn transcript_images(
+    message: &TranscriptMessage,
+    index: usize,
+    p: Palette,
+    image_cache: &TranscriptImageCache,
+) -> AnyElement {
     // Scope attachment indices by message, including expanded work steps.
     let mut images = h_flex()
         .id(("transcript-images", index))
@@ -817,18 +860,32 @@ fn transcript_images(message: &TranscriptMessage, index: usize, p: Palette) -> A
         .justify_end()
         .gap_2()
         .max_w_full();
+    let gallery: Arc<[Arc<Image>]> = message
+        .images
+        .iter()
+        .enumerate()
+        .filter_map(|(attachment, image)| {
+            Some(image_cache.image(
+                index,
+                attachment,
+                ImageFormat::from_mime_type(&image.mime)?,
+                image.data.as_ref()?,
+            ))
+        })
+        .collect();
+    let mut gallery_index = 0;
     for (image_index, image) in message.images.iter().enumerate() {
-        if let Some(data) = &image.data
-            && let Some(format) = ImageFormat::from_mime_type(&image.mime)
-        {
-            let preview = Arc::new(Image::from_bytes(format, data.to_vec()));
-            let thumbnail = preview.clone();
+        if image.data.is_some() && ImageFormat::from_mime_type(&image.mime).is_some() {
+            let thumbnail = gallery[gallery_index].clone();
+            let selected = gallery_index;
+            gallery_index += 1;
+            let gallery = gallery.clone();
             images = images.child(
                 div()
                     .id(("transcript-image", image_index))
                     .cursor_pointer()
                     .on_click(move |_, _, cx| {
-                        let image = preview.clone();
+                        let images = gallery.clone();
                         let bounds = Bounds::centered(None, size(px(1000.0), px(760.0)), cx);
                         if let Err(error) = cx.open_window(
                             WindowOptions {
@@ -839,7 +896,11 @@ fn transcript_images(message: &TranscriptMessage, index: usize, p: Palette) -> A
                                 cx.new(|cx| {
                                     let focus = cx.focus_handle();
                                     window.focus(&focus, cx);
-                                    ImagePreview { image, focus }
+                                    ImagePreview {
+                                        images,
+                                        selected,
+                                        focus,
+                                    }
                                 })
                             },
                         ) {
@@ -872,24 +933,41 @@ fn transcript_images(message: &TranscriptMessage, index: usize, p: Palette) -> A
 }
 
 struct ImagePreview {
-    image: Arc<Image>,
+    images: Arc<[Arc<Image>]>,
+    selected: usize,
     focus: FocusHandle,
 }
 
+impl ImagePreview {
+    fn previous(&mut self, cx: &mut Context<Self>) {
+        self.selected = (self.selected + self.images.len() - 1) % self.images.len();
+        cx.notify();
+    }
+
+    fn next(&mut self, cx: &mut Context<Self>) {
+        self.selected = (self.selected + 1) % self.images.len();
+        cx.notify();
+    }
+}
+
 impl Render for ImagePreview {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .relative()
             .bg(gpui::rgb(0x101010))
             .track_focus(&self.focus)
-            .on_key_down(|event, window, _| {
-                if event.keystroke.key == "escape" {
-                    window.remove_window();
+            .on_key_down(cx.listener(|view, event: &gpui::KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "escape" => window.remove_window(),
+                    "left" => view.previous(cx),
+                    "right" => view.next(cx),
+                    _ => return,
                 }
-            })
+                cx.stop_propagation();
+            }))
             .child(
-                img(self.image.clone())
+                img(self.images[self.selected].clone())
                     .size_full()
                     .object_fit(ObjectFit::Contain),
             )
@@ -907,10 +985,52 @@ impl Render for ImagePreview {
                     .on_click(|_, window, _| window.remove_window())
                     .child(Icon::new(IconName::Close).size_5()),
             )
+            .when(self.images.len() > 1, |this| {
+                this.child(
+                    h_flex()
+                        .absolute()
+                        .bottom_4()
+                        .w_full()
+                        .justify_center()
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .items_center()
+                                .p_2()
+                                .rounded_lg()
+                                .bg(gpui::rgb(0x303030))
+                                .text_color(gpui::rgb(0xffffff))
+                                .child(
+                                    div()
+                                        .id("previous-preview-image")
+                                        .debug_selector(|| "previous-preview-image".to_string())
+                                        .p_1()
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|view, _, _, cx| view.previous(cx)))
+                                        .child(Icon::new(IconName::ChevronLeft).size_5()),
+                                )
+                                .child(format!("{} / {}", self.selected + 1, self.images.len()))
+                                .child(
+                                    div()
+                                        .id("next-preview-image")
+                                        .debug_selector(|| "next-preview-image".to_string())
+                                        .p_1()
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|view, _, _, cx| view.next(cx)))
+                                        .child(Icon::new(IconName::ChevronRight).size_5()),
+                                ),
+                        ),
+                )
+            })
     }
 }
 
-fn assistant_text(message: &TranscriptMessage, index: usize, p: Palette) -> AnyElement {
+fn assistant_text(
+    message: &TranscriptMessage,
+    index: usize,
+    p: Palette,
+    image_cache: &TranscriptImageCache,
+) -> AnyElement {
     // The renderer defaults shout: 1.5rem headings, 1rem paragraph gaps, and
     // inline code tinted with the theme accent. Codex keeps everything
     // compact — headings barely above body size, neutral chips, tight
@@ -951,7 +1071,7 @@ fn assistant_text(message: &TranscriptMessage, index: usize, p: Palette) -> AnyE
             .text_sm()
             .text_color(p.foreground),
         )
-        .child(transcript_images(message, index, p))
+        .child(transcript_images(message, index, p, image_cache))
         .into_any_element()
 }
 
@@ -963,6 +1083,7 @@ fn collapsible_steps(
     expanded: bool,
     expanded_thinking: &HashSet<usize>,
     thinking_scroll: &HashMap<usize, ScrollHandle>,
+    image_cache: &TranscriptImageCache,
     p: Palette,
     cx: &mut Context<SessionDetailView>,
 ) -> AnyElement {
@@ -1005,7 +1126,7 @@ fn collapsible_steps(
         let mut list = v_flex().w_full().gap_2().pl_1p5();
         for (offset, message) in steps.iter().enumerate() {
             list = list.child(if message.role == TranscriptRole::Assistant {
-                assistant_text(message, key + offset, p)
+                assistant_text(message, key + offset, p, image_cache)
             } else if message.role == TranscriptRole::Thinking {
                 let index = key + offset;
                 thinking_detail(
@@ -1017,7 +1138,7 @@ fn collapsible_steps(
                     cx,
                 )
             } else {
-                step_detail(message, key + offset, p)
+                step_detail(message, key + offset, p, image_cache)
             });
         }
         block = block.child(list);
@@ -1095,7 +1216,12 @@ fn thinking_detail(
 
 /// Expanded view of one message inside a step group: an icon plus its title,
 /// with the raw content underneath.
-fn step_detail(message: &TranscriptMessage, index: usize, p: Palette) -> AnyElement {
+fn step_detail(
+    message: &TranscriptMessage,
+    index: usize,
+    p: Palette,
+    image_cache: &TranscriptImageCache,
+) -> AnyElement {
     let (icon, title) = match message.role {
         TranscriptRole::Thinking => (
             IconName::Cpu,
@@ -1129,7 +1255,7 @@ fn step_detail(message: &TranscriptMessage, index: usize, p: Palette) -> AnyElem
                 .text_color(p.muted_foreground)
                 .child(message.content.clone()),
         )
-        .child(transcript_images(message, index, p))
+        .child(transcript_images(message, index, p, image_cache))
         .into_any_element()
 }
 
@@ -1592,6 +1718,26 @@ mod transcript_tests {
     }
 
     #[gpui::test]
+    fn attachment_objects_are_reused_and_cleared_for_new_transcripts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let palette = cx.update(|cx| Palette::from_app(cx));
+        let view = cx.new(|_| SessionDetailView::new(palette));
+        view.update(cx, |detail, cx| {
+            let first = detail.image_cache.image(0, 0, ImageFormat::Png, b"first");
+            let repeated = detail.image_cache.image(0, 0, ImageFormat::Png, b"first");
+            assert!(Arc::ptr_eq(&first, &repeated));
+            detail.set_transcript(Ok(SessionTranscript::default()), cx);
+            let replacement = detail
+                .image_cache
+                .image(0, 0, ImageFormat::Png, b"replacement");
+            assert!(!Arc::ptr_eq(&first, &replacement));
+            assert_eq!(replacement.bytes, b"replacement");
+        });
+    }
+
+    #[gpui::test]
     fn image_only_user_message_renders_attachment(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let palette = cx.update(|cx| Palette::from_app(cx));
@@ -1622,17 +1768,55 @@ mod transcript_tests {
     }
 
     #[gpui::test]
+    fn image_preview_navigates_with_keys_buttons_and_closes_with_escape(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let initial_windows = cx.update(|cx| cx.windows().len());
+        let image = Arc::new(Image::from_bytes(
+            ImageFormat::Png,
+            include_bytes!("../../assets/AppIcon.png").to_vec(),
+        ));
+        let (view, visual) = cx.add_window_view(|window, cx| {
+            let focus = cx.focus_handle();
+            window.focus(&focus, cx);
+            ImagePreview {
+                images: Arc::from([image.clone(), image]),
+                selected: 1,
+                focus,
+            }
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        visual.simulate_keystrokes("left");
+        view.update(visual, |view, _| assert_eq!(view.selected, 0));
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let bounds = visual.debug_bounds("next-preview-image").unwrap();
+        visual.simulate_click(bounds.center(), gpui::Modifiers::default());
+        view.update(visual, |view, _| assert_eq!(view.selected, 1));
+        visual.simulate_keystrokes("right");
+        view.update(visual, |view, _| assert_eq!(view.selected, 0));
+        visual.simulate_keystrokes("escape");
+        assert_eq!(cx.update(|cx| cx.windows().len()), initial_windows);
+    }
+
+    #[gpui::test]
     fn images_in_different_messages_open_independent_previews(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let palette = cx.update(|cx| Palette::from_app(cx));
         let (view, cx) = cx.add_window_view(|_, _| SessionDetailView::new(palette));
         let mut image_message = message(TranscriptRole::User, None);
         image_message.content.clear();
-        image_message.images.push(llmeter_collector::TranscriptImage {
-            source: "fixture".into(),
-            mime: "image/png".into(),
-            data: Some(Arc::from(&include_bytes!("../../assets/AppIcon.png")[..])),
-        });
+        image_message
+            .images
+            .push(llmeter_collector::TranscriptImage {
+                source: "fixture".into(),
+                mime: "image/png".into(),
+                data: Some(Arc::from(&include_bytes!("../../assets/AppIcon.png")[..])),
+            });
         let transcript = SessionTranscript {
             messages: vec![image_message.clone(), image_message],
             truncated: false,

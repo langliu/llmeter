@@ -308,16 +308,24 @@ fn load_jsonl(path: &Path, session: &SessionSummary) -> Result<SessionTranscript
 fn parse_json_record(provider: Provider, value: &Value, builder: &mut TranscriptBuilder) {
     if provider == Provider::Codex {
         parse_codex_record(value, builder);
-    } else {
-        let start = builder.messages.len();
-        parse_generic_record(value, None, builder, None);
-        if matches!(provider, Provider::Pi | Provider::Omp) {
-            for message in &mut builder.messages[start..] {
-                if message.role == TranscriptRole::User {
-                    message.content = pi_visible_request(&message.content);
-                }
+    } else if matches!(provider, Provider::Pi | Provider::Omp) {
+        let mut parsed = TranscriptBuilder::default();
+        parse_generic_record(value, None, &mut parsed, None);
+        builder.truncated |= parsed.truncated;
+        for message in parsed.messages {
+            let content = if message.role == TranscriptRole::User {
+                pi_visible_request(&message.content)
+            } else {
+                message.content
+            };
+            // Normalize before the shared builder's adjacent-message deduplication.
+            builder.push(message.role, content, message.timestamp);
+            for image in message.images {
+                builder.push_image(message.role, image, message.timestamp);
             }
         }
+    } else {
+        parse_generic_record(value, None, builder, None);
     }
 }
 
@@ -1594,6 +1602,26 @@ fn load_antigravity_sqlite(path: &Path, _session: &SessionSummary) -> Result<Ses
 #[cfg(test)]
 mod tests {
     #[test]
+    fn pi_normalizes_before_deduplicating_adjacent_user_records() {
+        for provider in [Provider::Pi, Provider::Omp] {
+            let mut builder = TranscriptBuilder::default();
+            for text in [
+                "[Context] file:///tmp/ui/ 查看这个文件",
+                "[Context] file:///tmp/ui/ 查看这个文件",
+                "/tmp/ui/ 查看这个文件",
+            ] {
+                parse_json_record(
+                    provider,
+                    &serde_json::json!({"message":{
+                    "role":"user", "content":text}}),
+                    &mut builder,
+                );
+            }
+            assert_eq!(builder.messages.len(), 1);
+        }
+    }
+
+    #[test]
     fn pi_file_context_wrappers_preserve_the_request_and_reference() {
         for provider in [Provider::Pi, Provider::Omp] {
             let mut builder = TranscriptBuilder::default();
@@ -1685,7 +1713,10 @@ mod tests {
                 "数组 [1, 2]，然后使用 [Notion](app://notion)",
                 "数组 [1, 2]，然后使用 Notion",
             ),
-            ("[broken and [Notion](plugin://notion)", "[broken and Notion"),
+            (
+                "[broken and [Notion](plugin://notion)",
+                "[broken and Notion",
+            ),
             ("[[Notion](app://notion)]", "[Notion]"),
             (
                 "[array] [docs](https://example.com) [App](app://example)",

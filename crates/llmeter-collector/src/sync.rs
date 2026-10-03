@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    io::Read,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Instant, SystemTime},
@@ -75,6 +76,31 @@ pub struct SyncEngine {
     database: Database,
     adapters: Arc<Vec<Box<dyn ProviderAdapter>>>,
     wal_fingerprints: Arc<Mutex<HashMap<PathBuf, Option<(u64, SystemTime)>>>>,
+    source_aliases: Arc<Mutex<HashMap<(PathBuf, PathBuf), VerifiedSourceAlias>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceFingerprint {
+    identity: Option<String>,
+    size: u64,
+    modified: Option<SystemTime>,
+}
+
+impl SourceFingerprint {
+    fn read(path: &Path) -> std::io::Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        Ok(Self {
+            identity: metadata_identity(&metadata),
+            size: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+struct VerifiedSourceAlias {
+    prefix: SourceFingerprint,
+    complete: SourceFingerprint,
+    matches: bool,
 }
 
 /// Per-provider state shared by the sync loop: the adapter under sync and its
@@ -95,6 +121,7 @@ impl SyncEngine {
             database,
             adapters: Arc::new(adapters),
             wal_fingerprints: Arc::new(Mutex::new(HashMap::new())),
+            source_aliases: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -204,6 +231,96 @@ impl SyncEngine {
         scope
     }
 
+    /// Collapse only verified duplicate/prefix copies of the same Codex log.
+    /// Prefer the most complete source; distinct branches with colliding names survive.
+    fn canonical_codex_sources(
+        &self,
+        sources: Vec<SourceFile>,
+    ) -> (Vec<SourceFile>, HashMap<PathBuf, PathBuf>) {
+        let mut groups = HashMap::new();
+        for source in sources {
+            groups
+                .entry(source.path.file_name().unwrap_or_default().to_os_string())
+                .or_insert_with(Vec::new)
+                .push(source);
+        }
+        let mut canonical = Vec::new();
+        let mut aliases = HashMap::new();
+        for mut group in groups.into_values() {
+            if group.len() == 1 {
+                canonical.extend(group);
+                continue;
+            }
+            group.sort_by_cached_key(|source| {
+                (
+                    std::cmp::Reverse(std::fs::metadata(&source.path).map_or(0, |m| m.len())),
+                    source
+                        .path
+                        .components()
+                        .any(|part| part.as_os_str() == "archived_sessions"),
+                    source.path.clone(),
+                )
+            });
+            let mut representatives: Vec<SourceFile> = Vec::new();
+            for candidate in group {
+                if let Some(complete) = representatives.iter().find(|complete| {
+                    self.source_is_prefix(&candidate.path, &complete.path)
+                }) {
+                    aliases.insert(candidate.path, complete.path.clone());
+                } else {
+                    representatives.push(candidate);
+                }
+            }
+            canonical.extend(representatives);
+        }
+        canonical.sort_by(|a, b| a.path.cmp(&b.path));
+        let paths: HashSet<_> = canonical
+            .iter()
+            .map(|s| &s.path)
+            .chain(aliases.keys())
+            .collect();
+        self.source_aliases
+            .lock()
+            .unwrap()
+            .retain(|(a, b), _| paths.contains(a) && paths.contains(b));
+        (canonical, aliases)
+    }
+
+    fn source_is_prefix(&self, prefix_path: &Path, complete_path: &Path) -> bool {
+        let (Ok(prefix), Ok(complete)) = (
+            SourceFingerprint::read(prefix_path),
+            SourceFingerprint::read(complete_path),
+        ) else {
+            return false;
+        };
+        let key = (prefix_path.to_path_buf(), complete_path.to_path_buf());
+        if let Some(verified) = self.source_aliases.lock().unwrap().get(&key)
+            && verified.prefix == prefix
+            && verified.complete == complete
+        {
+            return verified.matches;
+        }
+        let Ok(matches) = log_is_prefix(prefix_path, complete_path, prefix.size, complete.size)
+        else {
+            return false;
+        };
+        // A write during verification invalidates the comparison for this pass.
+        if SourceFingerprint::read(prefix_path).ok().as_ref() != Some(&prefix)
+            || SourceFingerprint::read(complete_path).ok().as_ref() != Some(&complete)
+        {
+            return false;
+        }
+        self.source_aliases.lock().unwrap().insert(
+            key,
+            VerifiedSourceAlias {
+                prefix,
+                complete,
+                matches,
+            },
+        );
+        matches
+    }
+
     fn sync_provider(&self, adapter: &dyn ProviderAdapter, result: &mut SyncResult) -> Result<()> {
         if let Some(detection) = adapter.sync_detection()?
             && detection.status == ProviderStatus::UnsupportedVersion
@@ -215,11 +332,63 @@ impl SyncEngine {
             ));
             return Ok(());
         }
+        let mut cursors = self.database.get_cursors_by_provider(adapter.provider())?;
+        let sources = adapter.discover_sources()?;
+        let (sources, aliases) = if adapter.provider() == Provider::Codex {
+            self.canonical_codex_sources(sources)
+        } else {
+            (sources, HashMap::new())
+        };
+        if adapter.provider() == Provider::Codex {
+            let by_name: HashMap<_, Vec<_>> = cursors.values().fold(
+                HashMap::new(),
+                |mut index, cursor| {
+                    if let Some(name) = cursor.path.file_name() {
+                        index
+                            .entry(name.to_os_string())
+                            .or_insert_with(Vec::new)
+                            .push(cursor);
+                    }
+                    index
+                },
+            );
+            let mut relocated = false;
+            for source in &sources {
+                let Some(previous) = source.path.file_name().and_then(|name| by_name.get(name))
+                else {
+                    continue;
+                };
+                let fingerprint = SourceFingerprint::read(&source.path).ok();
+                for cursor in previous {
+                    let old_path = &cursor.path;
+                    let verified_alias = aliases.get(old_path) == Some(&source.path);
+                    // A missing file is not proof of a move. Only resume its
+                    // cursor when the destination retains the same file identity
+                    // and is at least as complete as the already imported log.
+                    let verified_move = matches!(old_path.try_exists(), Ok(false))
+                        && fingerprint.as_ref().is_some_and(|current| {
+                            cursor.file_identity.is_some()
+                                && cursor.file_identity == current.identity
+                                && current.size >= cursor.file_size
+                        });
+                    if *old_path != source.path && (verified_alias || verified_move) {
+                        self.database.relocate_usage_source(
+                            Provider::Codex,
+                            old_path,
+                            &source.path,
+                        )?;
+                        relocated = true;
+                    }
+                }
+            }
+            if relocated {
+                cursors = self.database.get_cursors_by_provider(adapter.provider())?;
+            }
+        }
         let context = ProviderSyncContext {
             adapter,
-            cursors: &self.database.get_cursors_by_provider(adapter.provider())?,
+            cursors: &cursors,
         };
-        let sources = adapter.discover_sources()?;
         for source in sources {
             match source.format {
                 SourceFormat::Jsonl => self.sync_source(&context, &source, result)?,
@@ -572,6 +741,33 @@ fn sqlite_event_id(source: &SourceFile, parsed: &ParsedUsage, session_id: Option
             .unwrap_or_default()
     );
     blake3::hash(value.as_bytes()).to_hex().to_string()
+}
+
+/// Compare streams using bounded memory, including an unfinished JSONL tail.
+fn log_is_prefix(
+    prefix_path: &Path,
+    complete_path: &Path,
+    prefix_len: u64,
+    complete_len: u64,
+) -> std::io::Result<bool> {
+    if prefix_len == 0 || prefix_len > complete_len {
+        return Ok(false);
+    }
+    let mut prefix = std::fs::File::open(prefix_path)?;
+    let mut complete = std::fs::File::open(complete_path)?;
+    let mut remaining = prefix_len;
+    let mut left = [0u8; 64 * 1024];
+    let mut right = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let count = remaining.min(left.len() as u64) as usize;
+        prefix.read_exact(&mut left[..count])?;
+        complete.read_exact(&mut right[..count])?;
+        if left[..count] != right[..count] {
+            return Ok(false);
+        }
+        remaining -= count as u64;
+    }
+    Ok(true)
 }
 
 /// Capture the sidecar before parsing so writes during parsing trigger another pass.
@@ -1253,6 +1449,196 @@ mod tests {
         let _ = fs::remove_dir_all(home);
     }
 
+    fn codex_test_log(id: &str, tokens: u64) -> String {
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\"}}}}\n\
+             {{\"type\":\"event_msg\",\"timestamp\":\"2026-08-14T00:00:00Z\",\"payload\":{{\"info\":{{\"last_token_usage\":{{\"input_tokens\":{tokens},\"total_tokens\":{tokens}}}}}}}}}\n"
+        )
+    }
+
+    #[test]
+    fn codex_missing_source_does_not_relocate_unrelated_same_name() {
+        let home = test_home("codex-unrelated-missing-source");
+        let source = home.join(".codex/sessions/rollout.jsonl");
+        let unrelated = home.join(".codex/archived_sessions/rollout.jsonl");
+        fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+        fs::write(&source, codex_test_log("original", 10)).unwrap();
+        // Create the unrelated file before deleting the original to avoid inode reuse.
+        fs::write(&unrelated, codex_test_log("unrelated", 7)).unwrap();
+        let database = Database::open_in_memory().unwrap();
+        let engine = SyncEngine::with_adapters(
+            database.clone(),
+            vec![Box::new(CodexAdapter::with_home(home.clone()))],
+        );
+        engine.sync_all().unwrap();
+        assert_eq!(overview(&database).total_tokens, 17);
+        fs::remove_file(&source).unwrap();
+        for _ in 0..2 {
+            engine.sync_all().unwrap();
+            assert_eq!(overview(&database).total_tokens, 17);
+            assert_eq!(
+                UsageRepository::new(database.clone()).get_sessions().unwrap().len(),
+                2
+            );
+            assert!(database.get_cursor(&source).unwrap().is_some());
+        }
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn codex_same_name_deduplicates_each_distinct_branch() {
+        let home = test_home("codex-multiple-copy-groups");
+        let longest = home.join(".codex/sessions/a/rollout.jsonl");
+        let shorter = home.join(".codex/sessions/b/rollout.jsonl");
+        let copy = home.join(".codex/archived_sessions/rollout.jsonl");
+        for path in [&longest, &shorter, &copy] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        fs::write(&longest, format!("{}{}", codex_test_log("long-branch", 20), "\n".repeat(300))).unwrap();
+        fs::write(&shorter, codex_test_log("short-branch", 10)).unwrap();
+        fs::copy(&shorter, &copy).unwrap();
+        let database = Database::open_in_memory().unwrap();
+        let adapter = CodexAdapter::with_home(home.clone());
+        let engine = SyncEngine::with_adapters(database.clone(), vec![Box::new(adapter.clone())]);
+        for _ in 0..2 {
+            engine.sync_all().unwrap();
+            assert_eq!(overview(&database).total_tokens, 30);
+            assert_eq!(
+                UsageRepository::new(database.clone()).get_sessions().unwrap().len(),
+                2
+            );
+        }
+        let (sources, aliases) = engine.canonical_codex_sources(adapter.discover_sources().unwrap());
+        assert_eq!(sources.len(), 2);
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases.get(&copy), Some(&shorter));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn codex_archive_copies_merge_and_invalidate_verification_after_writes() {
+        let home = test_home("codex-archive-copy");
+        let source = home.join(".codex/sessions/rollout-copy.jsonl");
+        let archived = home.join(".codex/archived_sessions/rollout-copy.jsonl");
+        fs::create_dir_all(archived.parent().unwrap()).unwrap();
+        fs::write(&source, concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread\"}}\n",
+            "{\"type\":\"event_msg\",\"timestamp\":\"2026-08-14T00:00:00Z\",\"payload\":{\"info\":{\"last_token_usage\":{\"input_tokens\":10,\"total_tokens\":10}}}}\n"
+        )).unwrap();
+        fs::copy(&source, &archived).unwrap();
+        let database = Database::open_in_memory().unwrap();
+        let engine = SyncEngine::with_adapters(
+            database.clone(),
+            vec![Box::new(CodexAdapter::with_home(home.clone()))],
+        );
+        engine.sync_all().unwrap();
+        engine.sync_all().unwrap();
+        assert_eq!(overview(&database).total_tokens, 10);
+        assert_eq!(
+            UsageRepository::new(database.clone())
+                .get_sessions()
+                .unwrap()
+                .len(),
+            1
+        );
+        // Older versions could have imported both paths. Keep the surviving source usable.
+        let mut duplicate = stored_usage(
+            "copy-duplicate",
+            Provider::Codex,
+            archived.clone(),
+            "",
+            Utc::now(),
+            10,
+        );
+        duplicate.source_event_id = None;
+        duplicate.session_id = Some("thread".into());
+        database.insert_usage_events(&[duplicate]).unwrap();
+        let mut cursor = database.get_cursor(&source).unwrap().unwrap();
+        cursor.path = archived.clone();
+        cursor.file_identity = metadata_identity(&fs::metadata(&archived).unwrap());
+        database.upsert_cursor(&cursor).unwrap();
+        engine.sync_all().unwrap();
+        assert_eq!(overview(&database).total_tokens, 10);
+        let mut file = OpenOptions::new().append(true).open(&archived).unwrap();
+        file.write_all(br#"{"type":"event_msg","timestamp":"2026-08-14T00:01:00Z","payload":{"info":{"last_token_usage":{"input_tokens":7,"total_tokens":7}}}}
+"#).unwrap();
+        engine.sync_all().unwrap();
+        assert_eq!(overview(&database).total_tokens, 17);
+        let sessions = UsageRepository::new(database.clone())
+            .get_sessions()
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].source_file.as_deref(), archived.to_str());
+        // Divergent files must not be hidden solely because they share a basename.
+        fs::write(
+            &source,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"different-thread\"}}\n",
+        )
+        .unwrap();
+        assert!(!engine.source_is_prefix(&source, &archived));
+        let adapter = CodexAdapter::with_home(home.clone());
+        let (sources, aliases) =
+            engine.canonical_codex_sources(adapter.discover_sources().unwrap());
+        assert_eq!(sources.len(), 2);
+        assert!(aliases.is_empty());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn codex_archive_move_preserves_usage_and_reads_appended_tail() {
+        let home = test_home("codex-archive-move");
+        let source = home.join(".codex/sessions/rollout-session.jsonl");
+        let archived = home.join(".codex/archived_sessions/rollout-session.jsonl");
+        fs::create_dir_all(archived.parent().unwrap()).unwrap();
+        fs::write(&source, concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread\"}}\n",
+            "{\"type\":\"event_msg\",\"timestamp\":\"2026-08-14T00:00:00Z\",\"payload\":{\"info\":{\"last_token_usage\":{\"input_tokens\":10,\"total_tokens\":10}}}}\n"
+        )).unwrap();
+        let database = Database::open_in_memory().unwrap();
+        let engine = SyncEngine::with_adapters(
+            database.clone(),
+            vec![Box::new(CodexAdapter::with_home(home.clone()))],
+        );
+        engine.sync_all().unwrap();
+        fs::rename(&source, &archived).unwrap();
+        // Simulate a previous version importing the archive as a second source.
+        let mut duplicate = stored_usage(
+            "archive-duplicate",
+            Provider::Codex,
+            archived.clone(),
+            "",
+            Utc::now(),
+            10,
+        );
+        duplicate.source_event_id = None;
+        duplicate.session_id = Some("thread".into());
+        database.insert_usage_events(&[duplicate]).unwrap();
+        database
+            .upsert_cursor(&FileCursor::new(archived.clone(), Provider::Codex, 4))
+            .unwrap();
+        engine.sync_all().unwrap();
+        assert_eq!(overview(&database).total_tokens, 10);
+        let repo = UsageRepository::new(database.clone());
+        let sessions = repo.get_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].source_file.as_deref(), archived.to_str());
+        let mut file = OpenOptions::new().append(true).open(&archived).unwrap();
+        file.write_all(br#"{"type":"event_msg","timestamp":"2026-08-14T00:01:00Z","payload":{"info":{"last_token_usage":{"input_tokens":7,"total_tokens":7}}}}
+"#).unwrap();
+        engine.sync_all().unwrap();
+        engine.sync_all().unwrap();
+        database
+            .relocate_usage_source(Provider::Codex, &source, &archived)
+            .unwrap();
+        database
+            .relocate_usage_source(Provider::Codex, &archived, &archived)
+            .unwrap();
+        assert_eq!(overview(&database).total_tokens, 17);
+        assert_eq!(repo.get_sessions().unwrap().len(), 1);
+        assert!(database.get_cursor(&source).unwrap().is_none());
+        fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn codex_upgrade_removes_both_session_id_variants_and_stays_stable() {
         let home = test_home("codex-session-identity");
@@ -1291,7 +1677,7 @@ mod tests {
             }])
             .unwrap();
         database
-            .upsert_cursor(&FileCursor::new(source_path.clone(), Provider::Codex, 2))
+            .upsert_cursor(&FileCursor::new(source_path.clone(), Provider::Codex, 4))
             .unwrap();
 
         let mut duplicate = stored_usage(
