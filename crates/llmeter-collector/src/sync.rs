@@ -263,9 +263,10 @@ impl SyncEngine {
             });
             let mut representatives: Vec<SourceFile> = Vec::new();
             for candidate in group {
-                if let Some(complete) = representatives.iter().find(|complete| {
-                    self.source_is_prefix(&candidate.path, &complete.path)
-                }) {
+                if let Some(complete) = representatives
+                    .iter()
+                    .find(|complete| self.source_is_prefix(&candidate.path, &complete.path))
+                {
                     aliases.insert(candidate.path, complete.path.clone());
                 } else {
                     representatives.push(candidate);
@@ -340,9 +341,8 @@ impl SyncEngine {
             (sources, HashMap::new())
         };
         if adapter.provider() == Provider::Codex {
-            let by_name: HashMap<_, Vec<_>> = cursors.values().fold(
-                HashMap::new(),
-                |mut index, cursor| {
+            let by_name: HashMap<_, Vec<_>> =
+                cursors.values().fold(HashMap::new(), |mut index, cursor| {
                     if let Some(name) = cursor.path.file_name() {
                         index
                             .entry(name.to_os_string())
@@ -350,8 +350,7 @@ impl SyncEngine {
                             .push(cursor);
                     }
                     index
-                },
-            );
+                });
             let mut relocated = false;
             for source in &sources {
                 let Some(previous) = source.path.file_name().and_then(|name| by_name.get(name))
@@ -1477,7 +1476,10 @@ mod tests {
             engine.sync_all().unwrap();
             assert_eq!(overview(&database).total_tokens, 17);
             assert_eq!(
-                UsageRepository::new(database.clone()).get_sessions().unwrap().len(),
+                UsageRepository::new(database.clone())
+                    .get_sessions()
+                    .unwrap()
+                    .len(),
                 2
             );
             assert!(database.get_cursor(&source).unwrap().is_some());
@@ -1494,7 +1496,11 @@ mod tests {
         for path in [&longest, &shorter, &copy] {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
         }
-        fs::write(&longest, format!("{}{}", codex_test_log("long-branch", 20), "\n".repeat(300))).unwrap();
+        fs::write(
+            &longest,
+            format!("{}{}", codex_test_log("long-branch", 20), "\n".repeat(300)),
+        )
+        .unwrap();
         fs::write(&shorter, codex_test_log("short-branch", 10)).unwrap();
         fs::copy(&shorter, &copy).unwrap();
         let database = Database::open_in_memory().unwrap();
@@ -1504,11 +1510,15 @@ mod tests {
             engine.sync_all().unwrap();
             assert_eq!(overview(&database).total_tokens, 30);
             assert_eq!(
-                UsageRepository::new(database.clone()).get_sessions().unwrap().len(),
+                UsageRepository::new(database.clone())
+                    .get_sessions()
+                    .unwrap()
+                    .len(),
                 2
             );
         }
-        let (sources, aliases) = engine.canonical_codex_sources(adapter.discover_sources().unwrap());
+        let (sources, aliases) =
+            engine.canonical_codex_sources(adapter.discover_sources().unwrap());
         assert_eq!(sources.len(), 2);
         assert_eq!(aliases.len(), 1);
         assert_eq!(aliases.get(&copy), Some(&shorter));
