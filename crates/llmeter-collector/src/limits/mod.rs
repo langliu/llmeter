@@ -7,7 +7,10 @@ use std::{
     time::Duration,
 };
 
-use aes_gcm::{Aes256Gcm, Nonce, aead::{Aead, KeyInit}};
+use aes_gcm::{
+    Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit},
+};
 use base64::{
     Engine,
     engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
@@ -65,8 +68,7 @@ impl LimitCollector {
                 scope.spawn(|| fetch_cursor(&self.home, &self.platform, self.http.as_ref()));
             let qoder = scope.spawn(|| fetch_qoder(&self.home, &self.platform, self.http.as_ref()));
             let trae = scope.spawn(|| fetch_trae(&self.home, &self.platform));
-            let zcode =
-                scope.spawn(|| fetch_zcode(&self.home, &self.platform, self.http.as_ref()));
+            let zcode = scope.spawn(|| fetch_zcode(&self.home, &self.platform, self.http.as_ref()));
             (
                 claude.join().unwrap_or_else(|_| {
                     ProviderFetch::failed("Claude limit worker stopped unexpectedly")
@@ -1595,8 +1597,7 @@ mod tests {
     #[test]
     fn decrypts_zcode_credential_round_trip() {
         let secret = "zcode-credential-fallback:darwin:/Users/test:tester";
-        let cipher =
-            Aes256Gcm::new_from_slice(&Sha256::digest(secret.as_bytes())).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(&Sha256::digest(secret.as_bytes())).unwrap();
         let iv = [7_u8; 12];
         // aes-gcm's encrypt returns ciphertext||tag; enc:v1: stores them apart.
         let encrypted = cipher
