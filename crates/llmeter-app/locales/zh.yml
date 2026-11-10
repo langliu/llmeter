@@ -97,6 +97,7 @@ limits:
   unavailable: "不可用"
   not_connected: "未连接"
   not_connected_hint: "未找到本地登录凭据，请先在对应应用或 CLI 中登录。"
+  none_connected: "未检测到可用的账户限额。在对应应用或 CLI 中登录后，点击右上角刷新即可显示。"
   no_windows: "账户未返回可显示的限额窗口。"
   cached_warning: "实时查询失败，当前显示上次成功结果。"
   updated: "更新于 %{time}"

@@ -22,9 +22,27 @@ const LIMIT_PROVIDERS: [Provider; 7] = [
     Provider::ZCode,
 ];
 
+/// A card appears only once it has quota windows to show. That keeps the page
+/// blank instead of flashing "pending" cards that later turn out to be
+/// unconfigured or unavailable: entries without windows (missing sign-in
+/// state, failed checks) and not-yet-checked providers stay hidden until a
+/// refresh delivers real data. Cached windows — including stale cache with an
+/// error footer — render immediately on open.
+fn visible_limit_providers(
+    limits: &llmeter_core::LimitsSnapshot,
+) -> impl Iterator<Item = Provider> + '_ {
+    LIMIT_PROVIDERS.into_iter().filter(move |provider| {
+        limits
+            .provider(*provider)
+            .is_some_and(|item| !item.windows.is_empty())
+    })
+}
+
 pub(crate) fn limits_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl IntoElement {
     let p = Palette::from_app(cx);
-    let cards = LIMIT_PROVIDERS.into_iter().map(|provider| {
+    let visible = visible_limit_providers(&view.limits).collect::<Vec<_>>();
+    let all_hidden = visible.is_empty();
+    let cards = visible.into_iter().map(|provider| {
         provider_card(
             provider,
             view.limits.provider(provider),
@@ -75,7 +93,28 @@ pub(crate) fn limits_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> 
                         .on_click(cx.listener(|view, _, _, cx| view.refresh_limits(cx))),
                 ),
         )
-        .child(v_flex().w_full().gap_4().children(cards))
+        .child(
+            v_flex()
+                .w_full()
+                .gap_4()
+                .children(cards)
+                // While a refresh is running a blank list means "waiting",
+                // not "nothing found"; hold the hint until the check settles.
+                .when(all_hidden && !view.limits_refreshing, |this| {
+                    this.child(
+                        div()
+                            .debug_selector(|| "limit-cards-empty".to_string())
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(p.border)
+                            .bg(p.tiles)
+                            .p_4()
+                            .text_sm()
+                            .text_color(p.muted_foreground)
+                            .child(t!("limits.none_connected")),
+                    )
+                }),
+        )
         .child(
             div()
                 .pt_1()
@@ -492,5 +531,59 @@ mod tests {
     fn percent_format_does_not_add_noise_to_whole_values() {
         assert_eq!(format_percent(42.0), "42%");
         assert_eq!(format_percent(42.25), "42.2%");
+    }
+
+    fn snapshot_entries(entries: Vec<ProviderLimits>) -> llmeter_core::LimitsSnapshot {
+        llmeter_core::LimitsSnapshot {
+            fetched_at: Some(Utc::now()),
+            providers: entries,
+        }
+    }
+
+    #[test]
+    fn only_cards_with_windows_are_visible() {
+        let mut stale = ProviderLimits::not_configured(Provider::Qoder, Utc::now());
+        stale.configured = true;
+        stale.stale = true;
+        stale.error = Some("live request failed".into());
+        stale.windows = vec![LimitWindow::new("seven_day", 40.0)];
+        let snapshot = snapshot_entries(vec![
+            // Signed out: no local credentials.
+            ProviderLimits::not_configured(Provider::Grok, Utc::now()),
+            // Signed in but the check failed with nothing to show.
+            ProviderLimits::failed(
+                Provider::Claude,
+                Utc::now(),
+                "Claude login expired. Run `claude` to sign in again.",
+            ),
+            // Live fetch failed but cached windows remain.
+            stale,
+        ]);
+        let visible = visible_limit_providers(&snapshot).collect::<Vec<_>>();
+        assert_eq!(
+            visible,
+            vec![Provider::Qoder],
+            "stale cache with windows is the only card worth showing"
+        );
+        // Codex and Trae have no entry at all (check not run this session):
+        // they start hidden instead of flashing a pending card.
+        assert!(!visible.contains(&Provider::Codex));
+        assert!(!visible.contains(&Provider::Trae));
+    }
+
+    #[test]
+    fn blank_snapshot_shows_no_cards() {
+        let snapshot = snapshot_entries(Vec::new());
+        assert!(visible_limit_providers(&snapshot).next().is_none());
+    }
+
+    #[test]
+    fn all_hidden_when_every_provider_lacks_credentials() {
+        let snapshot = snapshot_entries(
+            LIMIT_PROVIDERS
+                .map(|provider| ProviderLimits::not_configured(provider, Utc::now()))
+                .to_vec(),
+        );
+        assert!(visible_limit_providers(&snapshot).next().is_none());
     }
 }

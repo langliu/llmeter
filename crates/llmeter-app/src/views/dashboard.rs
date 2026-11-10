@@ -143,11 +143,14 @@ fn providers_page(view: &LLMeterView, snapshot: &UiSnapshot, p: Palette) -> gpui
         provider_rows = provider_rows.child(empty_state(t!("overview.no_usage").to_string(), p));
     }
 
+    // Models whose every event recorded zero tokens carry no signal in this
+    // ranking; showing them only pads the list below the models actually used.
+    let models_with_usage: Vec<&ModelUsage> = visible_model_usage(&snapshot.models).collect();
     let mut model_rows = div().flex().flex_col().gap_2();
-    for model in &snapshot.models {
+    for model in &models_with_usage {
         model_rows = model_rows.child(model_row(model, view, p));
     }
-    if snapshot.models.is_empty() {
+    if models_with_usage.is_empty() {
         model_rows = model_rows.child(empty_state(t!("overview.models_pending").to_string(), p));
     }
 
@@ -1298,6 +1301,14 @@ fn project_row(project: &ProjectUsage, view: &LLMeterView, p: Palette) -> impl I
         )
 }
 
+/// The providers-page model list keeps only models that recorded tokens in the
+/// 30-day window. Entries with zero total tokens (every event was empty) carry
+/// no signal in the ranking and only pad the list below models actually used;
+/// hiding them also keeps the empty state honest when nothing was used at all.
+fn visible_model_usage(models: &[ModelUsage]) -> impl Iterator<Item = &ModelUsage> {
+    models.iter().filter(|model| model.total_tokens > 0)
+}
+
 fn model_row(model: &ModelUsage, view: &LLMeterView, p: Palette) -> impl IntoElement {
     div()
         .flex()
@@ -2106,6 +2117,7 @@ mod tests {
     use super::{
         HEATMAP_CELL, HEATMAP_GAP, HEATMAP_WEEKS, aggregate_model_usage, cache_hit_rate,
         format_detail_percentage, heatmap_hit_index, provider_card_columns, total_prompt_input,
+        visible_model_usage,
     };
     use gpui::{Bounds, point, px, size};
     use llmeter_core::Provider;
@@ -2203,5 +2215,46 @@ mod tests {
         assert_eq!(aggregated[1].model, "shared-model");
         assert_eq!(aggregated[1].total_tokens, 150);
         assert_eq!(aggregated[1].estimated_cost_usd, Some(0.5));
+    }
+
+    #[test]
+    fn model_usage_list_hides_zero_token_entries() {
+        let models = vec![
+            ModelUsage {
+                provider: Provider::Codex,
+                model: "gpt-6-astra".into(),
+                total_tokens: 0,
+                estimated_cost_usd: Some(0.0),
+            },
+            ModelUsage {
+                provider: Provider::ZCode,
+                model: "glm-5.3".into(),
+                total_tokens: 36_820_000,
+                estimated_cost_usd: Some(51.63),
+            },
+            ModelUsage {
+                provider: Provider::Pi,
+                model: "gpt-5.6-luna".into(),
+                total_tokens: 20_000,
+                estimated_cost_usd: Some(0.0),
+            },
+        ];
+
+        let visible: Vec<&str> = visible_model_usage(&models)
+            .map(|model| model.model.as_str())
+            .collect();
+        assert_eq!(visible, vec!["glm-5.3", "gpt-5.6-luna"]);
+    }
+
+    #[test]
+    fn model_usage_list_hides_everything_when_no_tokens_recorded() {
+        let models = vec![ModelUsage {
+            provider: Provider::OpenCode,
+            model: "glm-5.3".into(),
+            total_tokens: 0,
+            estimated_cost_usd: Some(0.0),
+        }];
+        assert_eq!(visible_model_usage(&models).count(), 0);
+        assert_eq!(visible_model_usage(&[]).count(), 0);
     }
 }

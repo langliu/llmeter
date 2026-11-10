@@ -2140,34 +2140,56 @@ mod tests {
     }
 
     #[gpui::test]
-    fn disconnected_limit_cards_are_compact_in_both_themes(cx: &mut TestAppContext) {
+    fn limit_cards_without_windows_stay_hidden(cx: &mut TestAppContext) {
         let (view, cx) = setup_sessions_page(cx);
         cx.simulate_resize(gpui::size(px(980.0), px(760.0)));
         for preference in [super::ThemePreference::Light, super::ThemePreference::Dark] {
             cx.update(|window, cx| {
                 view.update(cx, |view, cx| {
                     view.active_page = DashboardPage::Limits;
-                    view.limits.providers =
-                        vec![ProviderLimits::not_configured(Provider::Claude, Utc::now())];
+                    view.limits.providers = vec![
+                        ProviderLimits::not_configured(Provider::Claude, Utc::now()),
+                        ProviderLimits::failed(
+                            Provider::Grok,
+                            Utc::now(),
+                            "Grok login expired. Run `grok login` to sign in again.",
+                        ),
+                    ];
                     view.set_theme_preference(preference, window, cx);
                     cx.notify();
                 });
                 window.draw(cx).clear(cx);
             });
-            let card = cx
-                .debug_bounds("limit-card-claude")
-                .expect("disconnected card");
             assert!(
-                card.size.height <= px(120.0),
-                "disconnected card is too tall: {:?}",
-                card.size.height
+                cx.debug_bounds("limit-card-claude").is_none(),
+                "card without local credentials must stay hidden"
             );
             assert!(
-                cx.debug_bounds("limit-updated-claude").is_none(),
-                "no quota data to timestamp"
+                cx.debug_bounds("limit-card-grok").is_none(),
+                "unavailable card without windows must stay hidden"
             );
-            let pending = cx.debug_bounds("limit-card-codex").expect("pending card");
-            assert!(pending.size.height <= px(120.0));
+            // Codex has no entry at all: the check has not run this session,
+            // so no pending card flashes before the refresh settles.
+            assert!(cx.debug_bounds("limit-card-codex").is_none());
+            assert!(
+                cx.debug_bounds("limit-cards-empty").is_some(),
+                "a settled snapshot with no usable cards should show the hint"
+            );
+
+            // A card with real windows renders as soon as data exists.
+            cx.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    let mut codex = ProviderLimits::not_configured(Provider::Codex, Utc::now());
+                    codex.configured = true;
+                    codex.windows = vec![llmeter_core::LimitWindow::new("seven_day", 40.0)];
+                    view.limits.providers = vec![codex];
+                    cx.notify();
+                });
+                window.draw(cx).clear(cx);
+            });
+            let card = cx.debug_bounds("limit-card-codex").expect("windowed card");
+            assert!(card.size.height > px(0.0));
+            assert!(cx.debug_bounds("limit-cards-empty").is_none());
         }
     }
 

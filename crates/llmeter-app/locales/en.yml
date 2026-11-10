@@ -97,6 +97,7 @@ limits:
   unavailable: "Unavailable"
   not_connected: "Not connected"
   not_connected_hint: "No local login was found. Sign in with the corresponding app or CLI first."
+  none_connected: "No usable account limits were detected. Sign in with an app or CLI, then refresh to see limits."
   no_windows: "The account returned no quota windows to display."
   cached_warning: "The live request failed; showing the last successful result."
   updated: "Updated %{time}"
