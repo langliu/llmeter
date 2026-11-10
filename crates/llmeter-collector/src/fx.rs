@@ -192,12 +192,20 @@ fn cache_is_fresh(path: &Path) -> bool {
 }
 
 fn fetch_upstream() -> Result<Value> {
-    let response = ureq::get(EXCHANGE_RATE_URL)
-        .set("User-Agent", "llmeter/0.1")
-        .timeout(FETCH_TIMEOUT)
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(FETCH_TIMEOUT))
+            .build(),
+    );
+    let mut response = agent
+        .get(EXCHANGE_RATE_URL)
+        .header("User-Agent", "llmeter/0.1")
         .call()
         .context("request exchange rates")?;
-    response.into_json().context("decode exchange-rate JSON")
+    response
+        .body_mut()
+        .read_json::<Value>()
+        .context("decode exchange-rate JSON")
 }
 
 #[cfg(test)]

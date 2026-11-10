@@ -13,7 +13,7 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD},
 };
-use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
+use cbc::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
 use chrono::{Duration as ChronoDuration, Timelike, Utc};
 use llmeter_core::{Provider, ProviderDetection, SourceFile, SourceFormat, TokenCounts};
 use llmeter_storage::Database;
@@ -345,7 +345,7 @@ fn decrypt_trae_cn_auth(value: &str) -> Result<Value> {
     let key_iv = Sha512::digest(kdf_input);
     let plaintext = Aes128CbcDecryptor::new_from_slices(&key_iv[..16], &key_iv[16..32])
         .map_err(|_| anyhow!("TRAE CN sign-in data is malformed"))?
-        .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
+        .decrypt_padded_vec::<Pkcs7>(ciphertext)
         .map_err(|_| anyhow!("TRAE CN sign-in data could not be decrypted"))?;
     if plaintext.len() < 64 {
         bail!("TRAE CN sign-in data is malformed");
@@ -425,16 +425,19 @@ fn fetch_trae_pages(
     start: i64,
     end: i64,
 ) -> std::result::Result<Vec<Value>, TraeUsageError> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(30))
-        .redirects(0)
-        .build();
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .build(),
+    );
     let mut rows = Vec::new();
     for page in 1..=TRAE_CN_MAX_PAGES {
         let response = agent
             .post(TRAE_CN_USAGE_URL)
-            .set("Content-Type", "application/json")
-            .set("Authorization", &format!("Cloud-IDE-JWT {token}"))
+            .header("Content-Type", "application/json")
+            .header("Authorization", &format!("Cloud-IDE-JWT {token}"))
             .send_json(serde_json::json!({
                 "usage_type": [7],
                 "start_time": start,
@@ -444,24 +447,28 @@ fn fetch_trae_pages(
             }));
         let response = match response {
             Ok(response) => response,
-            Err(ureq::Error::Status(401 | 403, _)) => {
-                return Err(TraeUsageError::Failed(
-                    "TRAE CN login expired; sign in again in TRAE".into(),
-                ));
-            }
-            Err(ureq::Error::Status(status, _)) => {
-                return Err(TraeUsageError::Failed(format!(
-                    "TRAE CN usage API returned HTTP {status}"
-                )));
-            }
-            Err(ureq::Error::Transport(_)) => {
+            Err(_) => {
                 return Err(TraeUsageError::Failed(
                     "TRAE CN usage API request failed".into(),
                 ));
             }
         };
+        match response.status().as_u16() {
+            401 | 403 => {
+                return Err(TraeUsageError::Failed(
+                    "TRAE CN login expired; sign in again in TRAE".into(),
+                ));
+            }
+            status if !(200..300).contains(&status) => {
+                return Err(TraeUsageError::Failed(format!(
+                    "TRAE CN usage API returned HTTP {status}"
+                )));
+            }
+            _ => {}
+        }
         let mut body = Vec::new();
         response
+            .into_body()
             .into_reader()
             .take(TRAE_CN_RESPONSE_LIMIT + 1)
             .read_to_end(&mut body)

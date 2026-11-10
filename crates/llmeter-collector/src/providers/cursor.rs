@@ -230,23 +230,38 @@ impl ProviderAdapter for CursorAdapter {
 }
 
 fn fetch_cursor_csv(cookie: &str) -> Result<String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(30))
-        .redirects(0)
-        .build();
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .build(),
+    );
     let mut url = CURSOR_USAGE_CSV_URL.to_string();
     for redirect in 0..=1 {
         let response = agent
             .get(&url)
-            .set("Accept", "text/csv,*/*")
-            .set("Cookie", cookie)
-            .set("Referer", "https://www.cursor.com/settings")
-            .set("User-Agent", "Mozilla/5.0 LLMeter/0.1")
-            .call();
-        match response {
-            Ok(response) => {
+            .header("Accept", "text/csv,*/*")
+            .header("Cookie", cookie)
+            .header("Referer", "https://www.cursor.com/settings")
+            .header("User-Agent", "Mozilla/5.0 LLMeter/0.1")
+            .call()
+            .map_err(|error| anyhow!("Cursor usage export request failed: {error}"))?;
+        let status = response.status().as_u16();
+        match status {
+            301 | 302 | 303 | 307 | 308 if redirect == 0 => {
+                let location = response
+                    .headers()
+                    .get("Location")
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| anyhow!("Cursor usage export redirect has no location"))?;
+                url = trusted_cursor_redirect(location)?;
+            }
+            401 | 403 => bail!("Cursor login expired; sign in again in Cursor"),
+            200..=299 => {
                 let mut body = String::new();
                 response
+                    .into_body()
                     .into_reader()
                     .take(MAX_CSV_BYTES + 1)
                     .read_to_string(&mut body)
@@ -256,21 +271,7 @@ fn fetch_cursor_csv(cookie: &str) -> Result<String> {
                 }
                 return Ok(body);
             }
-            Err(ureq::Error::Status(301 | 302 | 303 | 307 | 308, response)) if redirect == 0 => {
-                let location = response
-                    .header("Location")
-                    .ok_or_else(|| anyhow!("Cursor usage export redirect has no location"))?;
-                url = trusted_cursor_redirect(location)?;
-            }
-            Err(ureq::Error::Status(401 | 403, _)) => {
-                bail!("Cursor login expired; sign in again in Cursor")
-            }
-            Err(ureq::Error::Status(status, _)) => {
-                bail!("Cursor usage export returned HTTP {status}")
-            }
-            Err(ureq::Error::Transport(error)) => {
-                bail!("Cursor usage export request failed: {error}")
-            }
+            status => bail!("Cursor usage export returned HTTP {status}"),
         }
     }
     bail!("Cursor usage export redirected too many times")

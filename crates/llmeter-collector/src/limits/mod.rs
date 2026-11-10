@@ -197,10 +197,13 @@ struct UreqLimitHttpClient {
 impl UreqLimitHttpClient {
     fn new() -> Self {
         Self {
-            agent: ureq::AgentBuilder::new()
-                .timeout(PROVIDER_TIMEOUT)
-                .redirects(0)
-                .build(),
+            agent: ureq::Agent::new_with_config(
+                ureq::Agent::config_builder()
+                    .timeout_global(Some(PROVIDER_TIMEOUT))
+                    .max_redirects(0)
+                    .http_status_as_error(false)
+                    .build(),
+            ),
         }
     }
 }
@@ -209,22 +212,26 @@ impl LimitHttpClient for UreqLimitHttpClient {
     fn get_json(&self, url: &str, headers: &[(&str, &str)]) -> Result<Value, HttpFailure> {
         let mut request = self.agent.get(url);
         for (name, value) in headers {
-            request = request.set(name, value);
+            request = request.header(*name, *value);
         }
-        match request.call() {
-            Ok(response) => response.into_json().map_err(|error| HttpFailure {
-                status: None,
-                message: format!("invalid JSON response: {error}"),
-            }),
-            Err(ureq::Error::Status(status, _)) => Err(HttpFailure {
+        let mut response = request.call().map_err(|error| HttpFailure {
+            status: None,
+            message: error.to_string(),
+        })?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(HttpFailure {
                 status: Some(status),
                 message: format!("HTTP {status}"),
-            }),
-            Err(ureq::Error::Transport(error)) => Err(HttpFailure {
-                status: None,
-                message: error.to_string(),
-            }),
+            });
         }
+        response
+            .body_mut()
+            .read_json::<Value>()
+            .map_err(|error| HttpFailure {
+                status: None,
+                message: format!("invalid JSON response: {error}"),
+            })
     }
 }
 
@@ -1426,12 +1433,11 @@ fn decrypt_zcode_credential(cipher: &Aes256Gcm, value: &str) -> Result<String, S
     let iv = decode(iv)?;
     let tag = decode(tag)?;
     let mut message = decode(ciphertext)?;
-    if iv.len() != 12 {
-        return Err("credential nonce length is invalid".into());
-    }
     message.extend_from_slice(&tag);
+    let nonce = Nonce::try_from(iv.as_slice())
+        .map_err(|_| "credential nonce length is invalid".to_string())?;
     cipher
-        .decrypt(Nonce::from_slice(&iv), message.as_ref())
+        .decrypt(&nonce, message.as_ref())
         .map(|plaintext| String::from_utf8_lossy(&plaintext).into_owned())
         .map_err(|_| "credential was encrypted with a different key".into())
 }
@@ -1601,7 +1607,7 @@ mod tests {
         let iv = [7_u8; 12];
         // aes-gcm's encrypt returns ciphertext||tag; enc:v1: stores them apart.
         let encrypted = cipher
-            .encrypt(Nonce::from_slice(&iv), b"test-api-key".as_ref())
+            .encrypt(&Nonce::from(iv), b"test-api-key".as_ref())
             .unwrap();
         let split = encrypted.len() - 16;
         let (ciphertext, tag) = (&encrypted[..split], &encrypted[split..]);

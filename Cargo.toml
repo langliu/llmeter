@@ -24,28 +24,28 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1"
-aes = "0.8"
-aes-gcm = { version = "0.10", features = ["alloc"] }
+aes = "0.9"
+aes-gcm = { version = "0.11", features = ["alloc"] }
 async-trait = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 blake3 = "1"
 chrono = { version = "0.4", features = ["serde"] }
-cbc = { version = "0.1", features = ["alloc", "block-padding"] }
-dirs = "6"
+cbc = { version = "0.2", features = ["alloc", "block-padding"] }
+dirs = "7"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "runtime_shaders"] }
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 notify = "8"
-rusqlite = { version = "0.37", features = ["bundled"] }
-rust-i18n = "3"
+rusqlite = { version = "0.41", features = ["bundled"] }
+rust-i18n = "4"
 sys-locale = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 zstd = "0.13"

@@ -166,12 +166,20 @@ fn cache_is_fresh(path: &Path) -> bool {
 }
 
 fn fetch_upstream() -> Result<Value> {
-    let response = ureq::get(LITELLM_PRICING_URL)
-        .set("User-Agent", "llmeter/0.1")
-        .timeout(FETCH_TIMEOUT)
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(FETCH_TIMEOUT))
+            .build(),
+    );
+    let mut response = agent
+        .get(LITELLM_PRICING_URL)
+        .header("User-Agent", "llmeter/0.1")
         .call()
         .context("request LiteLLM pricing")?;
-    response.into_json().context("decode LiteLLM pricing JSON")
+    response
+        .body_mut()
+        .read_json::<Value>()
+        .context("decode LiteLLM pricing JSON")
 }
 
 pub fn reprice_events(database: &Database) -> Result<usize> {
