@@ -117,6 +117,7 @@ limits:
   window_cursor_api: "API 用量"
   window_qoder_credits: "Plan Credits"
   window_qoder_cn_credits: "Qoder CN Plan Credits"
+  window_zcode_mcp_credits: "MCP 月度额度"
   window_trae_fast_requests: "Fast Request 配额"
   requests_per_hour: "次/小时"
   allowance_only: "TRAE 本地登录态仅提供套餐配额，不提供当前已用量。"

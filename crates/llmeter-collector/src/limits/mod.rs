@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use aes_gcm::{Aes256Gcm, Nonce, aead::{Aead, KeyInit}};
 use base64::{
     Engine,
     engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
@@ -15,6 +16,7 @@ use chrono::{DateTime, Datelike, TimeZone, Utc};
 use llmeter_core::{LimitSource, LimitWindow, LimitsSnapshot, Provider, ProviderLimits};
 use llmeter_storage::{Database, LimitRepository};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::providers::{
     cursor_root, cursor_session_cookie, has_trae_cn_auth, qoder_root, read_entitlement,
@@ -27,6 +29,7 @@ const GROK_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing";
 const CURSOR_USAGE_URL: &str = "https://cursor.com/api/usage-summary";
 const QODER_USAGE_URL: &str = "https://qoder.com/api/v2/me/usages/big_model_credits";
 const QODER_CN_USAGE_URL: &str = "https://qoder.com.cn/api/v2/me/usages/big_model_credits";
+const ZCODE_USAGE_URL: &str = "https://bigmodel.cn/api/monitor/usage/quota/limit";
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
@@ -53,7 +56,7 @@ impl LimitCollector {
 
     pub fn refresh(&self) -> LimitsSnapshot {
         let now = Utc::now();
-        let (claude, codex, grok, cursor, qoder, trae) = std::thread::scope(|scope| {
+        let (claude, codex, grok, cursor, qoder, trae, zcode) = std::thread::scope(|scope| {
             let claude =
                 scope.spawn(|| fetch_claude(&self.home, &self.platform, self.http.as_ref()));
             let codex = scope.spawn(|| fetch_codex(&self.home, self.http.as_ref()));
@@ -62,6 +65,8 @@ impl LimitCollector {
                 scope.spawn(|| fetch_cursor(&self.home, &self.platform, self.http.as_ref()));
             let qoder = scope.spawn(|| fetch_qoder(&self.home, &self.platform, self.http.as_ref()));
             let trae = scope.spawn(|| fetch_trae(&self.home, &self.platform));
+            let zcode =
+                scope.spawn(|| fetch_zcode(&self.home, &self.platform, self.http.as_ref()));
             (
                 claude.join().unwrap_or_else(|_| {
                     ProviderFetch::failed("Claude limit worker stopped unexpectedly")
@@ -81,6 +86,9 @@ impl LimitCollector {
                 trae.join().unwrap_or_else(|_| {
                     ProviderFetch::failed("TRAE limit worker stopped unexpectedly")
                 }),
+                zcode.join().unwrap_or_else(|_| {
+                    ProviderFetch::failed("ZCode limit worker stopped unexpectedly")
+                }),
             )
         });
 
@@ -91,6 +99,7 @@ impl LimitCollector {
             (Provider::Cursor, cursor),
             (Provider::Qoder, qoder),
             (Provider::Trae, trae),
+            (Provider::ZCode, zcode),
         ]
         .into_iter()
         .map(|(provider, result)| self.finish(provider, result, now))
@@ -1260,6 +1269,196 @@ fn grok_period_key(current: Option<&Value>, config: &Value) -> &'static str {
     "monthly"
 }
 
+fn fetch_zcode(home: &Path, platform: &str, http: &dyn LimitHttpClient) -> ProviderFetch {
+    let zcode_home = std::env::var_os("ZCODE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".zcode"));
+    let Some(credentials) = read_json_file(&zcode_home.join("v2/credentials.json")) else {
+        return ProviderFetch::NotConfigured;
+    };
+    // ZCode encrypts every credential with a machine-derived key; each
+    // coding-plan sign-in adds one `account-provider:coding-plan:...:api-key`
+    // entry holding the BigModel API key used for the usage endpoint.
+    let secret = format!(
+        "zcode-credential-fallback:{}:{}:{}",
+        zcode_node_platform(platform),
+        home.display(),
+        zcode_username(),
+    );
+    let Ok(cipher) = Aes256Gcm::new_from_slice(&Sha256::digest(secret.as_bytes())) else {
+        return ProviderFetch::Failed(LimitFetchError::transient(
+            "ZCode credential cipher could not be initialized.",
+        ));
+    };
+    let mut api_key = None;
+    let mut decrypt_error = None;
+    for (name, value) in credentials.as_object().into_iter().flatten() {
+        if !name.starts_with("account-provider:coding-plan:") || !name.ends_with(":api-key") {
+            continue;
+        }
+        let Some(value) = value.as_str().filter(|value| value.starts_with("enc:v1:")) else {
+            continue;
+        };
+        match decrypt_zcode_credential(&cipher, value) {
+            Ok(key) if !key.is_empty() => {
+                api_key = Some(key);
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => decrypt_error = Some(error),
+        }
+    }
+    let Some(api_key) = api_key else {
+        if let Some(error) = decrypt_error {
+            return ProviderFetch::Failed(LimitFetchError::auth(format!(
+                "ZCode credentials could not be decrypted: {error}. Sign in again in ZCode."
+            )));
+        }
+        return ProviderFetch::NotConfigured;
+    };
+    // shortcut: only the first coding-plan API key is queried; multiple
+    // signed-in plans would need key-prefixed window keys.
+    let authorization = format!("Bearer {api_key}");
+    let body = match http.get_json(
+        ZCODE_USAGE_URL,
+        &[
+            ("Authorization", authorization.as_str()),
+            ("Accept", "application/json"),
+        ],
+    ) {
+        Ok(body) => body,
+        Err(error) if matches!(error.status, Some(401 | 403)) => {
+            return ProviderFetch::Failed(LimitFetchError::auth(
+                "ZCode sign-in expired. Sign in again in ZCode.",
+            ));
+        }
+        Err(error) => {
+            return ProviderFetch::Failed(LimitFetchError::transient(format!(
+                "ZCode usage request failed: {}",
+                error.message
+            )));
+        }
+    };
+    match normalize_zcode(&body, Utc::now()) {
+        Ok(limits) => ProviderFetch::Ready(limits),
+        Err(error) => ProviderFetch::Failed(error),
+    }
+}
+
+fn normalize_zcode(body: &Value, now: DateTime<Utc>) -> Result<ProviderLimits, LimitFetchError> {
+    let code = number(body.get("code")).unwrap_or_default();
+    if code != 200.0 {
+        let message = body
+            .get("msg")
+            .and_then(Value::as_str)
+            .unwrap_or("request failed");
+        return Err(if code == 401.0 {
+            LimitFetchError::auth("ZCode sign-in expired. Sign in again in ZCode.")
+        } else {
+            LimitFetchError::transient(format!("ZCode usage request failed: {message}"))
+        });
+    }
+    let data = body.get("data");
+    let mut windows = Vec::new();
+    for limit in data
+        .and_then(|data| data.get("limits"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let kind = limit.get("type").and_then(Value::as_str).unwrap_or("");
+        let unit = number(limit.get("unit")).unwrap_or_default() as u64;
+        let Some(percent) = number(limit.get("percentage")) else {
+            continue;
+        };
+        let mut window = match (kind, unit) {
+            ("TOKENS_LIMIT", 3) if number(limit.get("number")) == Some(5.0) => {
+                let mut window = LimitWindow::new("five_hour", percent);
+                window.window_seconds = Some(5 * 60 * 60);
+                window
+            }
+            ("TOKENS_LIMIT", 6) => {
+                let mut window = LimitWindow::new("weekly", percent);
+                window.window_seconds = Some(7 * 24 * 60 * 60);
+                window
+            }
+            ("TIME_LIMIT", 5) => {
+                let mut window = LimitWindow::new("zcode_mcp_credits", percent);
+                window.used_amount = number(limit.get("currentValue"));
+                window.limit_amount = number(limit.get("usage"));
+                window.unit = Some("credits".into());
+                window
+            }
+            _ => continue,
+        };
+        window.reset_at = parse_reset(limit.get("nextResetTime"));
+        windows.push(window);
+    }
+    if windows.is_empty() {
+        return Err(LimitFetchError::transient(
+            "ZCode usage response contained no quota windows",
+        ));
+    }
+    let plan = data
+        .and_then(|data| data.get("level"))
+        .and_then(Value::as_str)
+        .map(title_case);
+    Ok(ready_limits(Provider::ZCode, plan, windows, now))
+}
+
+fn decrypt_zcode_credential(cipher: &Aes256Gcm, value: &str) -> Result<String, String> {
+    let parts: Vec<_> = value
+        .strip_prefix("enc:v1:")
+        .ok_or_else(|| "value is not encrypted".to_string())?
+        .split('.')
+        .collect();
+    let [iv, tag, ciphertext] = parts.as_slice() else {
+        return Err("unexpected encrypted credential format".into());
+    };
+    let decode = |part: &str| {
+        URL_SAFE_NO_PAD
+            .decode(part)
+            .or_else(|_| URL_SAFE.decode(part))
+            .map_err(|_| "credential has invalid base64".to_string())
+    };
+    let iv = decode(iv)?;
+    let tag = decode(tag)?;
+    let mut message = decode(ciphertext)?;
+    if iv.len() != 12 {
+        return Err("credential nonce length is invalid".into());
+    }
+    message.extend_from_slice(&tag);
+    cipher
+        .decrypt(Nonce::from_slice(&iv), message.as_ref())
+        .map(|plaintext| String::from_utf8_lossy(&plaintext).into_owned())
+        .map_err(|_| "credential was encrypted with a different key".into())
+}
+
+fn zcode_node_platform(platform: &str) -> &'static str {
+    match platform {
+        "macos" => "darwin",
+        "windows" => "win32",
+        _ => "linux",
+    }
+}
+
+fn zcode_username() -> String {
+    std::env::var("USER")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            Command::new("id")
+                .arg("-un")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|value| value.trim().to_string())
+                .unwrap_or_else(|| "unknown".into())
+        })
+}
+
 fn ready_limits(
     provider: Provider,
     plan: Option<String>,
@@ -1341,6 +1540,84 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn normalizes_zcode_windows_and_plan() {
+        let result = normalize_zcode(
+            &json!({
+                "code": 200,
+                "data": {
+                    "level": "lite",
+                    "limits": [
+                        {
+                            "type": "TOKENS_LIMIT", "unit": 3, "number": 5,
+                            "percentage": 2, "nextResetTime": 1794328363216_u64
+                        },
+                        {
+                            "type": "TOKENS_LIMIT", "unit": 6,
+                            "percentage": 55, "nextResetTime": 1794808363216_u64
+                        },
+                        {
+                            "type": "TIME_LIMIT", "unit": 5, "number": 1,
+                            "usage": 100, "currentValue": 12, "remaining": 88,
+                            "percentage": 12, "nextResetTime": 1796038363216_u64
+                        }
+                    ]
+                }
+            }),
+            Utc::now(),
+        )
+        .unwrap();
+
+        assert_eq!(result.plan.as_deref(), Some("Lite"));
+        assert_eq!(result.windows.len(), 3);
+        assert_eq!(result.windows[0].key, "five_hour");
+        assert_eq!(result.windows[0].used_percent, 2.0);
+        assert_eq!(result.windows[0].window_seconds, Some(5 * 60 * 60));
+        assert_eq!(result.windows[1].key, "weekly");
+        assert_eq!(result.windows[1].window_seconds, Some(7 * 24 * 60 * 60));
+        assert_eq!(result.windows[2].key, "zcode_mcp_credits");
+        assert_eq!(result.windows[2].used_amount, Some(12.0));
+        assert_eq!(result.windows[2].limit_amount, Some(100.0));
+    }
+
+    #[test]
+    fn zcode_error_envelope_maps_to_fetch_error() {
+        let error = normalize_zcode(
+            &json!({ "code": 401, "msg": "令牌已过期或验证不正确" }),
+            Utc::now(),
+        )
+        .unwrap_err();
+
+        assert!(!error.transient);
+    }
+
+    #[test]
+    fn decrypts_zcode_credential_round_trip() {
+        let secret = "zcode-credential-fallback:darwin:/Users/test:tester";
+        let cipher =
+            Aes256Gcm::new_from_slice(&Sha256::digest(secret.as_bytes())).unwrap();
+        let iv = [7_u8; 12];
+        // aes-gcm's encrypt returns ciphertext||tag; enc:v1: stores them apart.
+        let encrypted = cipher
+            .encrypt(Nonce::from_slice(&iv), b"test-api-key".as_ref())
+            .unwrap();
+        let split = encrypted.len() - 16;
+        let (ciphertext, tag) = (&encrypted[..split], &encrypted[split..]);
+        let encode = |bytes: &[u8]| URL_SAFE_NO_PAD.encode(bytes);
+        let value = format!(
+            "enc:v1:{}.{}.{}",
+            encode(&iv),
+            encode(tag),
+            encode(ciphertext)
+        );
+
+        assert_eq!(
+            decrypt_zcode_credential(&cipher, &value).unwrap(),
+            "test-api-key"
+        );
+        assert!(decrypt_zcode_credential(&cipher, "enc:v1:a.b.c").is_err());
+    }
 
     #[test]
     fn normalizes_claude_windows_and_scoped_models() {

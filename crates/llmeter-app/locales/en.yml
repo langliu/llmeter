@@ -117,6 +117,7 @@ limits:
   window_cursor_api: "API usage"
   window_qoder_credits: "Plan Credits"
   window_qoder_cn_credits: "Qoder CN Plan Credits"
+  window_zcode_mcp_credits: "Monthly MCP credits"
   window_trae_fast_requests: "Fast Request allowance"
   requests_per_hour: "requests/hour"
   allowance_only: "TRAE's local login state exposes the allowance, but not current usage."

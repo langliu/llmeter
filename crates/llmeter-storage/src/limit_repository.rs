@@ -63,6 +63,7 @@ impl LimitRepository {
             Provider::Cursor,
             Provider::Qoder,
             Provider::Trae,
+            Provider::ZCode,
         ] {
             if let Some(mut limits) = self.load(provider)? {
                 if limits.cache_is_too_old(now) {

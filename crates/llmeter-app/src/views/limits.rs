@@ -12,13 +12,14 @@ use crate::{
     views::{palette::Palette, provider_brand::provider_logo},
 };
 
-const LIMIT_PROVIDERS: [Provider; 6] = [
+const LIMIT_PROVIDERS: [Provider; 7] = [
     Provider::Claude,
     Provider::Codex,
     Provider::Cursor,
     Provider::Qoder,
     Provider::Grok,
     Provider::Trae,
+    Provider::ZCode,
 ];
 
 pub(crate) fn limits_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl IntoElement {
@@ -387,6 +388,7 @@ fn window_label(key: &str) -> String {
         "cursor_api" => t!("limits.window_cursor_api").to_string(),
         "qoder_credits" => t!("limits.window_qoder_credits").to_string(),
         "qoder_cn_credits" => t!("limits.window_qoder_cn_credits").to_string(),
+        "zcode_mcp_credits" => t!("limits.window_zcode_mcp_credits").to_string(),
         "trae_fast_requests" => t!("limits.window_trae_fast_requests").to_string(),
         key if key.starts_with("model:") => key.trim_start_matches("model:").to_string(),
         key => key.replace('_', " "),
@@ -481,6 +483,7 @@ mod tests {
         assert!(!window_label("cursor_plan").is_empty());
         assert!(!window_label("qoder_credits").is_empty());
         assert!(!window_label("qoder_cn_credits").is_empty());
+        assert!(!window_label("zcode_mcp_credits").is_empty());
         assert!(!window_label("trae_fast_requests").is_empty());
         assert_eq!(window_label("model:Claude Opus"), "Claude Opus");
     }
