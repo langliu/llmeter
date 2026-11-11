@@ -139,6 +139,10 @@ fn provider_card(
         for window in &limits.windows {
             rows = rows.child(window_row(window, p));
         }
+        let resets = reset_rows(limits, Utc::now());
+        if !resets.is_empty() {
+            rows = rows.child(reset_block(&resets, p));
+        }
     }
     if !has_windows {
         rows = rows.child(
@@ -361,6 +365,113 @@ fn window_row(window: &LimitWindow, p: Palette) -> AnyElement {
         .into_any_element()
 }
 
+/// One upcoming quota reset for a provider's window, rendered beneath the
+/// usage rows inside that provider's card. Windows without a known future
+/// reset time are not listable.
+struct ResetRow {
+    window_key: String,
+    used_percent: f64,
+    usage_known: bool,
+    quota_exceeded: bool,
+    reset_at: DateTime<Utc>,
+}
+
+/// Collects the provider's windows whose quota resets in the future, sorted
+/// by reset time (soonest first). Expired resets are skipped so a stale cache
+/// never lists a window that already rolled over.
+fn reset_rows(limits: &ProviderLimits, now: DateTime<Utc>) -> Vec<ResetRow> {
+    let mut rows = Vec::new();
+    for window in &limits.windows {
+        if let Some(reset_at) = window.reset_at.filter(|reset| *reset > now) {
+            rows.push(ResetRow {
+                window_key: window.key.clone(),
+                used_percent: window.used_percent,
+                usage_known: window.usage_known,
+                quota_exceeded: window.quota_exceeded,
+                reset_at,
+            });
+        }
+    }
+    rows.sort_by_key(|row| row.reset_at);
+    rows
+}
+
+/// Reset schedule for one provider, embedded in its card below the usage
+/// rows: a muted subheading plus one label · bar · absolute-time row.
+fn reset_block(rows: &[ResetRow], p: Palette) -> AnyElement {
+    let mut list = v_flex().gap_2();
+    for row in rows {
+        list = list.child(reset_row(row, p));
+    }
+    v_flex()
+        .debug_selector(|| "limits-reset-block".to_string())
+        .gap_2()
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(p.muted_foreground)
+                .child(t!("limits.reset_title")),
+        )
+        .child(list)
+        .into_any_element()
+}
+
+fn reset_row(row: &ResetRow, p: Palette) -> AnyElement {
+    let color = if row.quota_exceeded || row.used_percent >= 90.0 {
+        p.danger
+    } else if row.used_percent >= 75.0 {
+        p.warning
+    } else {
+        p.link
+    };
+    let label = window_label(&row.window_key);
+    let reset_time = row
+        .reset_at
+        .with_timezone(&Local)
+        .format("%-m/%-d %H:%M")
+        .to_string();
+    // Allowance-only windows carry no usage percentage; keep the time column
+    // aligned across rows with a spacer instead of drawing a misleading bar.
+    let bar: AnyElement = if row.usage_known {
+        let ratio = (row.used_percent / 100.0).clamp(0.0, 1.0) as f32;
+        div()
+            .flex_1()
+            .min_w(px(0.0))
+            .h(px(6.0))
+            .overflow_hidden()
+            .rounded_full()
+            .bg(p.muted)
+            .child(div().h_full().w(relative(ratio)).rounded_full().bg(color))
+            .into_any_element()
+    } else {
+        div().flex_1().min_w(px(0.0)).into_any_element()
+    };
+
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap_3()
+        .child(
+            div()
+                .w(px(150.0))
+                .flex_shrink_0()
+                .truncate()
+                .text_sm()
+                .text_color(p.foreground)
+                .child(label),
+        )
+        .child(bar)
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(p.muted_foreground)
+                .child(reset_time),
+        )
+        .into_any_element()
+}
+
 fn status_style(
     limits: Option<&ProviderLimits>,
     refreshing: bool,
@@ -515,6 +626,7 @@ fn relative_duration(value: DateTime<Utc>, now: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
 
     #[test]
     fn labels_known_windows_and_preserves_model_names() {
@@ -575,6 +687,45 @@ mod tests {
     fn blank_snapshot_shows_no_cards() {
         let snapshot = snapshot_entries(Vec::new());
         assert!(visible_limit_providers(&snapshot).next().is_none());
+    }
+
+    #[test]
+    fn reset_rows_sort_by_time_and_skip_expired_or_unknown_resets() {
+        let now = Utc::now();
+        let mut claude = ProviderLimits::not_configured(Provider::Claude, now);
+        claude.configured = true;
+        let mut five_hour = LimitWindow::new("five_hour", 90.0);
+        five_hour.reset_at = Some(now + Duration::hours(2));
+        let mut seven_day = LimitWindow::new("seven_day", 40.0);
+        seven_day.reset_at = Some(now + Duration::days(3));
+        let mut expired = LimitWindow::new("daily", 10.0);
+        expired.reset_at = Some(now - Duration::minutes(5));
+        let mut allowance = LimitWindow::new("credits", 50.0);
+        allowance.reset_at = None;
+        allowance.usage_known = false;
+        claude.windows = vec![seven_day, expired, five_hour, allowance];
+
+        let rows = reset_rows(&claude, now);
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.window_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["five_hour", "seven_day"],
+            "expired and reset-less windows are not listable, soonest reset first"
+        );
+    }
+
+    #[test]
+    fn reset_rows_only_surface_resets_for_windows_in_the_future() {
+        let now = Utc::now();
+        let mut qoder = ProviderLimits::not_configured(Provider::Qoder, now);
+        qoder.configured = true;
+        // Exactly at `now` is already rolled over for scheduling purposes.
+        let mut boundary = LimitWindow::new("qoder_credits", 20.0);
+        boundary.reset_at = Some(now);
+        qoder.windows = vec![boundary];
+        assert!(reset_rows(&qoder, now).is_empty());
     }
 
     #[test]
