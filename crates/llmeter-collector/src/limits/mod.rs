@@ -16,7 +16,9 @@ use base64::{
     engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
 };
 use chrono::{DateTime, Datelike, TimeZone, Utc};
-use llmeter_core::{LimitSource, LimitWindow, LimitsSnapshot, Provider, ProviderLimits};
+use llmeter_core::{
+    LimitSource, LimitWindow, LimitsSnapshot, Provider, ProviderLimits, ResetCredit,
+};
 use llmeter_storage::{Database, LimitRepository};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -28,11 +30,14 @@ use crate::providers::{
 
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const CODEX_RESET_CREDITS_URL: &str =
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 const GROK_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing";
 const CURSOR_USAGE_URL: &str = "https://cursor.com/api/usage-summary";
 const QODER_USAGE_URL: &str = "https://qoder.com/api/v2/me/usages/big_model_credits";
 const QODER_CN_USAGE_URL: &str = "https://qoder.com.cn/api/v2/me/usages/big_model_credits";
 const ZCODE_USAGE_URL: &str = "https://bigmodel.cn/api/monitor/usage/quota/limit";
+const ZCODE_RESET_STATUS_URL: &str = "https://zcode.z.ai/api/v1/coding-plan/reset/status";
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
@@ -433,9 +438,49 @@ fn fetch_codex(home: &Path, http: &dyn LimitHttpClient) -> ProviderFetch {
         }
     };
     match normalize_codex(&body, plan, Utc::now()) {
-        Ok(limits) => ProviderFetch::Ready(limits),
+        Ok(mut limits) => {
+            // The inventory endpoint only augments the card list; a failure
+            // here must not discard already-fetched usage windows.
+            limits.reset_cards = http
+                .get_json(CODEX_RESET_CREDITS_URL, &headers)
+                .map(|body| parse_reset_credits(&body, Utc::now()))
+                .unwrap_or_default();
+            ProviderFetch::Ready(limits)
+        }
         Err(error) => ProviderFetch::Failed(error),
     }
+}
+
+/// Parses the banked reset-credit inventory into display cards. Only cards
+/// that are still redeemable (`status == "available"` and unexpired) are
+/// listed; malformed entries are skipped rather than failing the provider.
+fn parse_reset_credits(body: &Value, now: DateTime<Utc>) -> Vec<ResetCredit> {
+    body.get("credits")
+        .and_then(Value::as_array)
+        .map(|credits| {
+            credits
+                .iter()
+                .filter(|credit| credit.get("status").and_then(Value::as_str) == Some("available"))
+                .filter_map(|credit| {
+                    let granted_at = parse_reset(credit.get("granted_at"))?;
+                    let expires_at = parse_reset(credit.get("expires_at"))?;
+                    if expires_at <= now {
+                        return None;
+                    }
+                    let title = credit
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Reset")
+                        .to_string();
+                    Some(ResetCredit {
+                        granted_at: Some(granted_at),
+                        expires_at,
+                        title,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn normalize_codex(
@@ -1349,9 +1394,94 @@ fn fetch_zcode(home: &Path, platform: &str, http: &dyn LimitHttpClient) -> Provi
         }
     };
     match normalize_zcode(&body, Utc::now()) {
-        Ok(limits) => ProviderFetch::Ready(limits),
+        Ok(mut limits) => {
+            // The reset bank only augments the card list; a failure here must
+            // not discard already-fetched usage windows.
+            limits.reset_cards =
+                zcode_reset_cards(&credentials, &cipher, http, Utc::now()).unwrap_or_default();
+            ProviderFetch::Ready(limits)
+        }
         Err(error) => ProviderFetch::Failed(error),
     }
+}
+
+/// Fetches ZCode's banked reset-card inventory from zcode.z.ai. Unlike the
+/// usage endpoint (BigModel API key), this needs the session JWT plus the
+/// coding-plan OAuth token; a missing token or request failure degrades to
+/// an empty card list without failing the usage fetch.
+fn zcode_reset_cards(
+    credentials: &Value,
+    cipher: &Aes256Gcm,
+    http: &dyn LimitHttpClient,
+    now: DateTime<Utc>,
+) -> Option<Vec<ResetCredit>> {
+    let credential = |name: &str| -> Option<String> {
+        match credentials.get(name) {
+            Some(Value::String(value)) => decrypt_zcode_credential(cipher, value)
+                .ok()
+                .filter(|value| !value.is_empty()),
+            _ => None,
+        }
+    };
+    let zcode_token = credential("zcodejwttoken")?;
+    let plan_token = credentials
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(name, _)| name.starts_with("oauth:") && name.ends_with(":access_token"))
+        .find_map(|(_, value)| match value.as_str() {
+            Some(value) => decrypt_zcode_credential(cipher, value).ok(),
+            None => None,
+        })?;
+    let authorization = format!("Bearer {zcode_token}");
+    let body = http
+        .get_json(
+            ZCODE_RESET_STATUS_URL,
+            &[
+                ("Authorization", authorization.as_str()),
+                ("X-Bigmodel-Authorization", plan_token.as_str()),
+                ("Bigmodel-Target-Type", "PERSONAL"),
+                ("Accept", "application/json"),
+            ],
+        )
+        .ok()?;
+    Some(parse_zcode_reset_credits(&body, now))
+}
+
+/// Parses ZCode's reset-card inventory: a 5-hour and a weekly array of cards
+/// that only carry an expiry timestamp, no grant time.
+fn parse_zcode_reset_credits(body: &Value, now: DateTime<Utc>) -> Vec<ResetCredit> {
+    let data = body.get("data");
+    let mut cards = Vec::new();
+    for (field, title) in [
+        ("available_five_hour_resets", "5h reset"),
+        ("available_week_resets", "Weekly reset"),
+    ] {
+        for entry in data
+            .and_then(|data| data.get(field))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(expires_at) = entry
+                .get("expire_at")
+                .and_then(Value::as_i64)
+                .and_then(|millis| Utc.timestamp_millis_opt(millis).single())
+            else {
+                continue;
+            };
+            if expires_at <= now {
+                continue;
+            }
+            cards.push(ResetCredit {
+                granted_at: None,
+                expires_at,
+                title: title.into(),
+            });
+        }
+    }
+    cards.sort_by_key(|card| card.expires_at);
+    cards
 }
 
 fn normalize_zcode(body: &Value, now: DateTime<Utc>) -> Result<ProviderLimits, LimitFetchError> {
@@ -1478,6 +1608,7 @@ fn ready_limits(
         configured: true,
         plan,
         windows,
+        reset_cards: Vec::new(),
         captured_at,
         source: LimitSource::ProviderApi,
         stale: false,
@@ -1548,6 +1679,191 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// Manual probe: dumps the full ZCode usage payload plus candidate
+    /// reset-credit endpoints. Run with:
+    /// `cargo test -p llmeter-collector probe_zcode -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn probe_zcode_reset_credits() {
+        let home = std::env::home_dir().unwrap_or_else(std::env::temp_dir);
+        let credentials_path = home.join(".zcode").join("v2").join("credentials.json");
+        let credentials = read_json_file(&credentials_path).expect("credentials.json");
+        let secret = format!(
+            "zcode-credential-fallback:{}:{}:{}",
+            zcode_node_platform(std::env::consts::OS),
+            home.display(),
+            zcode_username(),
+        );
+        let cipher = Aes256Gcm::new_from_slice(&Sha256::digest(secret.as_bytes())).expect("cipher");
+        let mut api_key = None;
+        for (name, value) in credentials.as_object().into_iter().flatten() {
+            if !name.starts_with("account-provider:coding-plan:") || !name.ends_with(":api-key") {
+                continue;
+            }
+            if let Some(value) = value.as_str()
+                && let Ok(key) = decrypt_zcode_credential(&cipher, value)
+            {
+                api_key = Some(key);
+                break;
+            }
+        }
+        let api_key = api_key.expect("no coding-plan api key");
+        let agent = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .timeout_global(Some(std::time::Duration::from_secs(15)))
+                .http_status_as_error(false)
+                .build(),
+        );
+        let get = |url: &str| -> Option<String> {
+            let mut response = agent
+                .get(url)
+                .header("Authorization", &format!("Bearer {api_key}"))
+                .header("Accept", "application/json")
+                .call()
+                .ok()?;
+            response.body_mut().read_to_string().ok()
+        };
+        for url in [
+            "https://bigmodel.cn/api/monitor/usage/quota/limit",
+            "https://bigmodel.cn/api/monitor/usage/quota/reset_credits",
+            "https://bigmodel.cn/api/monitor/usage/quota/resetCredits",
+            "https://bigmodel.cn/api/monitor/usage/reset_credits",
+            "https://bigmodel.cn/api/monitor/usage/quota/packs",
+            "https://bigmodel.cn/api/biz/monitor/usage/quota/limit",
+            "https://bigmodel.cn/api/biz/coding/plan/quota",
+            "https://bigmodel.cn/api/biz/coding/reset_credits",
+        ] {
+            println!("=== {url}");
+            if let Some(body) = get(url) {
+                println!("{}", &body[..body.len().min(2500)]);
+            } else {
+                println!("<request failed>");
+            }
+        }
+
+        // zcode.z.ai coding-plan reset status (TokenTracker's approach):
+        // zcodejwttoken in Authorization, oauth access_token in
+        // X-Bigmodel-Authorization.
+        let load = |name: &str| -> Option<String> {
+            credentials
+                .get(name)
+                .and_then(Value::as_str)
+                .and_then(|value| decrypt_zcode_credential(&cipher, value).ok())
+                .filter(|value| !value.is_empty())
+        };
+        let zcode_token = load("zcodejwttoken");
+        let plan_token = load("oauth:bigmodel:access_token");
+        if let (Some(zcode_token), Some(plan_token)) = (zcode_token, plan_token) {
+            let authorization = format!("Bearer {zcode_token}");
+            println!("=== https://zcode.z.ai/api/v1/coding-plan/reset/status");
+            match agent
+                .get("https://zcode.z.ai/api/v1/coding-plan/reset/status")
+                .header("Authorization", &authorization)
+                .header("X-Bigmodel-Authorization", &plan_token)
+                .header("Bigmodel-Target-Type", "PERSONAL")
+                .header("Accept", "application/json")
+                .call()
+            {
+                Ok(mut response) => {
+                    let body = response.body_mut().read_to_string().unwrap_or_default();
+                    println!("{}", &body[..body.len().min(2500)]);
+                }
+                Err(error) => println!("<request failed: {error}>"),
+            }
+        } else {
+            println!("=== zcode.z.ai skipped: zcodejwttoken / oauth access_token missing");
+        }
+    }
+
+    #[test]
+    fn parses_available_reset_credits_and_skips_the_rest() {
+        let now = Utc::now();
+        let body = json!({
+            "credits": [
+                {
+                    "id": "RateLimitResetCredit_a",
+                    "status": "available",
+                    "granted_at": "2026-10-31T18:59:50Z",
+                    "expires_at": (now + chrono::Duration::days(19)).to_rfc3339(),
+                    "title": "Full reset (Weekly + 5 hr)"
+                },
+                {
+                    "id": "RateLimitResetCredit_b",
+                    "status": "redeemed",
+                    "granted_at": "2026-11-01T20:46:14Z",
+                    "expires_at": (now + chrono::Duration::days(20)).to_rfc3339(),
+                    "title": "Full reset (Weekly + 5 hr)"
+                },
+                {
+                    "id": "RateLimitResetCredit_c",
+                    "status": "available",
+                    "granted_at": "2026-11-01T20:46:14Z",
+                    "expires_at": (now - chrono::Duration::hours(1)).to_rfc3339(),
+                    "title": "Expired card"
+                },
+                {
+                    "id": "RateLimitResetCredit_d",
+                    "status": "available",
+                    "title": "Missing timestamps"
+                }
+            ],
+            "available_count": 2
+        });
+
+        let cards = parse_reset_credits(&body, now);
+        assert_eq!(cards.len(), 1, "only available + unexpired cards survive");
+        assert_eq!(cards[0].title, "Full reset (Weekly + 5 hr)");
+        let granted_at = cards[0].granted_at.expect("codex cards carry a grant time");
+        let expected = (cards[0].expires_at - now).num_seconds() as f64
+            / (cards[0].expires_at - granted_at).num_seconds() as f64;
+        assert_eq!(cards[0].remaining_ratio(now), Some(expected));
+    }
+
+    #[test]
+    #[test]
+    fn parses_zcode_reset_cards_from_probe_shape() {
+        let now = Utc::now();
+        let expires_ms = (now + chrono::Duration::days(12)).timestamp_millis();
+        let stale_ms = (now - chrono::Duration::hours(2)).timestamp_millis();
+        let body = json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "available_five_hour_resets": [
+                    {"expire_at": expires_ms},
+                    {"expire_at": expires_ms},
+                    {"expire_at": expires_ms}
+                ],
+                "available_week_resets": [
+                    {"expire_at": expires_ms},
+                    {"expire_at": stale_ms},
+                    {"not_expire_at": 1}
+                ],
+                "latest_five_hour_reset_history": null,
+                "latest_week_reset_history": null,
+                "has_unread_history": false
+            },
+            "logid": "probe"
+        });
+
+        let cards = parse_zcode_reset_credits(&body, now);
+        // Three 5-hour cards plus one surviving weekly card, sorted by expiry;
+        // expired and malformed entries are dropped. Grant times are unknown.
+        assert_eq!(cards.len(), 4);
+        assert!(cards.iter().all(|card| card.granted_at.is_none()));
+        assert_eq!(cards[0].title, "5h reset");
+        assert_eq!(
+            cards.last().map(|card| card.title.as_str()),
+            Some("Weekly reset")
+        );
+    }
+
+    #[test]
+    fn parses_reset_credits_for_missing_or_empty_inventory() {
+        assert!(parse_reset_credits(&json!({}), Utc::now()).is_empty());
+        assert!(parse_reset_credits(&json!({"credits": []}), Utc::now()).is_empty());
+    }
 
     #[test]
     fn normalizes_zcode_windows_and_plan() {

@@ -4,7 +4,7 @@ pub mod provider;
 pub mod time;
 pub mod usage;
 
-pub use limits::{LimitSource, LimitWindow, LimitsSnapshot, ProviderLimits};
+pub use limits::{LimitSource, LimitWindow, LimitsSnapshot, ProviderLimits, ResetCredit};
 pub use pricing::{
     ModelPricing, ModelRates, PricingCatalog, PricingSource, catalog_source, current_catalog,
     estimate_cost_usd, install_catalog,

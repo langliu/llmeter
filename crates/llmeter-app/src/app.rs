@@ -1386,7 +1386,7 @@ mod tests {
     };
     use gpui_component::{ActiveTheme, Root, WindowExt};
     use llmeter_collector::Collector;
-    use llmeter_core::{LimitSource, LimitWindow, Provider, ProviderLimits};
+    use llmeter_core::{LimitSource, LimitWindow, Provider, ProviderLimits, ResetCredit};
     use llmeter_storage::{Database, ModelUsage, ProviderUsage, SessionSummary};
 
     fn scroll(
@@ -2021,6 +2021,11 @@ mod tests {
                         reset_at: Some(now + Duration::hours(2)),
                         ..LimitWindow::new("five_hour", 78.0)
                     }],
+                    reset_cards: vec![ResetCredit {
+                        granted_at: Some(now - Duration::days(2)),
+                        expires_at: now + Duration::days(19),
+                        title: "Full reset (Weekly + 5 hr)".into(),
+                    }],
                     captured_at: now,
                     source: LimitSource::ProviderApi,
                     stale: false,
@@ -2032,6 +2037,7 @@ mod tests {
                     configured: true,
                     plan: Some("Plus".into()),
                     windows: vec![LimitWindow::new("seven_day", 25.0)],
+                    reset_cards: Vec::new(),
                     captured_at: now - Duration::minutes(5),
                     source: LimitSource::DiskCache,
                     stale: true,

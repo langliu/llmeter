@@ -21,11 +21,43 @@ pub struct ProviderLimits {
     pub configured: bool,
     pub plan: Option<String>,
     pub windows: Vec<LimitWindow>,
+    #[serde(default)]
+    pub reset_cards: Vec<ResetCredit>,
     pub captured_at: DateTime<Utc>,
     pub source: LimitSource,
     pub stale: bool,
     pub error: Option<String>,
     pub last_error: Option<String>,
+}
+
+/// One banked rate-limit reset card (Codex grants, ZCode reset bank),
+/// rendered on the limits page as a remaining-validity bar plus its expiry
+/// time.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResetCredit {
+    /// Cards without a known grant time (ZCode only exposes the expiry)
+    /// render a full bar.
+    pub granted_at: Option<DateTime<Utc>>,
+    pub expires_at: DateTime<Utc>,
+    pub title: String,
+}
+
+impl ResetCredit {
+    /// Fraction of the card's validity window left, clamped to 0..=1; `None`
+    /// when the grant time is unknown.
+    pub fn remaining_ratio(&self, now: DateTime<Utc>) -> Option<f64> {
+        let granted_at = self.granted_at?;
+        let total = (self.expires_at - granted_at).num_seconds();
+        if total <= 0 {
+            return Some(0.0);
+        }
+        let left = (self.expires_at - now).num_seconds();
+        Some((left as f64 / total as f64).clamp(0.0, 1.0))
+    }
+
+    pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at <= now
+    }
 }
 
 impl ProviderLimits {
@@ -35,6 +67,7 @@ impl ProviderLimits {
             configured: false,
             plan: None,
             windows: Vec::new(),
+            reset_cards: Vec::new(),
             captured_at,
             source: LimitSource::ProviderApi,
             stale: false,
@@ -53,6 +86,7 @@ impl ProviderLimits {
             configured: true,
             plan: None,
             windows: Vec::new(),
+            reset_cards: Vec::new(),
             captured_at,
             source: LimitSource::ProviderApi,
             stale: false,
@@ -153,6 +187,7 @@ mod tests {
                     ..LimitWindow::new("seven_day", 20.0)
                 },
             ],
+            reset_cards: Vec::new(),
             captured_at: now - Duration::minutes(5),
             source: LimitSource::ProviderApi,
             stale: false,
@@ -176,6 +211,7 @@ mod tests {
             configured: true,
             plan: None,
             windows: vec![LimitWindow::new("credits", 10.0)],
+            reset_cards: Vec::new(),
             captured_at: now - Duration::days(8),
             source: LimitSource::ProviderApi,
             stale: false,
