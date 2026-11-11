@@ -17,7 +17,9 @@ permissions:
 jobs:
   release-macos:
     name: Build & Release (macOS Apple Silicon)
-    runs-on: macos-15
+    # macos-latest tracks the newest GA arm64 image (currently macOS 26);
+    # pinned labels eventually get retired out from under the release.
+    runs-on: macos-latest
     env:
       TARGET: aarch64-apple-darwin
       ARCH: macos-arm64
