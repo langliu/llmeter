@@ -766,9 +766,11 @@ fn transcript_section(
                                 &transcript.messages[*start..*end],
                                 *start,
                                 detail.expanded_transcript_items.contains(start),
-                                &detail.expanded_thinking,
-                                &detail.thinking_scroll,
-                                &detail.image_cache,
+                                TranscriptViewState {
+                                    expanded_thinking: &detail.expanded_thinking,
+                                    thinking_scroll: &detail.thinking_scroll,
+                                    image_cache: &detail.image_cache,
+                                },
                                 p,
                                 cx,
                             ),
@@ -1081,9 +1083,7 @@ fn collapsible_steps(
     steps: &[TranscriptMessage],
     key: usize,
     expanded: bool,
-    expanded_thinking: &HashSet<usize>,
-    thinking_scroll: &HashMap<usize, ScrollHandle>,
-    image_cache: &TranscriptImageCache,
+    state: TranscriptViewState<'_>,
     p: Palette,
     cx: &mut Context<SessionDetailView>,
 ) -> AnyElement {
@@ -1126,24 +1126,36 @@ fn collapsible_steps(
         let mut list = v_flex().w_full().gap_2().pl_1p5();
         for (offset, message) in steps.iter().enumerate() {
             list = list.child(if message.role == TranscriptRole::Assistant {
-                assistant_text(message, key + offset, p, image_cache)
+                assistant_text(message, key + offset, p, state.image_cache)
             } else if message.role == TranscriptRole::Thinking {
                 let index = key + offset;
                 thinking_detail(
                     message,
                     index,
-                    expanded_thinking.contains(&index),
-                    thinking_scroll.get(&index).cloned().unwrap_or_default(),
+                    state.expanded_thinking.contains(&index),
+                    state
+                        .thinking_scroll
+                        .get(&index)
+                        .cloned()
+                        .unwrap_or_default(),
                     p,
                     cx,
                 )
             } else {
-                step_detail(message, key + offset, p, image_cache)
+                step_detail(message, key + offset, p, state.image_cache)
             });
         }
         block = block.child(list);
     }
     block.into_any_element()
+}
+
+/// Transcript view state threaded through work-group row builders: which
+/// thinking blocks are expanded, their scroll handles, and the image cache.
+struct TranscriptViewState<'a> {
+    expanded_thinking: &'a HashSet<usize>,
+    thinking_scroll: &'a HashMap<usize, ScrollHandle>,
+    image_cache: &'a TranscriptImageCache,
 }
 
 const THINKING_MAX_HEIGHT: f32 = 320.0;

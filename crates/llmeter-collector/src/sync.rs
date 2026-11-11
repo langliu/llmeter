@@ -71,11 +71,15 @@ impl SyncOptions {
     }
 }
 
+/// Maps WAL database paths to their last-seen (size, mtime) fingerprint;
+/// `None` records a checked path with no WAL sidecar present.
+type WalFingerprints = Arc<Mutex<HashMap<PathBuf, Option<(u64, SystemTime)>>>>;
+
 #[derive(Clone)]
 pub struct SyncEngine {
     database: Database,
     adapters: Arc<Vec<Box<dyn ProviderAdapter>>>,
-    wal_fingerprints: Arc<Mutex<HashMap<PathBuf, Option<(u64, SystemTime)>>>>,
+    wal_fingerprints: WalFingerprints,
     source_aliases: Arc<Mutex<HashMap<(PathBuf, PathBuf), VerifiedSourceAlias>>>,
 }
 
