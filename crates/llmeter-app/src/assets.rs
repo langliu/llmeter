@@ -21,7 +21,7 @@ const PROVIDER_ASSETS: [&str; 17] = [
     "providers/roo.svg",
     "providers/kilo.svg",
 ];
-const ICON_ASSETS: [&str; 1] = ["icons/layers.svg"];
+const ICON_ASSETS: [&str; 2] = ["icons/layers.svg", "icons/monitor.svg"];
 
 pub(crate) struct Assets;
 
@@ -66,6 +66,7 @@ impl AssetSource for Assets {
             "providers/roo.svg" => Some(include_bytes!("../assets/providers/roo.svg").as_slice()),
             "providers/kilo.svg" => Some(include_bytes!("../assets/providers/kilo.svg").as_slice()),
             "icons/layers.svg" => Some(include_bytes!("../assets/icons/layers.svg").as_slice()),
+            "icons/monitor.svg" => Some(include_bytes!("../assets/icons/monitor.svg").as_slice()),
             _ => None,
         };
         match asset {

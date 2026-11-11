@@ -1,7 +1,6 @@
 app:
   name: "LLMeter"
   tagline: "Local token meter"
-  no_cloud: "No cloud · No API key"
 nav:
   overview: "Overview"
   sessions: "Sessions"

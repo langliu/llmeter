@@ -4,20 +4,21 @@ use std::rc::Rc;
 
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use gpui::{
-    Bounds, Context, FontWeight, Hsla, IntoElement, MouseMoveEvent, Render, Rgba, canvas, div,
-    fill, point, prelude::*, px, relative, rgb, size, svg,
+    AnyElement, Bounds, Context, FontWeight, Hsla, IntoElement, MouseMoveEvent, Render, Rgba,
+    canvas, deferred, div, fill, point, prelude::*, px, relative, rgb, size, svg,
 };
 use gpui_component::{
-    ActiveTheme, IconName, Selectable, Sizable, TITLE_BAR_HEIGHT,
+    ActiveTheme, Icon, IconName, Selectable, Sizable, TITLE_BAR_HEIGHT,
     button::{Button, ButtonCustomVariant, ButtonGroup, ButtonVariants},
     date_picker::DatePicker,
+    h_flex, v_flex,
 };
 use llmeter_core::{Provider, ProviderDetection, ProviderStatus};
 use llmeter_storage::{DailyModelUsage, ModelUsage, ProjectUsage, ProviderUsage, RecentActivity};
 use rust_i18n::t;
 
 use crate::{
-    app::{LLMeterView, OverviewPeriod, OverviewProviderFilter},
+    app::{LLMeterView, OverviewPeriod, OverviewProviderFilter, ThemePreference},
     state::UiSnapshot,
     views::{
         limits::limits_page, palette::Palette, provider_brand::provider_logo,
@@ -130,7 +131,7 @@ pub fn dashboard(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl Into
         .flex()
         .size_full()
         .bg(p.background)
-        .child(sidebar(active_page, cx))
+        .child(sidebar(view, active_page, cx))
         .child(main)
 }
 
@@ -954,7 +955,11 @@ fn format_detail_percentage(value: f64) -> String {
     }
 }
 
-fn sidebar(active_page: DashboardPage, cx: &mut Context<LLMeterView>) -> impl IntoElement {
+fn sidebar(
+    view: &LLMeterView,
+    active_page: DashboardPage,
+    cx: &mut Context<LLMeterView>,
+) -> impl IntoElement {
     let p = Palette::from_app(cx);
     let sidebar_foreground = cx.theme().sidebar_foreground;
     let sidebar_background = cx.theme().sidebar;
@@ -1039,16 +1044,164 @@ fn sidebar(active_page: DashboardPage, cx: &mut Context<LLMeterView>) -> impl In
         )
         .child(navigation)
         .child(div().flex_1())
+        .child(sidebar_footer(view, p, cx))
+}
+
+/// Bottom sidebar row: quick theme switching and a GitHub star badge. The
+/// theme menu opens upward because the row sits at the window edge.
+fn sidebar_footer(
+    view: &LLMeterView,
+    p: Palette,
+    cx: &mut Context<LLMeterView>,
+) -> impl IntoElement {
+    h_flex()
+        .w_full()
+        .items_center()
+        .justify_between()
+        .px_2()
+        .pt_2()
         .child(
             div()
-                .px_2()
-                .pt_4()
-                .border_t_1()
-                .border_color(p.border)
-                .text_xs()
-                .text_color(p.muted_foreground)
-                .child(t!("app.no_cloud")),
+                .relative()
+                .child(
+                    Button::new("sidebar-theme")
+                        .outline()
+                        .compact()
+                        .rounded_full()
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.theme_menu_open = !view.theme_menu_open;
+                            cx.notify();
+                        }))
+                        .child(theme_option_icon(view.theme_pref, p.muted_foreground)),
+                )
+                .when(view.theme_menu_open, |this| {
+                    this.child(deferred(theme_menu(view, p, cx)).with_priority(1))
+                }),
         )
+        .child(
+            Button::new("sidebar-star")
+                .outline()
+                .compact()
+                .rounded_full()
+                .on_click(cx.listener(|_view, _, _, cx| {
+                    cx.open_url(llmeter_collector::repo::GITHUB_REPO_URL);
+                }))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(Icon::new(IconName::Github).size_3())
+                        .child(div().text_xs().text_color(p.muted_foreground).child("Star"))
+                        .when_some(view.star_count, |this, count| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(count.to_string()),
+                            )
+                        }),
+                ),
+        )
+}
+
+fn theme_menu(
+    view: &LLMeterView,
+    p: Palette,
+    cx: &mut Context<LLMeterView>,
+) -> gpui::Stateful<gpui::Div> {
+    let options = [
+        ThemePreference::Light,
+        ThemePreference::Dark,
+        ThemePreference::System,
+    ];
+    let mut menu = v_flex()
+        .id("sidebar-theme-menu")
+        .absolute()
+        .bottom_full()
+        .left_0()
+        .mb_1()
+        .w(px(112.0))
+        .gap_0p5()
+        .rounded_lg()
+        .border_1()
+        .border_color(p.border)
+        .bg(p.popover)
+        .shadow_md()
+        .p_1()
+        .occlude();
+    for (index, preference) in options.into_iter().enumerate() {
+        let is_selected = view.theme_pref == preference;
+        // Subtle highlight instead of the default solid selected fill, which
+        // reads as a heavy block next to the small menu.
+        let variant = if is_selected {
+            ButtonCustomVariant::new(cx)
+                .color(p.muted)
+                .foreground(p.foreground)
+                .hover(p.muted)
+                .active(p.muted)
+        } else {
+            ButtonCustomVariant::new(cx)
+                .color(gpui::transparent_black())
+                .foreground(p.muted_foreground)
+                .hover(p.muted)
+                .active(p.muted)
+        };
+        let icon_color = if is_selected {
+            p.foreground
+        } else {
+            p.muted_foreground
+        };
+        // Button centers its built-in icon+label pair; build the row as a
+        // full-width child so the icon and text sit flush left.
+        menu = menu.child(
+            Button::new(("sidebar-theme-item", index))
+                .custom(variant)
+                .compact()
+                .w_full()
+                .h(px(30.0))
+                .text_sm()
+                .justify_start()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_1p5()
+                        .child(theme_option_icon(preference, icon_color))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .child(preference.label()),
+                        ),
+                )
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    view.theme_menu_open = false;
+                    view.set_theme_preference(preference, window, cx);
+                })),
+        );
+    }
+    menu
+}
+
+/// Icon for a theme option; "system" uses a monitor glyph that is not part
+/// of the bundled icon set, so it loads from the app asset directory.
+fn theme_option_icon(preference: ThemePreference, color: gpui::Hsla) -> AnyElement {
+    match preference {
+        ThemePreference::Light => Icon::new(IconName::Sun)
+            .size_3()
+            .text_color(color)
+            .into_any_element(),
+        ThemePreference::Dark => Icon::new(IconName::Moon)
+            .size_3()
+            .text_color(color)
+            .into_any_element(),
+        ThemePreference::System => svg()
+            .path("icons/monitor.svg")
+            .size(px(12.0))
+            .text_color(color)
+            .into_any_element(),
+    }
 }
 
 fn page_heading(title: String, subtitle: String, p: Palette) -> impl IntoElement {

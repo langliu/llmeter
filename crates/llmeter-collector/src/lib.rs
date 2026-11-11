@@ -4,6 +4,7 @@ pub mod hooks;
 pub mod limits;
 pub mod parsers;
 pub mod pricing;
+pub mod repo;
 
 mod sqlite;
 

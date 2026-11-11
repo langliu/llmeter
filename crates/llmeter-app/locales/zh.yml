@@ -1,7 +1,6 @@
 app:
   name: "LLMeter"
   tagline: "本地 Token 计量器"
-  no_cloud: "无云端 · 无需 API Key"
 nav:
   overview: "概览"
   sessions: "会话"

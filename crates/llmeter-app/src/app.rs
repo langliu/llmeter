@@ -203,6 +203,9 @@ pub struct LLMeterView {
     sessions_sender: std::sync::mpsc::Sender<SessionsUpdate>,
     sessions_receiver: std::sync::mpsc::Receiver<SessionsUpdate>,
     limit_refresh_started_at: Option<Instant>,
+    star_receiver: std::sync::mpsc::Receiver<Option<u64>>,
+    pub(crate) star_count: Option<u64>,
+    pub(crate) theme_menu_open: bool,
     pub(crate) limits: LimitsSnapshot,
     pub(crate) limits_refreshing: bool,
     pub(crate) snapshot: UiSnapshot,
@@ -256,6 +259,7 @@ impl LLMeterView {
         let limit_collector = LimitCollector::new(collector.engine().database().clone());
         let limits = limit_collector.cached_snapshot();
         let (limit_sender, limit_receiver) = std::sync::mpsc::channel();
+        let (star_sender, star_receiver) = std::sync::mpsc::channel();
         let (snapshot_sender, snapshot_receiver) = std::sync::mpsc::channel();
         let (overview_sender, overview_receiver) = std::sync::mpsc::channel();
         let (sessions_sender, sessions_receiver) = std::sync::mpsc::channel();
@@ -282,6 +286,17 @@ impl LLMeterView {
             llmeter_collector::hooks::data_dir().join("cache"),
         );
         i18n::apply(locale_pref);
+        if !cfg!(test) {
+            let star_cache_dir = llmeter_collector::hooks::data_dir().join("cache");
+            std::thread::Builder::new()
+                .name("llmeter-stars".into())
+                .spawn(move || {
+                    let _ = star_sender.send(llmeter_collector::repo::cached_github_stargazers(
+                        &star_cache_dir,
+                    ));
+                })
+                .ok();
+        }
         let detections = collector.detect_all();
         let today = Local::now().date_naive();
         let overview_period = OverviewPeriod::default();
@@ -359,6 +374,9 @@ impl LLMeterView {
             sessions_sender,
             sessions_receiver,
             limit_refresh_started_at: None,
+            star_receiver,
+            star_count: None,
+            theme_menu_open: false,
             limits,
             limits_refreshing: false,
             snapshot,
@@ -532,6 +550,7 @@ impl LLMeterView {
             self.active_page = page;
             self.session_project_open = false;
             self.session_provider_open = false;
+            self.theme_menu_open = false;
             if page == DashboardPage::Limits {
                 self.start_limit_refresh();
             }
@@ -1052,6 +1071,10 @@ impl LLMeterView {
                     self.fx_rates = rates;
                 }
             }
+            changed = true;
+        }
+        while let Ok(stars) = self.star_receiver.try_recv() {
+            self.star_count = stars;
             changed = true;
         }
         if let Some(sync) = pending_reload {
