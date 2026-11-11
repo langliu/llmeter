@@ -17,7 +17,7 @@ permissions:
 jobs:
   release-macos:
     name: Build & Release (macOS Apple Silicon)
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       TARGET: aarch64-apple-darwin
       ARCH: macos-arm64
