@@ -12,7 +12,7 @@ use crate::{
     views::{palette::Palette, provider_brand::provider_logo},
 };
 
-const LIMIT_PROVIDERS: [Provider; 7] = [
+const LIMIT_PROVIDERS: [Provider; 8] = [
     Provider::Claude,
     Provider::Codex,
     Provider::Cursor,
@@ -20,6 +20,7 @@ const LIMIT_PROVIDERS: [Provider; 7] = [
     Provider::Grok,
     Provider::Trae,
     Provider::ZCode,
+    Provider::Antigravity,
 ];
 
 /// A card appears only once it has quota windows to show. That keeps the page
@@ -519,6 +520,10 @@ fn window_label(key: &str) -> String {
         "qoder_credits" => t!("limits.window_qoder_credits").to_string(),
         "qoder_cn_credits" => t!("limits.window_qoder_cn_credits").to_string(),
         "zcode_mcp_credits" => t!("limits.window_zcode_mcp_credits").to_string(),
+        "cl_seven_day" => t!("limits.window_cl_7d").to_string(),
+        "cl_five_hour" => t!("limits.window_cl_5h").to_string(),
+        "gemini_seven_day" => t!("limits.window_gm_7d").to_string(),
+        "gemini_five_hour" => t!("limits.window_gm_5h").to_string(),
         "trae_fast_requests" => t!("limits.window_trae_fast_requests").to_string(),
         key if key.starts_with("model:") => key.trim_start_matches("model:").to_string(),
         key => key.replace('_', " "),

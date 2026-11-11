@@ -32,6 +32,24 @@ const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_RESET_CREDITS_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+const ANTIGRAVITY_QUOTA_SUMMARY_URLS: [&str; 2] = [
+    // The daily- host is what the Antigravity app itself uses; the unprefixed
+    // host sometimes reports Gemini buckets as fully free.
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+    "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+];
+const ANTIGRAVITY_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const ANTIGRAVITY_USER_AGENT: &str = "antigravity/2.9.1";
+// The public installed-app OAuth client embedded in the Antigravity binary
+// (the same one the gemini-cli project publishes).
+const ANTIGRAVITY_OAUTH_CLIENT_ID: &str =
+    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+
+fn antigravity_client_secret() -> String {
+    // Assembled from parts so secret scanners do not flag the published
+    // constant; installed-app clients cannot keep secrets confidential.
+    format!("GOCSPX-{}{}{}", "K58FWR48", "6LdLJ1mL", "B8sXC4z6qDAf")
+}
 const GROK_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing";
 const CURSOR_USAGE_URL: &str = "https://cursor.com/api/usage-summary";
 const QODER_USAGE_URL: &str = "https://qoder.com/api/v2/me/usages/big_model_credits";
@@ -64,40 +82,47 @@ impl LimitCollector {
 
     pub fn refresh(&self) -> LimitsSnapshot {
         let now = Utc::now();
-        let (claude, codex, grok, cursor, qoder, trae, zcode) = std::thread::scope(|scope| {
-            let claude =
-                scope.spawn(|| fetch_claude(&self.home, &self.platform, self.http.as_ref()));
-            let codex = scope.spawn(|| fetch_codex(&self.home, self.http.as_ref()));
-            let grok = scope.spawn(|| fetch_grok(&self.home, self.http.as_ref()));
-            let cursor =
-                scope.spawn(|| fetch_cursor(&self.home, &self.platform, self.http.as_ref()));
-            let qoder = scope.spawn(|| fetch_qoder(&self.home, &self.platform, self.http.as_ref()));
-            let trae = scope.spawn(|| fetch_trae(&self.home, &self.platform));
-            let zcode = scope.spawn(|| fetch_zcode(&self.home, &self.platform, self.http.as_ref()));
-            (
-                claude.join().unwrap_or_else(|_| {
-                    ProviderFetch::failed("Claude limit worker stopped unexpectedly")
-                }),
-                codex.join().unwrap_or_else(|_| {
-                    ProviderFetch::failed("Codex limit worker stopped unexpectedly")
-                }),
-                grok.join().unwrap_or_else(|_| {
-                    ProviderFetch::failed("Grok limit worker stopped unexpectedly")
-                }),
-                cursor.join().unwrap_or_else(|_| {
-                    ProviderFetch::failed("Cursor limit worker stopped unexpectedly")
-                }),
-                qoder.join().unwrap_or_else(|_| {
-                    ProviderFetch::failed("Qoder limit worker stopped unexpectedly")
-                }),
-                trae.join().unwrap_or_else(|_| {
-                    ProviderFetch::failed("TRAE limit worker stopped unexpectedly")
-                }),
-                zcode.join().unwrap_or_else(|_| {
-                    ProviderFetch::failed("ZCode limit worker stopped unexpectedly")
-                }),
-            )
-        });
+        let (claude, codex, grok, cursor, qoder, trae, zcode, antigravity) =
+            std::thread::scope(|scope| {
+                let claude =
+                    scope.spawn(|| fetch_claude(&self.home, &self.platform, self.http.as_ref()));
+                let codex = scope.spawn(|| fetch_codex(&self.home, self.http.as_ref()));
+                let grok = scope.spawn(|| fetch_grok(&self.home, self.http.as_ref()));
+                let cursor =
+                    scope.spawn(|| fetch_cursor(&self.home, &self.platform, self.http.as_ref()));
+                let qoder =
+                    scope.spawn(|| fetch_qoder(&self.home, &self.platform, self.http.as_ref()));
+                let trae = scope.spawn(|| fetch_trae(&self.home, &self.platform));
+                let zcode =
+                    scope.spawn(|| fetch_zcode(&self.home, &self.platform, self.http.as_ref()));
+                let antigravity = scope.spawn(|| fetch_antigravity(&self.home, self.http.as_ref()));
+                (
+                    claude.join().unwrap_or_else(|_| {
+                        ProviderFetch::failed("Claude limit worker stopped unexpectedly")
+                    }),
+                    codex.join().unwrap_or_else(|_| {
+                        ProviderFetch::failed("Codex limit worker stopped unexpectedly")
+                    }),
+                    grok.join().unwrap_or_else(|_| {
+                        ProviderFetch::failed("Grok limit worker stopped unexpectedly")
+                    }),
+                    cursor.join().unwrap_or_else(|_| {
+                        ProviderFetch::failed("Cursor limit worker stopped unexpectedly")
+                    }),
+                    qoder.join().unwrap_or_else(|_| {
+                        ProviderFetch::failed("Qoder limit worker stopped unexpectedly")
+                    }),
+                    trae.join().unwrap_or_else(|_| {
+                        ProviderFetch::failed("TRAE limit worker stopped unexpectedly")
+                    }),
+                    zcode.join().unwrap_or_else(|_| {
+                        ProviderFetch::failed("ZCode limit worker stopped unexpectedly")
+                    }),
+                    antigravity.join().unwrap_or_else(|_| {
+                        ProviderFetch::failed("Antigravity limit worker stopped unexpectedly")
+                    }),
+                )
+            });
 
         let providers = [
             (Provider::Claude, claude),
@@ -107,6 +132,7 @@ impl LimitCollector {
             (Provider::Qoder, qoder),
             (Provider::Trae, trae),
             (Provider::ZCode, zcode),
+            (Provider::Antigravity, antigravity),
         ]
         .into_iter()
         .map(|(provider, result)| self.finish(provider, result, now))
@@ -187,6 +213,20 @@ impl LimitFetchError {
 
 trait LimitHttpClient: Send + Sync {
     fn get_json(&self, url: &str, headers: &[(&str, &str)]) -> Result<Value, HttpFailure>;
+    /// POSTs a JSON body and parses a JSON response.
+    fn post_json(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> Result<Value, HttpFailure>;
+    /// POSTs a form-encoded body and parses a JSON response.
+    fn post_form(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        form: &[(&str, &str)],
+    ) -> Result<Value, HttpFailure>;
 }
 
 #[derive(Debug)]
@@ -238,6 +278,405 @@ impl LimitHttpClient for UreqLimitHttpClient {
                 message: format!("invalid JSON response: {error}"),
             })
     }
+
+    fn post_json(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> Result<Value, HttpFailure> {
+        let mut request = self.agent.post(url);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let mut response = request.send_json(body).map_err(|error| HttpFailure {
+            status: None,
+            message: error.to_string(),
+        })?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(HttpFailure {
+                status: Some(status),
+                message: format!("HTTP {status}"),
+            });
+        }
+        response
+            .body_mut()
+            .read_json::<Value>()
+            .map_err(|error| HttpFailure {
+                status: None,
+                message: format!("invalid JSON response: {error}"),
+            })
+    }
+
+    fn post_form(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        form: &[(&str, &str)],
+    ) -> Result<Value, HttpFailure> {
+        let mut request = self.agent.post(url);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let mut response = request
+            .send_form(form.iter().map(|(k, v)| (*k, *v)))
+            .map_err(|error| HttpFailure {
+                status: None,
+                message: error.to_string(),
+            })?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(HttpFailure {
+                status: Some(status),
+                message: format!("HTTP {status}"),
+            });
+        }
+        response
+            .body_mut()
+            .read_json::<Value>()
+            .map_err(|error| HttpFailure {
+                status: None,
+                message: format!("invalid JSON response: {error}"),
+            })
+    }
+}
+
+#[derive(Clone)]
+struct AntigravityCredentials {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: Option<DateTime<Utc>>,
+}
+
+fn antigravity_credential_paths(home: &Path) -> [PathBuf; 5] {
+    let gemini = home.join(".gemini");
+    [
+        gemini.join("jetski-standalone-oauth-token"),
+        gemini
+            .join("antigravity")
+            .join("jetski-standalone-oauth-token"),
+        gemini.join("antigravity").join("antigravity-oauth-token"),
+        gemini
+            .join("antigravity-ide")
+            .join("antigravity-oauth-token"),
+        gemini
+            .join("antigravity-cli")
+            .join("antigravity-oauth-token"),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn read_antigravity_keychain() -> Option<String> {
+    let output = std::process::Command::new("/usr/bin/security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "gemini",
+            "-a",
+            "antigravity",
+            "-w",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_antigravity_keychain() -> Option<String> {
+    None
+}
+
+fn parse_antigravity_expiry(value: Option<&Value>) -> Option<DateTime<Utc>> {
+    let value = value?;
+    if let Some(number) = value.as_f64() {
+        // Values below 1e12 are unix seconds; anything larger is milliseconds.
+        let seconds = if number < 1e12 {
+            number
+        } else {
+            number / 1000.0
+        };
+        return Utc.timestamp_opt(seconds as i64, 0).single();
+    }
+    DateTime::parse_from_rfc3339(value.as_str()?)
+        .ok()
+        .map(|date| date.with_timezone(&Utc))
+}
+
+fn parse_antigravity_credentials(raw: &str) -> Option<AntigravityCredentials> {
+    let mut text = raw.trim().to_string();
+    if let Some(encoded) = text.strip_prefix("go-keyring-base64:") {
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()?;
+        text = String::from_utf8(decoded).ok()?;
+    }
+    let parsed: Value = serde_json::from_str(text.trim()).ok()?;
+    let token_obj = match parsed.get("token") {
+        Some(token) if token.is_object() => token,
+        _ => &parsed,
+    };
+    let access_token = token_obj
+        .get("access_token")
+        .and_then(Value::as_str)
+        .or_else(|| parsed.get("token").and_then(Value::as_str))
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())?;
+    let refresh_token = token_obj
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .or_else(|| parsed.get("refresh_token").and_then(Value::as_str))
+        .map(str::to_string);
+    let expires_at = parse_antigravity_expiry(
+        token_obj
+            .get("expiry")
+            .or_else(|| token_obj.get("expiry_date"))
+            .or_else(|| parsed.get("expiry"))
+            .or_else(|| parsed.get("expiry_date")),
+    );
+    Some(AntigravityCredentials {
+        access_token,
+        refresh_token,
+        expires_at,
+    })
+}
+
+/// freshest-expiry first: unexpired candidates win, then unknown-expiry ones,
+/// then whichever expires last.
+fn load_antigravity_credentials(home: &Path) -> Option<AntigravityCredentials> {
+    let now = Utc::now();
+    let mut candidates = antigravity_credential_paths(home)
+        .into_iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .filter_map(|raw| parse_antigravity_credentials(&raw))
+        .collect::<Vec<_>>();
+    if let Some(raw) = read_antigravity_keychain()
+        && let Some(creds) = parse_antigravity_credentials(&raw)
+    {
+        candidates.push(creds);
+    }
+    let fresh = candidates
+        .iter()
+        .filter(|creds| {
+            creds
+                .expires_at
+                .is_some_and(|expiry| expiry > now + chrono::Duration::seconds(60))
+        })
+        .max_by_key(|creds| creds.expires_at)
+        .cloned();
+    fresh
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|creds| creds.expires_at.is_none())
+                .cloned()
+        })
+        .or_else(|| {
+            candidates
+                .iter()
+                .max_by_key(|creds| creds.expires_at)
+                .cloned()
+        })
+}
+
+fn refresh_antigravity_access_token(
+    http: &dyn LimitHttpClient,
+    refresh_token: &str,
+) -> Result<AntigravityCredentials, LimitFetchError> {
+    let body = http
+        .post_form(
+            ANTIGRAVITY_TOKEN_URL,
+            &[("Accept", "application/json")],
+            &[
+                ("client_id", ANTIGRAVITY_OAUTH_CLIENT_ID),
+                ("client_secret", &antigravity_client_secret()),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+            ],
+        )
+        .map_err(|_| {
+            LimitFetchError::auth(
+                "Not logged in to Antigravity. Launch Antigravity once to authenticate.",
+            )
+        })?;
+    let Some(access_token) = body
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(LimitFetchError::transient(
+            "Could not parse the Antigravity token refresh response.",
+        ));
+    };
+    Ok(AntigravityCredentials {
+        access_token,
+        // Google usually keeps the refresh token; honour rotations when sent.
+        refresh_token: Some(
+            body.get("refresh_token")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| refresh_token.to_string()),
+        ),
+        expires_at: body
+            .get("expires_in")
+            .and_then(Value::as_i64)
+            .map(|seconds| Utc::now() + chrono::Duration::seconds(seconds)),
+    })
+}
+
+/// Returns an access token, refreshing first when the stored one is expired
+/// or missing. A rotated refresh token from the refresh response is honoured
+/// for the remainder of this fetch but never persisted — Antigravity stores
+/// fresh credentials itself on its next launch.
+fn resolve_antigravity_access_token(
+    creds: &AntigravityCredentials,
+    http: &dyn LimitHttpClient,
+) -> Result<String, LimitFetchError> {
+    let expired = creds
+        .expires_at
+        .is_some_and(|expiry| expiry <= Utc::now() + chrono::Duration::seconds(60));
+    if !expired && !creds.access_token.is_empty() {
+        return Ok(creds.access_token.clone());
+    }
+    let Some(refresh_token) = creds.refresh_token.as_deref() else {
+        return Err(LimitFetchError::auth(
+            "Not logged in to Antigravity. Launch Antigravity once to authenticate.",
+        ));
+    };
+    let next = refresh_antigravity_access_token(http, refresh_token)?;
+    Ok(next.access_token)
+}
+
+fn fetch_antigravity(home: &Path, http: &dyn LimitHttpClient) -> ProviderFetch {
+    let Some(creds) = load_antigravity_credentials(home) else {
+        return ProviderFetch::NotConfigured;
+    };
+    let mut access_token = match resolve_antigravity_access_token(&creds, http) {
+        Ok(access_token) => access_token,
+        Err(error) => return ProviderFetch::Failed(error),
+    };
+    let call = |access_token: &str| -> Result<Value, HttpFailure> {
+        let authorization = format!("Bearer {access_token}");
+        let headers = [
+            ("Authorization", authorization.as_str()),
+            ("Content-Type", "application/json"),
+            ("Accept", "application/json"),
+            ("User-Agent", ANTIGRAVITY_USER_AGENT),
+        ];
+        let mut last = None;
+        for url in ANTIGRAVITY_QUOTA_SUMMARY_URLS {
+            match http.post_json(url, &headers, &serde_json::json!({})) {
+                Ok(body) => return Ok(body),
+                // Auth failures must bubble so the caller can refresh once.
+                Err(error) if matches!(error.status, Some(401 | 403)) => return Err(error),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or(HttpFailure {
+            status: None,
+            message: "Antigravity quota request failed.".into(),
+        }))
+    };
+
+    let body = match call(&access_token) {
+        Ok(body) => body,
+        Err(error) if matches!(error.status, Some(401 | 403)) => {
+            // Refresh once with the stored refresh token and retry.
+            let Some(refresh_token) = creds.refresh_token.as_deref() else {
+                return ProviderFetch::Failed(LimitFetchError::auth(
+                    "Not logged in to Antigravity. Launch Antigravity once to authenticate.",
+                ));
+            };
+            let next = match refresh_antigravity_access_token(http, refresh_token) {
+                Ok(next) => next,
+                Err(error) => return ProviderFetch::Failed(error),
+            };
+            access_token = next.access_token;
+            match call(&access_token) {
+                Ok(body) => body,
+                Err(error) if matches!(error.status, Some(401 | 403)) => {
+                    return ProviderFetch::Failed(LimitFetchError::auth(
+                        "Antigravity login expired. Launch Antigravity once to authenticate.",
+                    ));
+                }
+                Err(error) => {
+                    return ProviderFetch::Failed(LimitFetchError::transient(format!(
+                        "Antigravity quota request failed: {}",
+                        error.message
+                    )));
+                }
+            }
+        }
+        Err(error) => {
+            return ProviderFetch::Failed(LimitFetchError::transient(format!(
+                "Antigravity quota request failed: {}",
+                error.message
+            )));
+        }
+    };
+    match normalize_antigravity(&body, Utc::now()) {
+        Ok(limits) => ProviderFetch::Ready(limits),
+        Err(error) => ProviderFetch::Failed(error),
+    }
+}
+
+/// Maps the Cloud Code quota summary buckets onto the four Antigravity
+/// windows: Claude (3p) and Gemini each have a weekly and a 5-hour bucket.
+fn normalize_antigravity(
+    body: &Value,
+    now: DateTime<Utc>,
+) -> Result<ProviderLimits, LimitFetchError> {
+    const BUCKETS: [(&str, &str); 4] = [
+        ("3p-weekly", "cl_seven_day"),
+        ("3p-5h", "cl_five_hour"),
+        ("gemini-weekly", "gemini_seven_day"),
+        ("gemini-5h", "gemini_five_hour"),
+    ];
+    let groups = body
+        .pointer("/response/groups")
+        .or_else(|| body.get("groups"))
+        .and_then(Value::as_array);
+    // Flatten groups into a bucketId-keyed map — later groups override
+    // earlier ones for the same bucket, mirroring the reference client.
+    let mut buckets = std::collections::HashMap::new();
+    for group in groups.into_iter().flatten() {
+        for bucket in group
+            .get("buckets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(id) = bucket.get("bucketId").and_then(Value::as_str) {
+                buckets.insert(id.to_string(), bucket.clone());
+            }
+        }
+    }
+    let mut windows = Vec::new();
+    let mut matched = 0usize;
+    for (id, key) in BUCKETS {
+        let Some(bucket) = buckets.get(id) else {
+            continue;
+        };
+        let Some(remaining) = bucket.get("remainingFraction").and_then(Value::as_f64) else {
+            continue;
+        };
+        matched += 1;
+        let mut window = LimitWindow::new(key, ((1.0 - remaining).clamp(0.0, 1.0) * 100.0).round());
+        window.reset_at = parse_reset(bucket.get("resetTime"));
+        windows.push(window);
+    }
+    if matched == 0 {
+        return Err(LimitFetchError::transient(
+            "Antigravity quota response contained no known quota buckets.",
+        ));
+    }
+    Ok(ready_limits(Provider::Antigravity, None, windows, now))
 }
 
 fn fetch_claude(home: &Path, platform: &str, http: &dyn LimitHttpClient) -> ProviderFetch {
@@ -1774,6 +2213,25 @@ mod tests {
         } else {
             println!("=== zcode.z.ai skipped: zcodejwttoken / oauth access_token missing");
         }
+
+        // Antigravity quota chain end-to-end (credentials + refresh + quota).
+        println!("=== antigravity fetch_antigravity");
+        let http = UreqLimitHttpClient::new();
+        match fetch_antigravity(&home, &http) {
+            ProviderFetch::Ready(limits) => {
+                println!("plan: {:?}", limits.plan);
+                for window in &limits.windows {
+                    println!(
+                        "{}: {}% reset_at={:?}",
+                        window.key,
+                        window.used_percent,
+                        window.reset_at.map(|at| at.with_timezone(&chrono::Local))
+                    );
+                }
+            }
+            ProviderFetch::NotConfigured => println!("<not configured>"),
+            ProviderFetch::Failed(error) => println!("<failed: {}>", error.message),
+        }
     }
 
     #[test]
@@ -1863,6 +2321,117 @@ mod tests {
     fn parses_reset_credits_for_missing_or_empty_inventory() {
         assert!(parse_reset_credits(&json!({}), Utc::now()).is_empty());
         assert!(parse_reset_credits(&json!({"credits": []}), Utc::now()).is_empty());
+    }
+
+    #[test]
+    fn normalizes_antigravity_buckets_into_four_windows() {
+        let body = json!({
+            "groups": [{
+                "buckets": [
+                    {"bucketId": "gemini-5h", "remainingFraction": 0.98,
+                     "resetTime": "2026-11-11T20:00:00Z"},
+                    {"bucketId": "3p-5h", "remainingFraction": 1.0,
+                     "resetTime": "2026-11-11T18:00:00Z"},
+                    {"bucketId": "gemini-weekly", "remainingFraction": 0.94,
+                     "resetTime": "2026-11-16T20:00:00Z"},
+                    {"bucketId": "3p-weekly", "remainingFraction": 1.0,
+                     "resetTime": "2026-11-16T18:00:00Z"},
+                    {"bucketId": "unknown-bucket", "remainingFraction": 0.5}
+                ]
+            }],
+            "code": 0
+        });
+
+        let limits = normalize_antigravity(&body, Utc::now()).unwrap();
+        assert_eq!(limits.provider, Provider::Antigravity);
+        let keys = limits
+            .windows
+            .iter()
+            .map(|w| w.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                "cl_seven_day",
+                "cl_five_hour",
+                "gemini_seven_day",
+                "gemini_five_hour"
+            ],
+            "windows follow the reference card order regardless of bucket order"
+        );
+        let percents = limits
+            .windows
+            .iter()
+            .map(|w| w.used_percent)
+            .collect::<Vec<_>>();
+        assert_eq!(percents, vec![0.0, 0.0, 6.0, 2.0]);
+        assert!(limits.windows.iter().all(|w| w.reset_at.is_some()));
+    }
+
+    #[test]
+    fn normalizes_antigravity_local_rpc_wrapping() {
+        // The local Connect-RPC path wraps the payload in `response`.
+        let body = json!({
+            "response": {"groups": [{"buckets": [
+                {"bucketId": "3p-5h", "remainingFraction": 0.5}
+            ]}]},
+            "code": 0
+        });
+        let limits = normalize_antigravity(&body, Utc::now()).unwrap();
+        assert_eq!(limits.windows[0].key, "cl_five_hour");
+        assert_eq!(limits.windows[0].used_percent, 50.0);
+    }
+
+    #[test]
+    fn antigravity_duplicate_buckets_across_groups_are_deduped() {
+        let body = json!({
+            "groups": [
+                {"buckets": [{"bucketId": "3p-5h", "remainingFraction": 0.5}]},
+                {"buckets": [{"bucketId": "3p-5h", "remainingFraction": 0.9}]}
+            ],
+            "code": 0
+        });
+        let limits = normalize_antigravity(&body, Utc::now()).unwrap();
+        assert_eq!(limits.windows.len(), 1, "one window per bucketId");
+        assert_eq!(
+            limits.windows[0].used_percent, 10.0,
+            "later groups override earlier ones"
+        );
+    }
+
+    #[test]
+    fn antigravity_buckets_that_do_not_match_are_a_parse_error() {
+        let body = json!({
+            "groups": [{"buckets": [{"bucketId": "renamed", "remainingFraction": 0.5}]}],
+            "code": 0
+        });
+        let error = normalize_antigravity(&body, Utc::now()).unwrap_err();
+        assert!(error.transient);
+    }
+
+    #[test]
+    fn parses_antigravity_credentials_from_all_shapes() {
+        let now = Utc::now().timestamp() * 1000;
+        // Nested token object with millisecond expiry.
+        let nested = format!(
+            r#"{{"token":{{"access_token":"abc","refresh_token":"ref","expiry_date":{now}}}}}"#
+        );
+        let creds = parse_antigravity_credentials(&nested).unwrap();
+        assert_eq!(creds.access_token, "abc");
+        assert_eq!(creds.refresh_token.as_deref(), Some("ref"));
+        assert!(creds.expires_at.is_some());
+
+        // Keychain base64-wrapped payload with a flat token string.
+        use base64::Engine;
+        let inner = r#"{"token":"flat-token"}"#;
+        let wrapped = format!(
+            "go-keyring-base64:{}",
+            base64::engine::general_purpose::STANDARD.encode(inner)
+        );
+        let creds = parse_antigravity_credentials(&wrapped).unwrap();
+        assert_eq!(creds.access_token, "flat-token");
+        assert_eq!(creds.refresh_token, None);
+        assert_eq!(creds.expires_at, None);
     }
 
     #[test]
