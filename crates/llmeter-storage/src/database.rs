@@ -283,58 +283,79 @@ impl Database {
         }
         // Only include active predicates so the planner can use
         // (provider, source_file) or (provider, timestamp) directly instead of
-        // evaluating OR-NULL residuals per row.
-        let mut where_clause = String::from("provider = ?1");
-        let mut params_vec = vec![Value::Text(provider.as_str().to_string())];
+        // evaluating OR-NULL residuals per row. Predicates are kept as
+        // (comparison, value) pairs so the window aggregate and the per-row
+        // membership probe below can number their parameters independently.
+        let mut predicates: Vec<(&str, Value)> =
+            vec![("provider = ", Value::Text(provider.as_str().to_string()))];
         if let Some(source) = &source {
-            where_clause.push_str(&format!(" AND source_file = ?{}", params_vec.len() + 1));
-            params_vec.push(Value::Text(source.clone()));
+            predicates.push(("source_file = ", Value::Text(source.clone())));
         }
         if let Some(since) = since {
-            where_clause.push_str(&format!(" AND timestamp >= ?{}", params_vec.len() + 1));
-            params_vec.push(Value::Integer(since.timestamp()));
+            predicates.push(("timestamp >= ", Value::Integer(since.timestamp())));
         }
         if let Some(snapshot_scope) = snapshot_scope {
-            where_clause.push_str(&format!(" AND snapshot_scope = ?{}", params_vec.len() + 1));
-            params_vec.push(Value::Text(snapshot_scope.to_string()));
+            predicates.push(("snapshot_scope = ", Value::Text(snapshot_scope.to_string())));
         }
+        let render_clause = |offset: usize| {
+            predicates
+                .iter()
+                .enumerate()
+                .map(|(index, (comparison, _))| format!("{comparison}?{}", index + offset))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
+        let where_clause = render_clause(1);
+        let params_vec = predicates
+            .iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
 
         let identities = ExistingEventIndex::load(&transaction, events)?;
-        let (existing_ids, previous_tokens) = {
-            let mut statement = transaction.prepare(&format!(
-                "SELECT id, total_tokens FROM usage_events WHERE {where_clause}"
-            ))?;
-            let rows = statement.query_map(params_from_iter(params_vec.iter()), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?;
-            let mut database_ids = HashSet::new();
-            let mut event_ids = HashSet::new();
-            let mut tokens = 0_u64;
-            for row in rows {
-                let (id, total) = row?;
-                database_ids.insert(id.clone());
-                event_ids.insert(id);
-                tokens = tokens.saturating_add(from_sqlite_u64(total));
+        // Sum the replaced window with one aggregate instead of buffering
+        // every row id and token. Rows outside the window that the upsert
+        // rewrites by identity also leave the snapshot, so count each
+        // distinct one once — they are the only rows needing id probes.
+        let window_tokens: i64 = transaction
+            .prepare_cached(&format!(
+                "SELECT COALESCE(SUM(total_tokens), 0) FROM usage_events WHERE {where_clause}"
+            ))?
+            .query_row(params_from_iter(params_vec.iter()), |row| row.get(0))?;
+        let mut previous_tokens = from_sqlite_u64(window_tokens);
+        let mut matched: HashMap<&str, i64> = HashMap::new();
+        for event in events {
+            if let Some((database_id, total)) = identities.get(event) {
+                matched.entry(database_id).or_insert(total);
             }
-            drop(statement);
-
-            for event in events {
-                if let Some((database_id, total)) = identities.get(event) {
-                    event_ids.insert(event.id.clone());
-                    if database_ids.insert(database_id.to_string()) {
-                        tokens = tokens.saturating_add(from_sqlite_u64(total));
-                    }
+        }
+        if !matched.is_empty() {
+            let exists_clause = format!("id = ?1 AND {}", render_clause(2));
+            let mut exists_statement = transaction.prepare_cached(&format!(
+                "SELECT EXISTS(SELECT 1 FROM usage_events WHERE {exists_clause})"
+            ))?;
+            let mut outside_ids = Vec::new();
+            for database_id in matched.keys() {
+                let mut bound = vec![Value::Text(database_id.to_string())];
+                bound.extend(params_vec.iter().map(|value| (*value).clone()));
+                let inside: bool =
+                    exists_statement.query_row(params_from_iter(bound.iter()), |row| row.get(0))?;
+                if !inside {
+                    outside_ids.push(*database_id);
                 }
             }
-            (event_ids, tokens)
-        };
+            for database_id in outside_ids {
+                if let Some(total) = matched.get(database_id) {
+                    previous_tokens = previous_tokens.saturating_add(from_sqlite_u64(*total));
+                }
+            }
+        }
         transaction
             .prepare_cached(&format!("DELETE FROM usage_events WHERE {where_clause}"))?
             .execute(params_from_iter(params_vec.iter()))?;
         upsert_usage_events(&transaction, events, &identities)?;
         let inserted = events
             .iter()
-            .filter(|event| !existing_ids.contains(&event.id))
+            .filter(|event| identities.get(event).is_none())
             .count();
         let current_tokens = events.iter().fold(0_u64, |total, event| {
             total.saturating_add(event.total_tokens)

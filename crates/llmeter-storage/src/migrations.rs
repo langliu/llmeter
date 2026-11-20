@@ -132,7 +132,18 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
             [],
         )?;
     }
-    connection.pragma_update(None, "user_version", 10)?;
+    if version < 11 {
+        // ExistingEventIndex looks up sync batches by bare source_event_id;
+        // the composite identity indexes all lead with provider, which left
+        // those lookups scanning the whole table on every batch.
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_usage_events_source_event_id
+             ON usage_events(source_event_id)
+             WHERE source_event_id IS NOT NULL",
+            [],
+        )?;
+    }
+    connection.pragma_update(None, "user_version", 11)?;
     Ok(())
 }
 
@@ -271,7 +282,7 @@ mod tests {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            10
+            11
         );
     }
 
@@ -408,6 +419,31 @@ mod tests {
             names
                 .iter()
                 .any(|name| name == "idx_usage_events_provider_source_file")
+        );
+    }
+
+    #[test]
+    fn bare_source_event_id_lookups_use_the_partial_index() {
+        let connection = Connection::open_in_memory().unwrap();
+        run(&connection).unwrap();
+        let mut plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN \
+                 SELECT id FROM usage_events WHERE source_event_id IN (?1, ?2)",
+            )
+            .unwrap();
+        let steps = plan
+            .query_map(rusqlite::params!["one", "two"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.contains("idx_usage_events_source_event_id")),
+            "identity lookups should seek the partial index, got plan: {steps:?}"
         );
     }
 

@@ -419,8 +419,7 @@ impl UsageRepository {
     }
 
     pub fn get_session_count(&self) -> Result<u64, StorageError> {
-        let connection = self.database.lock()?;
-        query_session_count(&connection)
+        self.database.with_reader(query_session_count)
     }
 
     pub fn get_sessions(&self) -> Result<Vec<SessionSummary>, StorageError> {
