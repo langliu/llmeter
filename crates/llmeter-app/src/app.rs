@@ -176,7 +176,7 @@ struct SessionFilterCache {
     valid: bool,
     query: String,
     provider: SessionProviderFilter,
-    range_start: Option<DateTime<Utc>>,
+    range: SessionRangeFilter,
     project: Option<String>,
     revision: u64,
     indices: std::rc::Rc<Vec<usize>>,
@@ -297,41 +297,36 @@ impl LLMeterView {
                 })
                 .ok();
         }
-        let detections = collector.detect_all();
         let today = Local::now().date_naive();
         let overview_period = OverviewPeriod::default();
         let overview_custom_range = (today, today);
         let (overview_start, overview_end) =
             overview_period.bounds(Local::now(), overview_custom_range);
         let initial_session_providers = repository.get_session_providers().unwrap_or_default();
-        let (snapshot, has_session_count) = match UiSnapshot::load(
-            &repository,
-            overview_start,
-            overview_end,
-            SessionLoad::Count,
-        ) {
-            Ok(snapshot) => (snapshot.with_detections(detections.clone()), true),
-            Err(error) => (
-                UiSnapshot {
-                    today: Default::default(),
-                    seven_days: Default::default(),
-                    thirty_days: Default::default(),
-                    overview_range: Default::default(),
-                    heatmap_daily: Vec::new(),
-                    heatmap_models: Vec::new(),
-                    providers: Vec::new(),
-                    models: Vec::new(),
-                    projects: Vec::new(),
-                    recent: Vec::new(),
-                    sessions: Vec::new(),
-                    session_count: 0,
-                    detections,
-                    database_path: repository.database().path().to_path_buf(),
-                    last_sync: None,
-                    warnings: vec![format!("database query failed: {error}")],
-                },
-                false,
-            ),
+        let database_path = repository.database().path().to_path_buf();
+        let (snapshot, has_session_count) = if cfg!(test) {
+            // Tests drive the view synchronously and expect real data.
+            let detections = collector.detect_all();
+            match UiSnapshot::load(
+                &repository,
+                overview_start,
+                overview_end,
+                SessionLoad::Count,
+            ) {
+                Ok(snapshot) => (snapshot.with_detections(detections), true),
+                Err(error) => {
+                    let mut fallback = UiSnapshot::empty(database_path);
+                    fallback
+                        .warnings
+                        .push(format!("database query failed: {error}"));
+                    (fallback, false)
+                }
+            }
+        } else {
+            // First paint must not wait for provider probing and the full
+            // dashboard query set; the background reload started below fills
+            // in the real data and the pending states cover the gap.
+            (UiSnapshot::empty(database_path), false)
         };
         let overview_date_range = cx.new(|cx| {
             let mut picker = DatePickerState::range(window, cx).date_format("%Y-%m-%d");
@@ -416,7 +411,7 @@ impl LLMeterView {
                 valid: false,
                 query: String::new(),
                 provider: SessionProviderFilter::All,
-                range_start: None,
+                range: SessionRangeFilter::All,
                 project: None,
                 revision: 0,
                 indices: std::rc::Rc::new(Vec::new()),
@@ -436,6 +431,7 @@ impl LLMeterView {
         view.apply_theme(window, cx);
         if !cfg!(test) {
             view.collector.start_background();
+            view.reload_snapshot(None);
         }
         let task = cx.spawn(async move |this, cx| {
             loop {
@@ -925,19 +921,21 @@ impl LLMeterView {
     pub(crate) fn visible_session_indices(&self, cx: &gpui::App) -> std::rc::Rc<Vec<usize>> {
         let query = self.session_search.read(cx).value();
         let query = query.to_string();
-        let range_start = self.session_range.start(Utc::now());
         {
             let cache = self.session_filter_cache.borrow();
             if cache.valid
                 && cache.revision == self.sessions_data_revision
                 && cache.query == query
                 && cache.provider == self.session_provider
-                && cache.range_start == range_start
+                && cache.range == self.session_range
                 && cache.project == self.session_project
             {
                 return cache.indices.clone();
             }
         }
+        // Computed only on a cache miss; keying the cache on the filter enum
+        // instead of this timestamp is what makes Days7/30/90 hits possible.
+        let range_start = self.session_range.start(Utc::now());
         let indices = self
             .snapshot
             .sessions
@@ -958,7 +956,7 @@ impl LLMeterView {
             valid: true,
             query,
             provider: self.session_provider,
-            range_start,
+            range: self.session_range,
             project: self.session_project.clone(),
             revision: self.sessions_data_revision,
             indices: indices.clone(),
@@ -1288,7 +1286,6 @@ impl LLMeterView {
                 .collect();
         }
 
-        snapshot.sessions = self.snapshot.sessions.clone();
         if refresh_session_count {
             self.has_session_count = true;
         } else {
@@ -1320,6 +1317,10 @@ impl LLMeterView {
             self.snapshot.warnings = snapshot.warnings;
             return false;
         }
+        // Dashboard loads never populate the session list (Count/Skip only);
+        // the full list lives in the old snapshot until the next
+        // session-update generation lands. Swap it across instead of cloning.
+        std::mem::swap(&mut snapshot.sessions, &mut self.snapshot.sessions);
         self.heatmap_data_revision = self.heatmap_data_revision.wrapping_add(1);
         self.snapshot = snapshot;
         true
@@ -1329,6 +1330,10 @@ impl LLMeterView {
 /// Compares every data-bearing field of two snapshots, ignoring volatile
 /// bookkeeping (last_sync, warnings) that changes on every sync.
 fn snapshot_data_equivalent(left: &UiSnapshot, right: &UiSnapshot) -> bool {
+    // `sessions` is deliberately excluded: dashboard loads always deliver an
+    // empty list and apply_snapshot carries the old one across, so comparing
+    // it here would compare the old list with itself. Real session-list
+    // changes arrive through the separately gated session-update path.
     left.today == right.today
         && left.seven_days == right.seven_days
         && left.thirty_days == right.thirty_days
@@ -1339,7 +1344,6 @@ fn snapshot_data_equivalent(left: &UiSnapshot, right: &UiSnapshot) -> bool {
         && left.models == right.models
         && left.projects == right.projects
         && left.recent == right.recent
-        && left.sessions == right.sessions
         && left.session_count == right.session_count
         && left.detections == right.detections
 }

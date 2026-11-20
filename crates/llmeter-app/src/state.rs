@@ -52,6 +52,29 @@ impl OverviewRangeSnapshot {
 }
 
 impl UiSnapshot {
+    /// Placeholder rendered before the first background load lands. The
+    /// dashboard's pending/empty states stand in for the data until then.
+    pub fn empty(database_path: PathBuf) -> Self {
+        Self {
+            today: Default::default(),
+            seven_days: Default::default(),
+            thirty_days: Default::default(),
+            overview_range: Default::default(),
+            heatmap_daily: Vec::new(),
+            heatmap_models: Vec::new(),
+            providers: Vec::new(),
+            models: Vec::new(),
+            projects: Vec::new(),
+            recent: Vec::new(),
+            sessions: Vec::new(),
+            session_count: 0,
+            detections: Vec::new(),
+            database_path,
+            last_sync: None,
+            warnings: Vec::new(),
+        }
+    }
+
     pub fn load(
         repository: &UsageRepository,
         overview_start: DateTime<Utc>,
