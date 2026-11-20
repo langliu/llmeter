@@ -78,13 +78,16 @@ impl CodexAdapter {
             .or_else(|| nested(payload, &["total_token_usage"]))
             .or_else(|| nested(value, &["total_token_usage"]))
             .and_then(usage_snapshot);
-        let generic_usage = super::object_with_usage(value);
 
         let (counts, cumulative_snapshot) = if let Some(counts) = last_usage {
             (counts, None)
         } else if let Some(snapshot) = total_usage {
             (snapshot.into(), Some(snapshot))
-        } else if let Some(usage) = generic_usage.and_then(counts_from_codex_usage) {
+        } else if let Some(usage) =
+            // The generic fallback walks the whole record; most lines carry
+            // last/total usage, so only pay for it when both miss.
+            super::object_with_usage(value).and_then(counts_from_codex_usage)
+        {
             (usage.0, usage.1)
         } else {
             return Ok(None);

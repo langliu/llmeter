@@ -181,18 +181,44 @@ impl SyncEngine {
 
     pub fn sync(&self, options: SyncOptions) -> Result<SyncResult> {
         let started = Instant::now();
+        let adapters = self
+            .selected_adapters(&options)
+            .map(|adapter| adapter.as_ref())
+            .collect::<Vec<_>>();
+        // Provider syncs are independent: each adapter reads its own cursors
+        // and sources, and writes serialize on the database writer. Fan out so
+        // a slow remote snapshot (Trae pagination, Cursor CSV) does not delay
+        // the other providers behind it.
+        let provider_results = std::thread::scope(|scope| {
+            let handles = adapters
+                .iter()
+                .map(|adapter| {
+                    scope.spawn(move || {
+                        let adapter: &dyn ProviderAdapter = *adapter;
+                        let mut provider_result = SyncResult::default();
+                        match self.sync_provider(adapter, &mut provider_result) {
+                            Ok(()) => provider_result,
+                            Err(error) => {
+                                let warning = format!(
+                                    "{} provider sync failed: {error:#}",
+                                    adapter.provider()
+                                );
+                                warn!(provider = %adapter.provider(), error = %error, "provider sync failed");
+                                provider_result.warnings.push(warning);
+                                provider_result
+                            }
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("provider sync worker panicked"))
+                .collect::<Vec<_>>()
+        });
         let mut result = SyncResult::default();
-        for adapter in self.selected_adapters(&options) {
-            match self.sync_provider(adapter.as_ref(), &mut result) {
-                Ok(()) => {}
-                Err(error) => {
-                    result.warnings.push(format!(
-                        "{} provider sync failed: {error:#}",
-                        adapter.provider()
-                    ));
-                    warn!(provider = %adapter.provider(), error = %error, "provider sync failed");
-                }
-            }
+        for provider_result in provider_results {
+            result.merge(provider_result);
         }
         result.duration_ms = started.elapsed().as_millis();
         // Keep the WAL small: short UI reads on the reader pool keep

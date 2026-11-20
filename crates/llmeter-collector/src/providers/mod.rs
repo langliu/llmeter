@@ -634,6 +634,19 @@ pub(crate) struct PathMemo<T> {
     entries: std::sync::Mutex<HashMap<PathBuf, (Option<StorageFingerprint>, T)>>,
 }
 
+impl<T: Clone> Clone for PathMemo<T> {
+    fn clone(&self) -> Self {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        Self {
+            entries: std::sync::Mutex::new(entries),
+        }
+    }
+}
+
 impl<T: Clone> PathMemo<T> {
     pub(crate) fn new() -> Self {
         Self {

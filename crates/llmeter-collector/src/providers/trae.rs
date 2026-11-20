@@ -420,18 +420,29 @@ fn fetch_trae_window(
     }
 }
 
+/// Shared connection pool. Trae syncs paginate up to 100 requests per window
+/// and split recursively, so one agent keeps TCP/TLS handshakes to a minimum
+/// instead of one fresh pool per window.
+static TRAE_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+fn trae_agent() -> &'static ureq::Agent {
+    TRAE_AGENT.get_or_init(|| {
+        ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(30)))
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .build(),
+        )
+    })
+}
+
 fn fetch_trae_pages(
     token: &str,
     start: i64,
     end: i64,
 ) -> std::result::Result<Vec<Value>, TraeUsageError> {
-    let agent = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .build(),
-    );
+    let agent = trae_agent();
     let mut rows = Vec::new();
     for page in 1..=TRAE_CN_MAX_PAGES {
         let response = agent

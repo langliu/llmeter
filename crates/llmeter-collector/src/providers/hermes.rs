@@ -10,7 +10,7 @@ use llmeter_core::{
     Provider, ProviderDetection, ProviderStatus, SourceFile, SourceFormat, TokenCounts,
 };
 
-use super::{ParsedUsage, ProviderAdapter, home_dir, project_name};
+use super::{ParsedUsage, PathMemo, ProviderAdapter, home_dir, project_name};
 use crate::sqlite::{open_read_only, table_has_columns};
 
 const HERMES_PARSER_VERSION: u32 = 1;
@@ -46,6 +46,10 @@ const MODEL_USAGE_COLUMNS: &[&str] = &[
 #[derive(Clone, Debug)]
 pub struct HermesAdapter {
     root: PathBuf,
+    /// detect and discover_sources both probe the schema (and detect also
+    /// counts usage rows) on every sync; the memo keeps that to one open per
+    /// changed database.
+    schema_probes: PathMemo<(bool, bool)>,
 }
 
 impl Default for HermesAdapter {
@@ -53,7 +57,10 @@ impl Default for HermesAdapter {
         let root = std::env::var_os("HERMES_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home_dir().join(".hermes"));
-        Self { root }
+        Self {
+            root,
+            schema_probes: PathMemo::new(),
+        }
     }
 }
 
@@ -61,7 +68,21 @@ impl HermesAdapter {
     pub fn with_home(home: PathBuf) -> Self {
         Self {
             root: home.join(".hermes"),
+            schema_probes: PathMemo::new(),
         }
+    }
+
+    /// Cached (supported, has_usage_rows) probe; failures are not memoized so
+    /// a locked database is retried on the next sync.
+    fn cached_schema_probe(&self, path: &Path) -> Result<(bool, bool)> {
+        if let Some(cached) = self.schema_probes.get(path) {
+            return Ok(cached);
+        }
+        let supported = supported_schema(path)?;
+        let has_usage_rows = supported && usage_row_count(path)? > 0;
+        let probe = (supported, has_usage_rows);
+        self.schema_probes.insert(path, probe);
+        Ok(probe)
     }
 
     fn databases(&self) -> Result<Vec<PathBuf>> {
@@ -125,7 +146,7 @@ impl ProviderAdapter for HermesAdapter {
         }
 
         for database in &databases {
-            if !supported_schema(database)? {
+            if !self.cached_schema_probe(database)?.0 {
                 return Ok(ProviderDetection {
                     provider: Provider::Hermes,
                     status: ProviderStatus::UnsupportedVersion,
@@ -139,10 +160,10 @@ impl ProviderAdapter for HermesAdapter {
         }
         let has_data = databases
             .iter()
-            .map(|path| usage_row_count(path))
+            .map(|path| self.cached_schema_probe(path).map(|probe| probe.1))
             .collect::<Result<Vec<_>>>()?
             .into_iter()
-            .any(|count| count > 0);
+            .any(|has_rows| has_rows);
         Ok(ProviderDetection {
             provider: Provider::Hermes,
             status: if has_data {
@@ -162,8 +183,8 @@ impl ProviderAdapter for HermesAdapter {
     fn discover_sources(&self) -> Result<Vec<SourceFile>> {
         self.databases()?
             .into_iter()
-            .filter_map(|path| match supported_schema(&path) {
-                Ok(true) => Some(Ok(SourceFile {
+            .filter_map(|path| match self.cached_schema_probe(&path) {
+                Ok((true, _)) => Some(Ok(SourceFile {
                     path,
                     provider: Provider::Hermes,
                     format: SourceFormat::Sqlite,
@@ -171,7 +192,7 @@ impl ProviderAdapter for HermesAdapter {
                     project_path: None,
                     project_name: None,
                 })),
-                Ok(false) => None,
+                Ok((false, _)) => None,
                 Err(error) => Some(Err(error)),
             })
             .collect()

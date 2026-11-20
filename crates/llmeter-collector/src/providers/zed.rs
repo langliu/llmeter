@@ -12,7 +12,7 @@ use llmeter_core::{
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
-use super::{ParsedUsage, ProviderAdapter, home_dir, json_value, project_name};
+use super::{ParsedUsage, PathMemo, ProviderAdapter, home_dir, json_value, project_name};
 
 const ZED_PARSER_VERSION: u32 = 6;
 const REQUIRED_COLUMNS: &[&str] = &["id", "updated_at", "data_type", "data", "folder_paths"];
@@ -60,6 +60,9 @@ pub struct ZedAdapter {
     telemetry_ids: Mutex<HashMap<PathBuf, TelemetryLogScan>>,
     prompt_scans: Mutex<HashMap<PathBuf, PromptLogScan>>,
     thread_cache: Mutex<HashMap<PathBuf, HashMap<ThreadKey, CachedThread>>>,
+    /// detect and discover_sources both probe the threads schema on every
+    /// sync; the memo keeps that probe to one open per changed database.
+    schema_probes: PathMemo<(bool, u64)>,
 }
 
 /// Per-log incremental scan state for telemetry.log thread ids.
@@ -171,7 +174,19 @@ impl ZedAdapter {
             telemetry_ids: Mutex::new(HashMap::new()),
             prompt_scans: Mutex::new(HashMap::new()),
             thread_cache: Mutex::new(HashMap::new()),
+            schema_probes: PathMemo::new(),
         }
+    }
+
+    /// Cached (supported, thread_count) schema probe; open/PRAGMA failures
+    /// are not memoized so a locked database is retried on the next sync.
+    fn cached_schema_probe(&self, path: &Path) -> Result<(bool, u64)> {
+        if let Some(cached) = self.schema_probes.get(path) {
+            return Ok(cached);
+        }
+        let probe = schema_thread_count(path)?;
+        self.schema_probes.insert(path, probe);
+        Ok(probe)
     }
 
     pub fn with_database(path: PathBuf) -> Self {
@@ -540,7 +555,7 @@ impl ProviderAdapter for ZedAdapter {
 
         let mut has_thread_data = false;
         for path in &databases {
-            let (supported, thread_count) = schema_thread_count(path)?;
+            let (supported, thread_count) = self.cached_schema_probe(path)?;
             if !supported {
                 return Ok(ProviderDetection {
                     provider: Provider::Zed,
@@ -586,8 +601,8 @@ impl ProviderAdapter for ZedAdapter {
             })
             .collect::<Vec<_>>();
         for path in self.existing_databases() {
-            match supported_schema(&path) {
-                Ok(true) => sources.push(SourceFile {
+            match self.cached_schema_probe(&path) {
+                Ok((true, _)) => sources.push(SourceFile {
                     path,
                     provider: Provider::Zed,
                     format: SourceFormat::Sqlite,
@@ -595,7 +610,7 @@ impl ProviderAdapter for ZedAdapter {
                     project_path: None,
                     project_name: None,
                 }),
-                Ok(false) => {}
+                Ok((false, _)) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -778,27 +793,6 @@ fn telemetry_thread_id(line: &str) -> Option<String> {
         .get("thread_id")?
         .as_str()
         .map(str::to_string)
-}
-
-fn supported_schema(path: &Path) -> Result<bool> {
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let exists = connection
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads'",
-            [],
-            |_| Ok(()),
-        )
-        .is_ok();
-    if !exists {
-        return Ok(false);
-    }
-    let mut statement = connection.prepare("PRAGMA table_info('threads')")?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(REQUIRED_COLUMNS
-        .iter()
-        .all(|required| columns.iter().any(|column| column == required)))
 }
 
 /// Checks the threads schema and counts usable threads with a single

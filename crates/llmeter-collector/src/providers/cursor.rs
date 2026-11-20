@@ -229,14 +229,24 @@ impl ProviderAdapter for CursorAdapter {
     }
 }
 
+/// Shared connection pool so each sync reuses the Cursor origin's TCP/TLS
+/// connection instead of handshaking from scratch every cycle.
+static CURSOR_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+fn cursor_agent() -> &'static ureq::Agent {
+    CURSOR_AGENT.get_or_init(|| {
+        ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(30)))
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .build(),
+        )
+    })
+}
+
 fn fetch_cursor_csv(cookie: &str) -> Result<String> {
-    let agent = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .build(),
-    );
+    let agent = cursor_agent();
     let mut url = CURSOR_USAGE_CSV_URL.to_string();
     for redirect in 0..=1 {
         let response = agent
