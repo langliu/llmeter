@@ -2279,7 +2279,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn parses_zcode_reset_cards_from_probe_shape() {
         let now = Utc::now();
         let expires_ms = (now + chrono::Duration::days(12)).timestamp_millis();
