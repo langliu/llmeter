@@ -24,8 +24,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::providers::{
-    cursor_root, cursor_session_cookie, has_trae_cn_auth, qoder_root, read_entitlement,
-    trae_cn_root, trae_root,
+    cursor_root, cursor_session_cookie, has_trae_cn_auth, jwt_payload, qoder_root,
+    read_entitlement, read_json_file, trae_cn_root, trae_root,
 };
 
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -2056,10 +2056,6 @@ fn ready_limits(
     }
 }
 
-fn read_json_file(path: &Path) -> Option<Value> {
-    serde_json::from_slice(&fs::read(path).ok()?).ok()
-}
-
 fn number(value: Option<&Value>) -> Option<f64> {
     value.and_then(|value| {
         value
@@ -2093,15 +2089,6 @@ fn parse_reset(value: Option<&Value>) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value.as_str()?)
         .ok()
         .map(|date| date.with_timezone(&Utc))
-}
-
-fn jwt_payload(token: &str) -> Option<Value> {
-    let payload = token.split('.').nth(1)?;
-    let decoded = URL_SAFE_NO_PAD
-        .decode(payload)
-        .or_else(|_| URL_SAFE.decode(payload))
-        .ok()?;
-    serde_json::from_slice(&decoded).ok()
 }
 
 fn title_case(value: &str) -> String {

@@ -7,7 +7,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, NaiveDate, Utc};
 use llmeter_core::{Provider, ProviderDetection, SourceFile, SourceFormat, TokenCounts};
 use rusqlite::{Connection, OpenFlags};
@@ -15,7 +14,7 @@ use serde_json::Value;
 
 use super::{
     ParsedSnapshot, ParsedUsage, PathMemo, ProviderAdapter, SnapshotPolicy, StorageFingerprint,
-    data_status, home_dir, snapshot_scope, storage_fingerprint,
+    data_status, home_dir, jwt_payload, read_json_file, snapshot_scope, storage_fingerprint,
 };
 
 const CURSOR_PARSER_VERSION: u32 = 2;
@@ -123,24 +122,6 @@ fn read_cursor_access_token(path: &Path) -> Option<String> {
         )
         .ok()
         .filter(|value| value.len() >= 10)
-}
-
-fn read_json_file(path: &Path) -> Option<Value> {
-    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
-}
-
-fn jwt_payload(token: &str) -> Option<Value> {
-    let payload = token.split('.').nth(1)?;
-    let padding = (4 - payload.len() % 4) % 4;
-    let mut encoded = payload.to_string();
-    encoded.extend(std::iter::repeat_n('=', padding));
-    serde_json::from_slice(
-        &URL_SAFE_NO_PAD
-            .decode(payload)
-            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(encoded.as_bytes()))
-            .ok()?,
-    )
-    .ok()
 }
 
 fn normalize_cursor_subject(subject: &str) -> Option<String> {

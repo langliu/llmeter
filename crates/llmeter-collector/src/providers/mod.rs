@@ -688,6 +688,30 @@ impl<T: Clone> PathMemo<T> {
     }
 }
 
+/// Reads and parses a JSON document, returning None for missing files,
+/// unreadable paths, or invalid JSON.
+pub(crate) fn read_json_file(path: &Path) -> Option<Value> {
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+/// Decodes one base64url JWT segment (padding-tolerant) into JSON.
+pub(crate) fn decode_jwt_segment(segment: &str) -> Option<Value> {
+    use base64::Engine;
+    let padding = (4 - segment.len() % 4) % 4;
+    let mut padded = segment.to_string();
+    padded.extend(std::iter::repeat_n('=', padding));
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(segment)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(padded.as_bytes()))
+        .ok()?;
+    serde_json::from_slice(&decoded).ok()
+}
+
+/// Payload (second segment) of a JWT.
+pub(crate) fn jwt_payload(token: &str) -> Option<Value> {
+    decode_jwt_segment(token.split('.').nth(1)?)
+}
+
 pub(crate) fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }

@@ -9,10 +9,7 @@ use std::{
 
 use aes::Aes128;
 use anyhow::{Result, anyhow, bail};
-use base64::{
-    Engine,
-    engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD},
-};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use cbc::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
 use chrono::{Duration as ChronoDuration, Timelike, Utc};
 use llmeter_core::{Provider, ProviderDetection, SourceFile, SourceFormat, TokenCounts};
@@ -291,14 +288,7 @@ fn trae_cn_account_identity(auth: &Value, token: &str) -> String {
 
 fn jwt_claim(token: &str, names: &[&str]) -> Option<String> {
     token.split('.').skip(1).find_map(|segment| {
-        let padding = (4 - segment.len() % 4) % 4;
-        let mut padded = segment.to_string();
-        padded.extend(std::iter::repeat_n('=', padding));
-        let decoded = URL_SAFE_NO_PAD
-            .decode(segment)
-            .or_else(|_| URL_SAFE.decode(padded.as_bytes()))
-            .ok()?;
-        let payload: Value = serde_json::from_slice(&decoded).ok()?;
+        let payload = super::decode_jwt_segment(segment)?;
         names
             .iter()
             .find_map(|name| payload.get(*name).and_then(Value::as_str))
