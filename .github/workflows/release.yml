@@ -141,9 +141,7 @@ jobs:
             app "LLMeter.app"
           
             postflight_steps do
-              system_command "/usr/bin/xattr",
-                             args: ["-cr", "#{appdir}/LLMeter.app"],
-                             sudo: false
+              run "/usr/bin/xattr", args: ["-cr", "{{appdir}}/LLMeter.app"]
             end
           
             zap trash: [
