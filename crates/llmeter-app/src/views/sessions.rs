@@ -56,6 +56,10 @@ impl SessionProviderFilter {
     }
 }
 
+/// Fixed height estimate for every session row; the virtual list is sized
+/// from a shared cached vector instead of a per-frame allocation.
+pub(crate) const SESSION_ROW_HEIGHT: f32 = 78.0;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SessionRangeFilter {
     #[default]
@@ -107,7 +111,7 @@ pub(crate) fn sessions_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -
             .child(empty_state(t!("sessions.empty").to_string(), p))
             .into_any_element()
     } else {
-        let item_sizes = Rc::new(vec![size(px(1.0), px(78.0)); visible_count]);
+        let item_sizes = view.session_row_sizes(cx);
         v_virtual_list(
             cx.entity().clone(),
             "session-items",

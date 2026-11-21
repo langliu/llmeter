@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Datelike, Days, Duration as ChronoDuration, Local, NaiveDate, Utc};
 use gpui::{
-    AppContext, ClipboardItem, Context, Entity, ParentElement, Render, Styled, Subscription,
-    Window, div, point, px,
+    AppContext, ClipboardItem, Context, Entity, ParentElement, Render, Size, Styled, Subscription,
+    Window, div, point, px, size,
 };
 use gpui_component::{
     Root, VirtualListScrollHandle, WindowExt,
@@ -180,6 +180,9 @@ struct SessionFilterCache {
     project: Option<String>,
     revision: u64,
     indices: std::rc::Rc<Vec<usize>>,
+    /// Uniform row-height estimates for the sessions virtual list, rebuilt
+    /// together with `indices` so rendering does not reallocate O(n) per frame.
+    row_sizes: std::rc::Rc<Vec<Size<gpui::Pixels>>>,
 }
 
 #[derive(Default)]
@@ -415,6 +418,7 @@ impl LLMeterView {
                 project: None,
                 revision: 0,
                 indices: std::rc::Rc::new(Vec::new()),
+                row_sizes: std::rc::Rc::new(Vec::new()),
             }),
             session_derived_cache: std::cell::RefCell::new(SessionDerivedCache::default()),
             heatmap_data_revision: 0,
@@ -952,6 +956,13 @@ impl LLMeterView {
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         let indices = std::rc::Rc::new(indices);
+        let row_sizes = std::rc::Rc::new(
+            std::iter::repeat_n(
+                size(px(1.0), px(crate::views::sessions::SESSION_ROW_HEIGHT)),
+                indices.len(),
+            )
+            .collect::<Vec<_>>(),
+        );
         *self.session_filter_cache.borrow_mut() = SessionFilterCache {
             valid: true,
             query,
@@ -960,8 +971,16 @@ impl LLMeterView {
             project: self.session_project.clone(),
             revision: self.sessions_data_revision,
             indices: indices.clone(),
+            row_sizes,
         };
         indices
+    }
+
+    /// Uniform row-height vector for the sessions virtual list, cached with
+    /// the filter indices so each frame does not rebuild it.
+    pub(crate) fn session_row_sizes(&self, cx: &gpui::App) -> std::rc::Rc<Vec<Size<gpui::Pixels>>> {
+        self.visible_session_indices(cx);
+        self.session_filter_cache.borrow().row_sizes.clone()
     }
 
     pub(crate) fn session_providers(&self) -> std::rc::Rc<Vec<Provider>> {
