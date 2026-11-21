@@ -269,18 +269,22 @@ impl UsageRepository {
 
     pub fn load_dashboard(&self, query: DashboardQuery) -> Result<DashboardSnapshot, StorageError> {
         let mut snapshot = self.database.with_reader(|connection| {
-            let (today, seven_days, thirty_days) = query_windowed_overviews(
+            let (today, seven_days, thirty_days, overview) = query_windowed_overviews(
                 connection,
                 query.today_start,
                 query.seven_start,
                 query.thirty_start,
+                query.overview_start,
+                query.overview_end,
                 query.now_end,
             )?;
+            let (heatmap_daily, heatmap_models) =
+                query_heatmap(connection, query.heatmap_start, query.now_end)?;
             Ok(DashboardSnapshot {
                 today,
                 seven_days,
                 thirty_days,
-                overview: query_overview(connection, query.overview_start, query.overview_end)?,
+                overview,
                 overview_daily: query_daily_usage(
                     connection,
                     query.overview_start,
@@ -296,12 +300,8 @@ impl UsageRepository {
                     query.overview_start,
                     query.overview_end,
                 )?,
-                heatmap_daily: query_daily_usage(connection, query.heatmap_start, query.now_end)?,
-                heatmap_models: query_daily_model_usage(
-                    connection,
-                    query.heatmap_start,
-                    query.now_end,
-                )?,
+                heatmap_daily,
+                heatmap_models,
                 providers: query_provider_usage(connection, query.thirty_start, query.now_end)?,
                 models: query_model_usage(connection, query.thirty_start, query.now_end)?,
                 projects: query_project_usage(connection, query.thirty_start, query.now_end)?,
@@ -494,14 +494,23 @@ fn query_overview(
         .map_err(StorageError::from)
 }
 
+/// One FILTER scan answering the today / 7-day / 30-day headline numbers and
+/// the custom-range overview; every window would otherwise scan the same rows
+/// on its own. The scan covers the oldest window start through `end`.
+#[allow(clippy::type_complexity)]
 fn query_windowed_overviews(
     connection: &Connection,
     today_start: DateTime<Utc>,
     seven_start: DateTime<Utc>,
     thirty_start: DateTime<Utc>,
+    overview_start: DateTime<Utc>,
+    overview_end: DateTime<Utc>,
     end: DateTime<Utc>,
-) -> Result<(Overview, Overview, Overview), StorageError> {
-    let scan_start = today_start.min(seven_start).min(thirty_start);
+) -> Result<(Overview, Overview, Overview, Overview), StorageError> {
+    let scan_start = today_start
+        .min(seven_start)
+        .min(thirty_start)
+        .min(overview_start);
     connection
         .prepare_cached(
             "SELECT
@@ -528,14 +537,25 @@ fn query_windowed_overviews(
                 COALESCE(SUM(output_tokens) FILTER (WHERE timestamp >= ?3), 0),
                 COALESCE(SUM(reasoning_tokens) FILTER (WHERE timestamp >= ?3), 0),
                 COALESCE(SUM(total_tokens) FILTER (WHERE timestamp >= ?3), 0),
-                SUM(COALESCE(reported_cost_usd, estimated_cost_usd)) FILTER (WHERE timestamp >= ?3)
-             FROM usage_events WHERE timestamp >= ?4 AND timestamp < ?5",
+                SUM(COALESCE(reported_cost_usd, estimated_cost_usd)) FILTER (WHERE timestamp >= ?3),
+                COUNT(*) FILTER (WHERE timestamp >= ?4 AND timestamp < ?5),
+                COALESCE(SUM(input_tokens) FILTER (WHERE timestamp >= ?4 AND timestamp < ?5), 0),
+                COALESCE(SUM(cached_input_tokens) FILTER (WHERE timestamp >= ?4 AND timestamp < ?5), 0),
+                COALESCE(SUM(cache_creation_input_tokens) FILTER (WHERE timestamp >= ?4 AND timestamp < ?5), 0),
+                COALESCE(SUM(output_tokens) FILTER (WHERE timestamp >= ?4 AND timestamp < ?5), 0),
+                COALESCE(SUM(reasoning_tokens) FILTER (WHERE timestamp >= ?4 AND timestamp < ?5), 0),
+                COALESCE(SUM(total_tokens) FILTER (WHERE timestamp >= ?4 AND timestamp < ?5), 0),
+                SUM(COALESCE(reported_cost_usd, estimated_cost_usd))
+                    FILTER (WHERE timestamp >= ?4 AND timestamp < ?5)
+             FROM usage_events WHERE timestamp >= ?6 AND timestamp < ?7",
         )?
         .query_row(
             params![
                 today_start.timestamp(),
                 seven_start.timestamp(),
                 thirty_start.timestamp(),
+                overview_start.timestamp(),
+                overview_end.timestamp(),
                 scan_start.timestamp(),
                 end.timestamp()
             ],
@@ -544,10 +564,64 @@ fn query_windowed_overviews(
                     overview_from_row(row, 0)?,
                     overview_from_row(row, 8)?,
                     overview_from_row(row, 16)?,
+                    overview_from_row(row, 24)?,
                 ))
             },
         )
         .map_err(StorageError::from)
+}
+
+/// Heatmap data in one grouped scan: day/model rows feed the per-day model
+/// ranking directly, and folding them per day reproduces the daily totals the
+/// separate day-only query used to scan for.
+fn query_heatmap(
+    connection: &Connection,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<(Vec<DailyUsage>, Vec<DailyModelUsage>), StorageError> {
+    let mut statement = connection.prepare_cached(
+        "SELECT strftime('%Y-%m-%d', timestamp, 'unixepoch', 'localtime') AS day,
+                COALESCE(model, 'Unknown'), COALESCE(SUM(total_tokens), 0),
+                SUM(COALESCE(reported_cost_usd, estimated_cost_usd))
+         FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2
+         GROUP BY day, model ORDER BY day, 3 DESC",
+    )?;
+    let rows = statement.query_map(params![start.timestamp(), end.timestamp()], |row| {
+        Ok((
+            DailyModelUsage {
+                day: row.get(0)?,
+                model: row.get(1)?,
+                total_tokens: from_sqlite_u64(row.get(2)?),
+            },
+            row.get::<_, Option<f64>>(3)?,
+        ))
+    })?;
+    let mut models = Vec::new();
+    let mut daily: Vec<DailyUsage> = Vec::new();
+    for row in rows {
+        let (usage, cost) = row?;
+        let day = usage.day.clone();
+        let total_tokens = usage.total_tokens;
+        models.push(usage);
+        match daily.last_mut() {
+            // Rows arrive ordered by day, so the fold is one pass.
+            Some(entry) if entry.day == day => {
+                entry.total_tokens = entry.total_tokens.saturating_add(total_tokens);
+                entry.estimated_cost_usd = match (entry.estimated_cost_usd, cost) {
+                    (Some(left), Some(right)) => Some(left + right),
+                    (Some(left), None) => Some(left),
+                    (None, Some(right)) => Some(right),
+                    (None, None) => None,
+                };
+            }
+            _ => daily.push(DailyUsage {
+                day,
+                total_tokens,
+                estimated_cost_usd: cost,
+            }),
+        }
+    }
+    Ok((daily, models))
 }
 
 fn query_daily_usage(
