@@ -24,3 +24,7 @@ tracing.workspace = true
 ureq.workspace = true
 uuid.workspace = true
 zstd.workspace = true
+
+# Reads the key ZCode 4 keeps in the login keychain to seal its credentials.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework.workspace = true

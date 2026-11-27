@@ -54,8 +54,18 @@ const GROK_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing";
 const CURSOR_USAGE_URL: &str = "https://cursor.com/api/usage-summary";
 const QODER_USAGE_URL: &str = "https://qoder.com/api/v2/me/usages/big_model_credits";
 const QODER_CN_USAGE_URL: &str = "https://qoder.com.cn/api/v2/me/usages/big_model_credits";
-const ZCODE_USAGE_URL: &str = "https://bigmodel.cn/api/monitor/usage/quota/limit";
+const ZCODE_BIGMODEL_USAGE_URL: &str = "https://bigmodel.cn/api/monitor/usage/quota/limit";
+const ZCODE_ZAI_USAGE_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
+/// Quota endpoint per ZCode account family; `oauth:active_provider` names the
+/// family the sign-in belongs to.
+const ZCODE_USAGE_URLS: [(&str, &str); 2] = [
+    ("bigmodel", ZCODE_BIGMODEL_USAGE_URL),
+    ("zai", ZCODE_ZAI_USAGE_URL),
+];
 const ZCODE_RESET_STATUS_URL: &str = "https://zcode.z.ai/api/v1/coding-plan/reset/status";
+/// ZCode 4 seals its credentials with a random key stored as this keychain
+/// item's password, under an account derived from the credentials file path.
+const ZCODE_KEYCHAIN_SERVICE: &str = "ZCode Credential Encryption";
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
@@ -1762,58 +1772,72 @@ fn grok_period_key(current: Option<&Value>, config: &Value) -> &'static str {
     "monthly"
 }
 
+/// Reads a generic keychain item's password given its service and account.
+type ZcodeOsKey<'a> = dyn Fn(&str, &str) -> Result<Vec<u8>, String> + 'a;
+
 fn fetch_zcode(home: &Path, platform: &str, http: &dyn LimitHttpClient) -> ProviderFetch {
     let zcode_home = std::env::var_os("ZCODE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".zcode"));
-    let Some(credentials) = read_json_file(&zcode_home.join("v2/credentials.json")) else {
+    fetch_zcode_from(
+        &zcode_home,
+        home,
+        platform,
+        http,
+        &zcode_os_key,
+        zcode_managed_secret().as_deref(),
+    )
+}
+
+fn fetch_zcode_from(
+    zcode_home: &Path,
+    home: &Path,
+    platform: &str,
+    http: &dyn LimitHttpClient,
+    os_key: &ZcodeOsKey<'_>,
+    managed_secret: Option<&str>,
+) -> ProviderFetch {
+    let credentials_path = zcode_home.join("v2/credentials.json");
+    let Some(credentials) = read_json_file(&credentials_path) else {
         return ProviderFetch::NotConfigured;
     };
-    // ZCode encrypts every credential with a machine-derived key; each
-    // coding-plan sign-in adds one `account-provider:coding-plan:...:api-key`
-    // entry holding the BigModel API key used for the usage endpoint.
-    let secret = format!(
-        "zcode-credential-fallback:{}:{}:{}",
-        zcode_node_platform(platform),
-        home.display(),
-        zcode_username(),
-    );
-    let Ok(cipher) = Aes256Gcm::new_from_slice(&Sha256::digest(secret.as_bytes())) else {
-        return ProviderFetch::Failed(LimitFetchError::transient(
-            "ZCode credential cipher could not be initialized.",
-        ));
+    let store = match ZcodeCredentials::open(
+        credentials,
+        &credentials_path,
+        home,
+        platform,
+        os_key,
+        managed_secret,
+    ) {
+        Ok(store) => store,
+        Err(error) => return ProviderFetch::Failed(error),
     };
-    let mut api_key = None;
-    let mut decrypt_error = None;
-    for (name, value) in credentials.as_object().into_iter().flatten() {
-        if !name.starts_with("account-provider:coding-plan:") || !name.ends_with(":api-key") {
-            continue;
-        }
-        let Some(value) = value.as_str().filter(|value| value.starts_with("enc:v1:")) else {
-            continue;
-        };
-        match decrypt_zcode_credential(&cipher, value) {
-            Ok(key) if !key.is_empty() => {
-                api_key = Some(key);
-                break;
-            }
-            Ok(_) => {}
-            Err(error) => decrypt_error = Some(error),
-        }
-    }
-    let Some(api_key) = api_key else {
-        if let Some(error) = decrypt_error {
+    // ZCode 3 and earlier kept the BigModel API key of each coding-plan
+    // sign-in in an `account-provider:coding-plan:...:api-key` entry; ZCode 4
+    // signs usage requests with the OAuth login token instead.
+    let authorization: Result<Option<(&str, String)>, String> = match store.coding_plan_api_key() {
+        Ok(Some(api_key)) => Ok(Some((
+            ZCODE_BIGMODEL_USAGE_URL,
+            format!("Bearer {api_key}"),
+        ))),
+        Ok(None) => store
+            .oauth_access_token()
+            .map(|token| token.map(|(usage_url, token)| (usage_url, format!("Bearer {token}")))),
+        Err(error) => Err(error),
+    };
+    // shortcut: only the first coding-plan API key is queried; multiple
+    // signed-in plans would need key-prefixed window keys.
+    let (usage_url, authorization) = match authorization {
+        Ok(Some(authorization)) => authorization,
+        Ok(None) => return ProviderFetch::NotConfigured,
+        Err(error) => {
             return ProviderFetch::Failed(LimitFetchError::auth(format!(
                 "ZCode credentials could not be decrypted: {error}. Sign in again in ZCode."
             )));
         }
-        return ProviderFetch::NotConfigured;
     };
-    // shortcut: only the first coding-plan API key is queried; multiple
-    // signed-in plans would need key-prefixed window keys.
-    let authorization = format!("Bearer {api_key}");
     let body = match http.get_json(
-        ZCODE_USAGE_URL,
+        usage_url,
         &[
             ("Authorization", authorization.as_str()),
             ("Accept", "application/json"),
@@ -1836,8 +1860,7 @@ fn fetch_zcode(home: &Path, platform: &str, http: &dyn LimitHttpClient) -> Provi
         Ok(mut limits) => {
             // The reset bank only augments the card list; a failure here must
             // not discard already-fetched usage windows.
-            limits.reset_cards =
-                zcode_reset_cards(&credentials, &cipher, http, Utc::now()).unwrap_or_default();
+            limits.reset_cards = zcode_reset_cards(&store, http, Utc::now()).unwrap_or_default();
             ProviderFetch::Ready(limits)
         }
         Err(error) => ProviderFetch::Failed(error),
@@ -1845,33 +1868,19 @@ fn fetch_zcode(home: &Path, platform: &str, http: &dyn LimitHttpClient) -> Provi
 }
 
 /// Fetches ZCode's banked reset-card inventory from zcode.z.ai. Unlike the
-/// usage endpoint (BigModel API key), this needs the session JWT plus the
-/// coding-plan OAuth token; a missing token or request failure degrades to
-/// an empty card list without failing the usage fetch.
+/// usage endpoint, this needs the session JWT plus the coding-plan OAuth
+/// token; a missing token or request failure degrades to an empty card list
+/// without failing the usage fetch.
 fn zcode_reset_cards(
-    credentials: &Value,
-    cipher: &Aes256Gcm,
+    credentials: &ZcodeCredentials,
     http: &dyn LimitHttpClient,
     now: DateTime<Utc>,
 ) -> Option<Vec<ResetCredit>> {
-    let credential = |name: &str| -> Option<String> {
-        match credentials.get(name) {
-            Some(Value::String(value)) => decrypt_zcode_credential(cipher, value)
-                .ok()
-                .filter(|value| !value.is_empty()),
-            _ => None,
-        }
-    };
-    let zcode_token = credential("zcodejwttoken")?;
+    let zcode_token = credentials.get("zcodejwttoken").ok().flatten()?;
     let plan_token = credentials
-        .as_object()
-        .into_iter()
-        .flatten()
+        .entries()
         .filter(|(name, _)| name.starts_with("oauth:") && name.ends_with(":access_token"))
-        .find_map(|(_, value)| match value.as_str() {
-            Some(value) => decrypt_zcode_credential(cipher, value).ok(),
-            None => None,
-        })?;
+        .find_map(|(_, value)| credentials.decrypt(value).ok())?;
     let authorization = format!("Bearer {zcode_token}");
     let body = http
         .get_json(
@@ -1985,11 +1994,16 @@ fn normalize_zcode(body: &Value, now: DateTime<Utc>) -> Result<ProviderLimits, L
 }
 
 fn decrypt_zcode_credential(cipher: &Aes256Gcm, value: &str) -> Result<String, String> {
-    let parts: Vec<_> = value
+    let payload = value
         .strip_prefix("enc:v1:")
-        .ok_or_else(|| "value is not encrypted".to_string())?
-        .split('.')
-        .collect();
+        .ok_or_else(|| "value is not encrypted".to_string())?;
+    decrypt_zcode_envelope(cipher, payload)
+}
+
+/// Opens the `iv.tag.ciphertext` payload shared by the `enc:v1` and `enc:v2`
+/// envelopes.
+fn decrypt_zcode_envelope(cipher: &Aes256Gcm, payload: &str) -> Result<String, String> {
+    let parts: Vec<_> = payload.split('.').collect();
     let [iv, tag, ciphertext] = parts.as_slice() else {
         return Err("unexpected encrypted credential format".into());
     };
@@ -2034,6 +2048,264 @@ fn zcode_username() -> String {
                 .map(|value| value.trim().to_string())
                 .unwrap_or_else(|| "unknown".into())
         })
+}
+
+/// Decrypts the entries of ZCode's `v2/credentials.json`. Values are plain,
+/// `enc:v1:` envelopes sealed with a key derived from the machine identity,
+/// or — since ZCode 4 — `enc:v2:<source>:<fingerprint>:…` envelopes sealed
+/// with a random key that lives in the OS keychain (`os` source) or is the
+/// SHA-256 of a managed secret (`env` source).
+struct ZcodeCredentials {
+    credentials: Value,
+    legacy: Aes256Gcm,
+    /// The `enc:v2` cipher and the fingerprint its key must match.
+    v2: Option<(Aes256Gcm, String)>,
+}
+
+impl ZcodeCredentials {
+    fn open(
+        credentials: Value,
+        credentials_path: &Path,
+        home: &Path,
+        platform: &str,
+        os_key: &ZcodeOsKey<'_>,
+        managed_secret: Option<&str>,
+    ) -> Result<Self, LimitFetchError> {
+        let secret = format!(
+            "zcode-credential-fallback:{}:{}:{}",
+            zcode_node_platform(platform),
+            home.display(),
+            zcode_username(),
+        );
+        let Ok(legacy) = Aes256Gcm::new_from_slice(&Sha256::digest(secret.as_bytes())) else {
+            return Err(LimitFetchError::transient(
+                "ZCode credential cipher could not be initialized.",
+            ));
+        };
+        let v2 = match credentials
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(_, value)| value.as_str())
+            .find_map(zcode_v2_envelope)
+        {
+            Some((source, fingerprint, _)) => {
+                let key = match source {
+                    "os" => zcode_os_key_for(credentials_path, fingerprint, os_key),
+                    "env" => managed_secret
+                        .map(|secret| Sha256::digest(secret.as_bytes()).to_vec())
+                        .ok_or_else(|| {
+                            "ZCode credentials are sealed with a managed secret".to_string()
+                        }),
+                    _ => Err(format!(
+                        "ZCode credentials are sealed with an unsupported key source ({source})"
+                    )),
+                };
+                let key = key.map_err(LimitFetchError::transient)?;
+                if key.len() != 32 || zcode_key_fingerprint(&key) != fingerprint {
+                    return Err(LimitFetchError::transient(
+                        "ZCode credentials were sealed with a key LLMeter cannot read.",
+                    ));
+                }
+                let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| {
+                    LimitFetchError::transient("ZCode credential cipher could not be initialized.")
+                })?;
+                Some((cipher, fingerprint.to_string()))
+            }
+            None => None,
+        };
+        Ok(Self {
+            credentials,
+            legacy,
+            v2,
+        })
+    }
+
+    fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.credentials
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(name, value)| Some((name.as_str(), value.as_str()?)))
+    }
+
+    fn get(&self, name: &str) -> Result<Option<String>, String> {
+        let Some(value) = self.credentials.get(name).and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        Ok(Some(self.decrypt(value)?).filter(|value| !value.is_empty()))
+    }
+
+    fn decrypt(&self, value: &str) -> Result<String, String> {
+        match zcode_v2_envelope(value) {
+            Some((_, fingerprint, payload)) => {
+                let (cipher, expected) = self
+                    .v2
+                    .as_ref()
+                    .ok_or_else(|| "value is sealed with an unknown key".to_string())?;
+                if fingerprint != expected.as_str() {
+                    return Err("value was encrypted with a different key".into());
+                }
+                decrypt_zcode_envelope(cipher, payload)
+            }
+            None if value.starts_with("enc:") => decrypt_zcode_credential(&self.legacy, value),
+            None => Ok(value.to_string()),
+        }
+    }
+
+    /// The API key of the first coding-plan sign-in that decrypts, as stored
+    /// by ZCode 3 and earlier. Falls through with the decryption error when
+    /// every candidate fails.
+    fn coding_plan_api_key(&self) -> Result<Option<String>, String> {
+        let mut decrypt_error = None;
+        for (name, value) in self.entries() {
+            if !name.starts_with("account-provider:coding-plan:") || !name.ends_with(":api-key") {
+                continue;
+            }
+            if !value.starts_with("enc:") {
+                continue;
+            }
+            match self.decrypt(value) {
+                Ok(key) if !key.is_empty() => return Ok(Some(key)),
+                Ok(_) => {}
+                Err(error) => decrypt_error = Some(error),
+            }
+        }
+        match decrypt_error {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
+    }
+
+    /// The OAuth login token of the account family `oauth:active_provider`
+    /// names, with the usage endpoint that serves it. Without an active
+    /// provider, the first family that has a token wins.
+    fn oauth_access_token(&self) -> Result<Option<(&'static str, String)>, String> {
+        let active = self.get("oauth:active_provider")?;
+        for (family, usage_url) in ZCODE_USAGE_URLS {
+            if active.as_deref().is_some_and(|active| active != family) {
+                continue;
+            }
+            if let Some(token) = self.get(&format!("oauth:{family}:access_token"))? {
+                return Ok(Some((usage_url, token)));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Splits `enc:v2:<source>:<key fingerprint>:<payload>` into its parts.
+fn zcode_v2_envelope(value: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = value.strip_prefix("enc:v2:")?.splitn(3, ':');
+    let source = parts.next()?;
+    let fingerprint = parts.next()?;
+    let payload = parts.next()?;
+    (fingerprint.len() == 24 && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some((source, fingerprint, payload))
+}
+
+/// ZCode files the keychain item under the SHA-256 of the credentials path
+/// and stamps every envelope with the first 24 hex digits of the key's hash.
+fn zcode_keychain_account(credentials_path: &Path) -> String {
+    hex(&Sha256::digest(
+        credentials_path.to_string_lossy().as_bytes(),
+    ))
+}
+
+fn zcode_key_fingerprint(key: &[u8]) -> String {
+    hex(&Sha256::digest(key))[..24].to_string()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .iter()
+        .flat_map(|byte| {
+            [
+                DIGITS[(byte >> 4) as usize] as char,
+                DIGITS[(byte & 0xf) as usize] as char,
+            ]
+        })
+        .collect()
+}
+
+/// The keys ZCode's keychain items held when the user last consented to a
+/// read, by credentials file. Every fresh read makes macOS ask again unless
+/// the user chose "Always Allow", so they are kept for the life of the
+/// process.
+static ZCODE_OS_KEYS: std::sync::Mutex<Vec<(String, [u8; 32])>> = std::sync::Mutex::new(Vec::new());
+
+/// The key behind an `enc:v2:os` envelope: the one already read in this
+/// process while its fingerprint still matches, otherwise a fresh keychain
+/// read.
+fn zcode_os_key_for(
+    credentials_path: &Path,
+    fingerprint: &str,
+    os_key: &ZcodeOsKey<'_>,
+) -> Result<Vec<u8>, String> {
+    let account = zcode_keychain_account(credentials_path);
+    if let Ok(cache) = ZCODE_OS_KEYS.lock()
+        && let Some((_, key)) = cache.iter().find(|(cached, _)| cached == &account)
+        && zcode_key_fingerprint(key) == fingerprint
+    {
+        return Ok(key.to_vec());
+    }
+    // The keychain holds the base64url text of the key.
+    let key = os_key(ZCODE_KEYCHAIN_SERVICE, &account).and_then(|key| {
+        let key = String::from_utf8_lossy(&key);
+        let key = key.trim();
+        URL_SAFE_NO_PAD
+            .decode(key)
+            .or_else(|_| URL_SAFE.decode(key))
+            .map_err(|_| "ZCode's keychain entry has an unexpected format".to_string())
+    })?;
+    let decoded: [u8; 32] = key
+        .clone()
+        .try_into()
+        .map_err(|_| "ZCode's keychain entry has an unexpected format".to_string())?;
+    // Only a key that opens the envelope is worth remembering.
+    if let Ok(mut cache) = ZCODE_OS_KEYS.lock()
+        && zcode_key_fingerprint(&decoded) == fingerprint
+    {
+        cache.retain(|(cached, _)| cached != &account);
+        cache.push((account, decoded));
+    }
+    Ok(key)
+}
+
+/// Reads a generic keychain item's password. The first read of another app's
+/// item makes macOS ask the user for permission.
+#[cfg(target_os = "macos")]
+fn zcode_os_key(service: &str, account: &str) -> Result<Vec<u8>, String> {
+    security_framework::passwords::get_generic_password(service, account).map_err(|error| {
+        if error.code() == -25300 {
+            // errSecItemNotFound
+            "ZCode's credential key is missing from the Keychain. Sign in again in ZCode."
+                .to_string()
+        } else {
+            format!(
+                "ZCode's credential key could not be read from the Keychain ({error}); \
+                 allow LLMeter when macOS asks, then refresh."
+            )
+        }
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn zcode_os_key(_service: &str, _account: &str) -> Result<Vec<u8>, String> {
+    Err("ZCode's credential key is only reachable through the macOS Keychain.".into())
+}
+
+/// ZCode's managed secret for `enc:v2:env:` envelopes: the
+/// `ZCODE_CREDENTIAL_SECRET` variable, or the file named by
+/// `ZCODE_CREDENTIAL_SECRET_FILE`.
+fn zcode_managed_secret() -> Option<String> {
+    if let Some(secret) = std::env::var_os("ZCODE_CREDENTIAL_SECRET") {
+        return Some(secret.to_string_lossy().into_owned());
+    }
+    let path = std::env::var_os("ZCODE_CREDENTIAL_SECRET_FILE")?;
+    let secret = fs::read_to_string(path).ok()?;
+    (32..=4096).contains(&secret.len()).then_some(secret)
 }
 
 fn ready_limits(
@@ -2115,26 +2387,23 @@ mod tests {
         let home = std::env::home_dir().unwrap_or_else(std::env::temp_dir);
         let credentials_path = home.join(".zcode").join("v2").join("credentials.json");
         let credentials = read_json_file(&credentials_path).expect("credentials.json");
-        let secret = format!(
-            "zcode-credential-fallback:{}:{}:{}",
-            zcode_node_platform(std::env::consts::OS),
-            home.display(),
-            zcode_username(),
-        );
-        let cipher = Aes256Gcm::new_from_slice(&Sha256::digest(secret.as_bytes())).expect("cipher");
-        let mut api_key = None;
-        for (name, value) in credentials.as_object().into_iter().flatten() {
-            if !name.starts_with("account-provider:coding-plan:") || !name.ends_with(":api-key") {
-                continue;
-            }
-            if let Some(value) = value.as_str()
-                && let Ok(key) = decrypt_zcode_credential(&cipher, value)
-            {
-                api_key = Some(key);
-                break;
-            }
-        }
-        let api_key = api_key.expect("no coding-plan api key");
+        let store = ZcodeCredentials::open(
+            credentials,
+            &credentials_path,
+            &home,
+            std::env::consts::OS,
+            &zcode_os_key,
+            zcode_managed_secret().as_deref(),
+        )
+        .expect("credential store");
+        let authorization = match store.coding_plan_api_key().expect("api key") {
+            Some(api_key) => format!("Bearer {api_key}"),
+            None => store
+                .oauth_access_token()
+                .expect("login token")
+                .map(|(_, token)| format!("Bearer {token}"))
+                .expect("no coding-plan api key or login token"),
+        };
         let agent = ureq::Agent::new_with_config(
             ureq::Agent::config_builder()
                 .timeout_global(Some(std::time::Duration::from_secs(15)))
@@ -2144,7 +2413,7 @@ mod tests {
         let get = |url: &str| -> Option<String> {
             let mut response = agent
                 .get(url)
-                .header("Authorization", &format!("Bearer {api_key}"))
+                .header("Authorization", &authorization)
                 .header("Accept", "application/json")
                 .call()
                 .ok()?;
@@ -2171,13 +2440,7 @@ mod tests {
         // zcode.z.ai coding-plan reset status (TokenTracker's approach):
         // zcodejwttoken in Authorization, oauth access_token in
         // X-Bigmodel-Authorization.
-        let load = |name: &str| -> Option<String> {
-            credentials
-                .get(name)
-                .and_then(Value::as_str)
-                .and_then(|value| decrypt_zcode_credential(&cipher, value).ok())
-                .filter(|value| !value.is_empty())
-        };
+        let load = |name: &str| store.get(name).ok().flatten();
         let zcode_token = load("zcodejwttoken");
         let plan_token = load("oauth:bigmodel:access_token");
         if let (Some(zcode_token), Some(plan_token)) = (zcode_token, plan_token) {
@@ -2495,6 +2758,489 @@ mod tests {
             "test-api-key"
         );
         assert!(decrypt_zcode_credential(&cipher, "enc:v1:a.b.c").is_err());
+    }
+
+    /// Seals `plaintext` as an `enc:v2:<source>` envelope, the way ZCode 4
+    /// does, with a fixed nonce.
+    fn seal_zcode_v2(source: &str, key: &[u8], plaintext: &str) -> String {
+        let cipher = Aes256Gcm::new_from_slice(key).unwrap();
+        format!(
+            "enc:v2:{source}:{}:{}",
+            zcode_key_fingerprint(key),
+            seal_zcode_payload(&cipher, plaintext)
+        )
+    }
+
+    fn seal_zcode_v1(cipher: &Aes256Gcm, plaintext: &str) -> String {
+        format!("enc:v1:{}", seal_zcode_payload(cipher, plaintext))
+    }
+
+    /// The `iv.tag.ciphertext` payload shared by both envelope versions.
+    fn seal_zcode_payload(cipher: &Aes256Gcm, plaintext: &str) -> String {
+        let iv = [7_u8; 12];
+        // aes-gcm's encrypt returns ciphertext||tag; ZCode stores them apart.
+        let encrypted = cipher
+            .encrypt(&Nonce::from(iv), plaintext.as_bytes())
+            .unwrap();
+        let split = encrypted.len() - 16;
+        let encode = |bytes: &[u8]| URL_SAFE_NO_PAD.encode(bytes);
+        format!(
+            "{}.{}.{}",
+            encode(&iv),
+            encode(&encrypted[split..]),
+            encode(&encrypted[..split])
+        )
+    }
+
+    /// A throwaway home directory holding sealed ZCode credentials.
+    fn zcode_test_home(credentials: &Value) -> PathBuf {
+        let home = std::env::temp_dir().join(format!("llmeter-zcode-{}", uuid::Uuid::new_v4()));
+        let v2 = home.join(".zcode").join("v2");
+        std::fs::create_dir_all(&v2).unwrap();
+        std::fs::write(v2.join("credentials.json"), credentials.to_string()).unwrap();
+        home
+    }
+
+    /// A recorded request: its URL and the headers it was sent with.
+    type RecordedRequest = (String, Vec<(String, String)>);
+
+    /// Answers GETs from a URL prefix table and records every request.
+    #[derive(Default)]
+    struct FakeLimitHttp {
+        responses: Vec<(&'static str, Value)>,
+        requests: std::sync::Mutex<Vec<RecordedRequest>>,
+    }
+
+    impl LimitHttpClient for FakeLimitHttp {
+        fn get_json(&self, url: &str, headers: &[(&str, &str)]) -> Result<Value, HttpFailure> {
+            self.requests.lock().unwrap().push((
+                url.to_string(),
+                headers
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .collect(),
+            ));
+            self.responses
+                .iter()
+                .find(|(prefix, _)| url.starts_with(prefix))
+                .map(|(_, body)| body.clone())
+                .ok_or(HttpFailure {
+                    status: Some(404),
+                    message: "HTTP 404".into(),
+                })
+        }
+
+        fn post_json(
+            &self,
+            url: &str,
+            _headers: &[(&str, &str)],
+            _body: &Value,
+        ) -> Result<Value, HttpFailure> {
+            panic!("unexpected POST {url}")
+        }
+
+        fn post_form(
+            &self,
+            url: &str,
+            _headers: &[(&str, &str)],
+            _form: &[(&str, &str)],
+        ) -> Result<Value, HttpFailure> {
+            panic!("unexpected POST {url}")
+        }
+    }
+
+    fn zcode_usage_body() -> Value {
+        json!({
+            "code": 200,
+            "msg": "ok",
+            "data": {
+                "limits": [
+                    {
+                        "type": "TIME_LIMIT",
+                        "unit": 5,
+                        "number": 1,
+                        "usage": 100,
+                        "currentValue": 52,
+                        "percentage": 52,
+                        "nextResetTime": 1_797_046_286_982_i64
+                    },
+                    {
+                        "type": "TOKENS_LIMIT",
+                        "unit": 3,
+                        "number": 5,
+                        "percentage": 12,
+                        "nextResetTime": 1_795_811_722_181_i64
+                    }
+                ],
+                "level": "lite"
+            },
+            "success": true
+        })
+    }
+
+    fn zcode_reset_body() -> Value {
+        let expires_at = (Utc::now() + chrono::Duration::days(12)).timestamp_millis();
+        json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "available_five_hour_resets": [{"expire_at": expires_at}, {"expire_at": expires_at}],
+                "available_week_resets": []
+            }
+        })
+    }
+
+    fn request_header(requests: &[RecordedRequest], index: usize, name: &str) -> Option<String> {
+        requests[index]
+            .1
+            .iter()
+            .find(|(header, _)| header == name)
+            .map(|(_, value)| value.clone())
+    }
+
+    #[test]
+    fn zcode_keychain_account_hashes_the_credentials_path() {
+        assert_eq!(
+            zcode_keychain_account(Path::new("/Users/test/.zcode/v2/credentials.json")),
+            "54f90a1483536ef8fe9454fea4e9e18b13011a809c69486e35ddc0e1af26dd2e"
+        );
+    }
+
+    #[test]
+    fn zcode_credentials_decrypt_plain_legacy_and_v2_entries() {
+        let home = Path::new("/Users/test");
+        // The legacy key is derived from the machine identity the fetch sees.
+        let secret = format!(
+            "zcode-credential-fallback:darwin:{}:{}",
+            home.display(),
+            zcode_username()
+        );
+        let legacy = Aes256Gcm::new_from_slice(&Sha256::digest(secret.as_bytes())).unwrap();
+        let key = [3_u8; 32];
+        let store = ZcodeCredentials::open(
+            json!({
+                "plain": "as-is",
+                "legacy": seal_zcode_v1(&legacy, "v1-secret"),
+                "current": seal_zcode_v2("os", &key, "v2-secret")
+            }),
+            Path::new("/Users/test/.zcode/v2/credentials.json"),
+            home,
+            "macos",
+            &|_, _| Ok(URL_SAFE_NO_PAD.encode(key).into_bytes()),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(store.get("plain").unwrap().as_deref(), Some("as-is"));
+        assert_eq!(store.get("legacy").unwrap().as_deref(), Some("v1-secret"));
+        assert_eq!(store.get("current").unwrap().as_deref(), Some("v2-secret"));
+        assert_eq!(store.get("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn fetches_zcode_quota_with_the_oauth_login_token() {
+        let key = [3_u8; 32];
+        let home = zcode_test_home(&json!({
+            "oauth:active_provider": seal_zcode_v2("os", &key, "bigmodel"),
+            "oauth:bigmodel:access_token": seal_zcode_v2("os", &key, "login-token"),
+            "zcodejwttoken": seal_zcode_v2("os", &key, "zcode-jwt")
+        }));
+        let http = FakeLimitHttp {
+            responses: vec![
+                (ZCODE_BIGMODEL_USAGE_URL, zcode_usage_body()),
+                (ZCODE_RESET_STATUS_URL, zcode_reset_body()),
+            ],
+            ..Default::default()
+        };
+        let credentials_path = home.join(".zcode").join("v2").join("credentials.json");
+
+        let fetch = fetch_zcode_from(
+            &home.join(".zcode"),
+            &home,
+            "macos",
+            &http,
+            &|service, account| {
+                assert_eq!(service, ZCODE_KEYCHAIN_SERVICE);
+                assert_eq!(account, &zcode_keychain_account(&credentials_path));
+                Ok(URL_SAFE_NO_PAD.encode(key).into_bytes())
+            },
+            None,
+        );
+
+        let limits = match fetch {
+            ProviderFetch::Ready(limits) => limits,
+            ProviderFetch::NotConfigured => panic!("ZCode reported as not configured"),
+            ProviderFetch::Failed(error) => panic!("ZCode fetch failed: {}", error.message),
+        };
+        assert_eq!(
+            limits
+                .windows
+                .iter()
+                .map(|window| window.key.as_str())
+                .collect::<Vec<_>>(),
+            ["zcode_mcp_credits", "five_hour"]
+        );
+        assert_eq!(limits.plan.as_deref(), Some("Lite"));
+        assert_eq!(limits.reset_cards.len(), 2);
+        let requests = http.requests.lock().unwrap();
+        assert_eq!(requests[0].0, ZCODE_BIGMODEL_USAGE_URL);
+        assert_eq!(
+            request_header(&requests, 0, "Authorization").as_deref(),
+            Some("Bearer login-token")
+        );
+        assert_eq!(
+            request_header(&requests, 1, "Authorization").as_deref(),
+            Some("Bearer zcode-jwt")
+        );
+        assert_eq!(
+            request_header(&requests, 1, "X-Bigmodel-Authorization").as_deref(),
+            Some("login-token")
+        );
+        drop(requests);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn zcode_active_provider_selects_the_quota_endpoint() {
+        let key = [3_u8; 32];
+        let home = zcode_test_home(&json!({
+            "oauth:active_provider": seal_zcode_v2("os", &key, "zai"),
+            "oauth:bigmodel:access_token": seal_zcode_v2("os", &key, "bigmodel-token"),
+            "oauth:zai:access_token": seal_zcode_v2("os", &key, "zai-token")
+        }));
+        let http = FakeLimitHttp {
+            responses: vec![(ZCODE_ZAI_USAGE_URL, zcode_usage_body())],
+            ..Default::default()
+        };
+
+        let fetch = fetch_zcode_from(
+            &home.join(".zcode"),
+            &home,
+            "macos",
+            &http,
+            &|_, _| Ok(URL_SAFE_NO_PAD.encode(key).into_bytes()),
+            None,
+        );
+
+        assert!(matches!(fetch, ProviderFetch::Ready(_)));
+        let requests = http.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, ZCODE_ZAI_USAGE_URL);
+        assert_eq!(
+            request_header(&requests, 0, "Authorization").as_deref(),
+            Some("Bearer zai-token")
+        );
+        drop(requests);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn fetches_zcode_quota_with_the_legacy_api_key() {
+        let home = zcode_test_home(&json!({}));
+        // The legacy key is derived from the machine identity the fetch sees.
+        let secret = format!(
+            "zcode-credential-fallback:darwin:{}:{}",
+            home.display(),
+            zcode_username()
+        );
+        let legacy = Aes256Gcm::new_from_slice(&Sha256::digest(secret.as_bytes())).unwrap();
+        std::fs::write(
+            home.join(".zcode").join("v2").join("credentials.json"),
+            json!({
+                "account-provider:coding-plan:acct:api-key": seal_zcode_v1(&legacy, "legacy-api-key")
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let http = FakeLimitHttp {
+            responses: vec![(ZCODE_BIGMODEL_USAGE_URL, zcode_usage_body())],
+            ..Default::default()
+        };
+
+        let fetch = fetch_zcode_from(
+            &home.join(".zcode"),
+            &home,
+            "macos",
+            &http,
+            &|_, _| panic!("legacy credentials never reach the keychain"),
+            None,
+        );
+
+        assert!(matches!(fetch, ProviderFetch::Ready(_)));
+        let requests = http.requests.lock().unwrap();
+        assert_eq!(requests[0].0, ZCODE_BIGMODEL_USAGE_URL);
+        assert_eq!(
+            request_header(&requests, 0, "Authorization").as_deref(),
+            Some("Bearer legacy-api-key")
+        );
+        drop(requests);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn zcode_without_sign_in_is_not_configured() {
+        let key = [3_u8; 32];
+        let home =
+            zcode_test_home(&json!({"zcodejwttoken": seal_zcode_v2("os", &key, "zcode-jwt")}));
+        let http = FakeLimitHttp::default();
+
+        let fetch = fetch_zcode_from(
+            &home.join(".zcode"),
+            &home,
+            "macos",
+            &http,
+            &|_, _| Ok(URL_SAFE_NO_PAD.encode(key).into_bytes()),
+            None,
+        );
+
+        assert!(matches!(fetch, ProviderFetch::NotConfigured));
+        assert!(http.requests.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn zcode_keychain_denial_is_a_transient_failure() {
+        let key = [3_u8; 32];
+        let home = zcode_test_home(&json!({
+            "oauth:bigmodel:access_token": seal_zcode_v2("os", &key, "login-token")
+        }));
+        let http = FakeLimitHttp::default();
+
+        let fetch = fetch_zcode_from(
+            &home.join(".zcode"),
+            &home,
+            "macos",
+            &http,
+            &|_, _| Err("keychain locked".to_string()),
+            None,
+        );
+
+        match fetch {
+            ProviderFetch::Failed(error) => {
+                // Transient, so a cached card stays visible with the reason.
+                assert!(error.transient);
+                assert!(
+                    error.message.contains("keychain locked"),
+                    "{}",
+                    error.message
+                );
+            }
+            ProviderFetch::Ready(_) => panic!("quota fetched without the credential key"),
+            ProviderFetch::NotConfigured => panic!("a locked keychain is not a missing sign-in"),
+        }
+        assert!(http.requests.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn zcode_v2_key_must_match_the_envelope_fingerprint() {
+        let home = zcode_test_home(&json!({
+            "oauth:bigmodel:access_token": seal_zcode_v2("os", &[3_u8; 32], "login-token")
+        }));
+        let http = FakeLimitHttp::default();
+
+        let fetch = fetch_zcode_from(
+            &home.join(".zcode"),
+            &home,
+            "macos",
+            &http,
+            &|_, _| Ok(URL_SAFE_NO_PAD.encode([4_u8; 32]).into_bytes()),
+            None,
+        );
+
+        match fetch {
+            ProviderFetch::Failed(error) => {
+                assert!(error.transient);
+                assert!(error.message.contains("cannot read"), "{}", error.message);
+            }
+            ProviderFetch::Ready(_) => panic!("a different key opened the envelope"),
+            ProviderFetch::NotConfigured => panic!("an unreadable key is not a missing sign-in"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn zcode_env_sealed_credentials_use_the_managed_secret() {
+        let secret = "0123456789abcdef0123456789abcdef";
+        let key = Sha256::digest(secret.as_bytes()).to_vec();
+        let home = zcode_test_home(&json!({
+            "oauth:bigmodel:access_token": seal_zcode_v2("env", &key, "login-token")
+        }));
+        let http = FakeLimitHttp {
+            responses: vec![(ZCODE_BIGMODEL_USAGE_URL, zcode_usage_body())],
+            ..Default::default()
+        };
+        let keychain = |_: &str, _: &str| -> Result<Vec<u8>, String> {
+            panic!("env-sealed credentials never reach the keychain")
+        };
+
+        // Without the secret there is nothing to open the envelope with.
+        let fetch = fetch_zcode_from(&home.join(".zcode"), &home, "macos", &http, &keychain, None);
+        assert!(matches!(fetch, ProviderFetch::Failed(_)));
+        assert!(http.requests.lock().unwrap().is_empty());
+
+        let fetch = fetch_zcode_from(
+            &home.join(".zcode"),
+            &home,
+            "macos",
+            &http,
+            &keychain,
+            Some(secret),
+        );
+
+        assert!(matches!(fetch, ProviderFetch::Ready(_)));
+        let requests = http.requests.lock().unwrap();
+        assert_eq!(
+            request_header(&requests, 0, "Authorization").as_deref(),
+            Some("Bearer login-token")
+        );
+        drop(requests);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn zcode_keychain_key_is_read_once_per_credentials_key() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let first = [3_u8; 32];
+        let home = zcode_test_home(&json!({
+            "oauth:bigmodel:access_token": seal_zcode_v2("os", &first, "login-token")
+        }));
+        let credentials_path = home.join(".zcode").join("v2").join("credentials.json");
+        let http = FakeLimitHttp {
+            responses: vec![(ZCODE_BIGMODEL_USAGE_URL, zcode_usage_body())],
+            ..Default::default()
+        };
+        let reads = AtomicUsize::new(0);
+        let keychain_item = std::cell::Cell::new(first);
+        let keychain = |_: &str, _: &str| -> Result<Vec<u8>, String> {
+            reads.fetch_add(1, Ordering::SeqCst);
+            Ok(URL_SAFE_NO_PAD.encode(keychain_item.get()).into_bytes())
+        };
+
+        // One consent covers every later refresh of the process.
+        for _ in 0..2 {
+            let fetch =
+                fetch_zcode_from(&home.join(".zcode"), &home, "macos", &http, &keychain, None);
+
+            assert!(matches!(fetch, ProviderFetch::Ready(_)));
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+
+        // Until ZCode seals its credentials with a rotated key.
+        let next = [4_u8; 32];
+        keychain_item.set(next);
+        std::fs::write(
+            &credentials_path,
+            json!({"oauth:bigmodel:access_token": seal_zcode_v2("os", &next, "login-token")})
+                .to_string(),
+        )
+        .unwrap();
+        let fetch = fetch_zcode_from(&home.join(".zcode"), &home, "macos", &http, &keychain, None);
+
+        assert!(matches!(fetch, ProviderFetch::Ready(_)));
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
