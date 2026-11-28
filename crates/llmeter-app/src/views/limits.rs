@@ -27,30 +27,38 @@ const LIMIT_PROVIDERS: [Provider; 8] = [
 /// blank instead of flashing "pending" cards that later turn out to be
 /// unconfigured or unavailable: entries without windows (missing sign-in
 /// state, failed checks) and not-yet-checked providers stay hidden until a
-/// refresh delivers real data. Cached windows — including stale cache with an
-/// error footer — render immediately on open.
+/// refresh delivers real data. Cached windows render immediately. ZCode can
+/// also show a card with no quota windows when the user needs to connect it.
 fn visible_limit_providers(
     limits: &llmeter_core::LimitsSnapshot,
 ) -> impl Iterator<Item = Provider> + '_ {
     LIMIT_PROVIDERS.into_iter().filter(move |provider| {
         limits
             .provider(*provider)
-            .is_some_and(|item| !item.windows.is_empty())
+            .is_some_and(|item| !item.windows.is_empty() || needs_zcode_connection(item))
     })
+}
+
+fn needs_zcode_connection(limits: &ProviderLimits) -> bool {
+    limits.provider == Provider::ZCode && limits.authorization_required
 }
 
 pub(crate) fn limits_page(view: &LLMeterView, cx: &mut Context<LLMeterView>) -> impl IntoElement {
     let p = Palette::from_app(cx);
     let visible = visible_limit_providers(&view.limits).collect::<Vec<_>>();
     let all_hidden = visible.is_empty();
-    let cards = visible.into_iter().map(|provider| {
-        provider_card(
-            provider,
-            view.limits.provider(provider),
-            view.limits_refreshing,
-            p,
-        )
-    });
+    let cards = visible
+        .into_iter()
+        .map(|provider| {
+            provider_card(
+                provider,
+                view.limits.provider(provider),
+                view.limits_refreshing,
+                p,
+                cx,
+            )
+        })
+        .collect::<Vec<_>>();
     let refresh_label = if view.limits_refreshing {
         t!("limits.refreshing").to_string()
     } else {
@@ -130,6 +138,7 @@ fn provider_card(
     limits: Option<&ProviderLimits>,
     refreshing: bool,
     p: Palette,
+    cx: &mut Context<LLMeterView>,
 ) -> AnyElement {
     let has_windows = limits.is_some_and(|item| !item.windows.is_empty());
     let mut rows = v_flex()
@@ -145,7 +154,30 @@ fn provider_card(
             rows = rows.child(reset_block(&cards, p, Utc::now()));
         }
     }
-    if !has_windows {
+    let needs_connection = limits.is_some_and(needs_zcode_connection);
+    if needs_connection {
+        rows = rows.child(
+            v_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(p.muted_foreground)
+                        .child(t!("limits.zcode_connect_hint")),
+                )
+                .child(
+                    h_flex()
+                        .debug_selector(|| "connect-zcode".to_string())
+                        .child(
+                            Button::new("connect-zcode")
+                                .outline()
+                                .label(t!("limits.zcode_connect"))
+                                .disabled(refreshing)
+                                .on_click(cx.listener(|view, _, _, cx| view.connect_zcode(cx))),
+                        ),
+                ),
+        );
+    } else if !has_windows {
         rows = rows.child(
             div()
                 .text_sm()
@@ -240,7 +272,9 @@ fn provider_card(
             )
         })
         .when_some(
-            limits.and_then(|item| item.last_error.clone().or_else(|| item.error.clone())),
+            limits
+                .filter(|_| !needs_connection)
+                .and_then(|item| item.last_error.clone().or_else(|| item.error.clone())),
             |this, error| {
                 this.child(div().pt_2().text_xs().text_color(p.warning).child(
                     if limits.is_some_and(|item| item.stale) {
@@ -469,11 +503,15 @@ fn status_style(
             p.muted_foreground,
             p.muted,
         ),
-        Some(item) if !item.configured => (
-            t!("limits.not_connected").to_string(),
-            p.muted_foreground,
-            p.muted,
-        ),
+        Some(item)
+            if !item.configured || (needs_zcode_connection(item) && item.windows.is_empty()) =>
+        {
+            (
+                t!("limits.not_connected").to_string(),
+                p.muted_foreground,
+                p.muted,
+            )
+        }
         Some(item) if item.stale => (
             t!("limits.cached").to_string(),
             p.warning,

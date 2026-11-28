@@ -1,4 +1,6 @@
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -103,8 +105,14 @@ impl LimitCollector {
                 let qoder =
                     scope.spawn(|| fetch_qoder(&self.home, &self.platform, self.http.as_ref()));
                 let trae = scope.spawn(|| fetch_trae(&self.home, &self.platform));
-                let zcode =
-                    scope.spawn(|| fetch_zcode(&self.home, &self.platform, self.http.as_ref()));
+                let zcode = scope.spawn(|| {
+                    fetch_zcode(
+                        &self.home,
+                        &self.platform,
+                        self.http.as_ref(),
+                        ZcodeKeychainAccess::Silent,
+                    )
+                });
                 let antigravity = scope.spawn(|| fetch_antigravity(&self.home, self.http.as_ref()));
                 (
                     claude.join().unwrap_or_else(|_| {
@@ -154,6 +162,18 @@ impl LimitCollector {
         }
     }
 
+    /// Only call in response to the user's explicit ZCode connection action.
+    pub fn connect_zcode(&self) -> ProviderLimits {
+        let now = Utc::now();
+        let result = fetch_zcode(
+            &self.home,
+            &self.platform,
+            self.http.as_ref(),
+            ZcodeKeychainAccess::Interactive,
+        );
+        self.finish(Provider::ZCode, result, now)
+    }
+
     fn finish(
         &self,
         provider: Provider,
@@ -177,11 +197,14 @@ impl LimitCollector {
             ProviderFetch::Failed(error) => {
                 if error.transient
                     && let Ok(Some(cached)) = self.repository.load(provider)
-                    && let Some(stale) = cached.as_stale(error.message.clone(), now)
+                    && let Some(mut stale) = cached.as_stale(error.message.clone(), now)
                 {
+                    stale.authorization_required = error.authorization_required;
                     return stale;
                 }
-                ProviderLimits::failed(provider, now, error.message)
+                let mut limits = ProviderLimits::failed(provider, now, error.message);
+                limits.authorization_required = error.authorization_required;
+                limits
             }
         }
     }
@@ -199,10 +222,11 @@ impl ProviderFetch {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct LimitFetchError {
     message: String,
     transient: bool,
+    authorization_required: bool,
 }
 
 impl LimitFetchError {
@@ -210,6 +234,7 @@ impl LimitFetchError {
         Self {
             message: message.into(),
             transient: false,
+            authorization_required: false,
         }
     }
 
@@ -217,6 +242,15 @@ impl LimitFetchError {
         Self {
             message: message.into(),
             transient: true,
+            authorization_required: false,
+        }
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn zcode_authorization_required() -> Self {
+        Self {
+            authorization_required: true,
+            ..Self::transient("LLMeter needs permission to read the ZCode credential key.")
         }
     }
 }
@@ -1772,10 +1806,21 @@ fn grok_period_key(current: Option<&Value>, config: &Value) -> &'static str {
     "monthly"
 }
 
-/// Reads a generic keychain item's password given its service and account.
-type ZcodeOsKey<'a> = dyn Fn(&str, &str) -> Result<Vec<u8>, String> + 'a;
+#[derive(Clone, Copy)]
+enum ZcodeKeychainAccess {
+    Silent,
+    Interactive,
+}
 
-fn fetch_zcode(home: &Path, platform: &str, http: &dyn LimitHttpClient) -> ProviderFetch {
+/// Reads a generic keychain item's password given its service and account.
+type ZcodeOsKey<'a> = dyn Fn(&str, &str) -> Result<Vec<u8>, LimitFetchError> + 'a;
+
+fn fetch_zcode(
+    home: &Path,
+    platform: &str,
+    http: &dyn LimitHttpClient,
+    access: ZcodeKeychainAccess,
+) -> ProviderFetch {
     let zcode_home = std::env::var_os("ZCODE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".zcode"));
@@ -1784,7 +1829,7 @@ fn fetch_zcode(home: &Path, platform: &str, http: &dyn LimitHttpClient) -> Provi
         home,
         platform,
         http,
-        &zcode_os_key,
+        &|service, account| zcode_os_key(service, account, access),
         zcode_managed_secret().as_deref(),
     )
 }
@@ -1815,7 +1860,7 @@ fn fetch_zcode_from(
     // ZCode 3 and earlier kept the BigModel API key of each coding-plan
     // sign-in in an `account-provider:coding-plan:...:api-key` entry; ZCode 4
     // signs usage requests with the OAuth login token instead.
-    let authorization: Result<Option<(&str, String)>, String> = match store.coding_plan_api_key() {
+    let authorization = match store.coding_plan_api_key() {
         Ok(Some(api_key)) => Ok(Some((
             ZCODE_BIGMODEL_USAGE_URL,
             format!("Bearer {api_key}"),
@@ -1830,11 +1875,7 @@ fn fetch_zcode_from(
     let (usage_url, authorization) = match authorization {
         Ok(Some(authorization)) => authorization,
         Ok(None) => return ProviderFetch::NotConfigured,
-        Err(error) => {
-            return ProviderFetch::Failed(LimitFetchError::auth(format!(
-                "ZCode credentials could not be decrypted: {error}. Sign in again in ZCode."
-            )));
-        }
+        Err(error) => return ProviderFetch::Failed(error),
     };
     let body = match http.get_json(
         usage_url,
@@ -1872,7 +1913,7 @@ fn fetch_zcode_from(
 /// token; a missing token or request failure degrades to an empty card list
 /// without failing the usage fetch.
 fn zcode_reset_cards(
-    credentials: &ZcodeCredentials,
+    credentials: &ZcodeCredentials<'_>,
     http: &dyn LimitHttpClient,
     now: DateTime<Utc>,
 ) -> Option<Vec<ResetCredit>> {
@@ -2050,26 +2091,31 @@ fn zcode_username() -> String {
         })
 }
 
+type ZcodeCipherCache = HashMap<(String, String), Result<Aes256Gcm, LimitFetchError>>;
+
 /// Decrypts the entries of ZCode's `v2/credentials.json`. Values are plain,
 /// `enc:v1:` envelopes sealed with a key derived from the machine identity,
 /// or — since ZCode 4 — `enc:v2:<source>:<fingerprint>:…` envelopes sealed
 /// with a random key that lives in the OS keychain (`os` source) or is the
 /// SHA-256 of a managed secret (`env` source).
-struct ZcodeCredentials {
+struct ZcodeCredentials<'a> {
     credentials: Value,
+    credentials_path: &'a Path,
     legacy: Aes256Gcm,
-    /// The `enc:v2` cipher and the fingerprint its key must match.
-    v2: Option<(Aes256Gcm, String)>,
+    os_key: &'a ZcodeOsKey<'a>,
+    managed_secret: Option<&'a str>,
+    /// Resolve only the keys needed by this fetch, and memoize failures too.
+    v2: RefCell<ZcodeCipherCache>,
 }
 
-impl ZcodeCredentials {
+impl<'a> ZcodeCredentials<'a> {
     fn open(
         credentials: Value,
-        credentials_path: &Path,
+        credentials_path: &'a Path,
         home: &Path,
         platform: &str,
-        os_key: &ZcodeOsKey<'_>,
-        managed_secret: Option<&str>,
+        os_key: &'a ZcodeOsKey<'a>,
+        managed_secret: Option<&'a str>,
     ) -> Result<Self, LimitFetchError> {
         let secret = format!(
             "zcode-credential-fallback:{}:{}:{}",
@@ -2082,42 +2128,38 @@ impl ZcodeCredentials {
                 "ZCode credential cipher could not be initialized.",
             ));
         };
-        let v2 = match credentials
-            .as_object()
-            .into_iter()
-            .flatten()
-            .filter_map(|(_, value)| value.as_str())
-            .find_map(zcode_v2_envelope)
-        {
-            Some((source, fingerprint, _)) => {
-                let key = match source {
-                    "os" => zcode_os_key_for(credentials_path, fingerprint, os_key),
-                    "env" => managed_secret
-                        .map(|secret| Sha256::digest(secret.as_bytes()).to_vec())
-                        .ok_or_else(|| {
-                            "ZCode credentials are sealed with a managed secret".to_string()
-                        }),
-                    _ => Err(format!(
-                        "ZCode credentials are sealed with an unsupported key source ({source})"
-                    )),
-                };
-                let key = key.map_err(LimitFetchError::transient)?;
-                if key.len() != 32 || zcode_key_fingerprint(&key) != fingerprint {
-                    return Err(LimitFetchError::transient(
-                        "ZCode credentials were sealed with a key LLMeter cannot read.",
-                    ));
-                }
-                let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| {
-                    LimitFetchError::transient("ZCode credential cipher could not be initialized.")
-                })?;
-                Some((cipher, fingerprint.to_string()))
-            }
-            None => None,
-        };
         Ok(Self {
             credentials,
+            credentials_path,
             legacy,
-            v2,
+            os_key,
+            managed_secret,
+            v2: RefCell::default(),
+        })
+    }
+
+    fn v2_cipher(&self, source: &str, fingerprint: &str) -> Result<Aes256Gcm, LimitFetchError> {
+        let key = match source {
+            "os" => zcode_os_key_for(self.credentials_path, fingerprint, self.os_key)?,
+            "env" => self
+                .managed_secret
+                .map(|secret| Sha256::digest(secret.as_bytes()).to_vec())
+                .ok_or_else(|| {
+                    LimitFetchError::transient("ZCode credentials are sealed with a managed secret")
+                })?,
+            _ => {
+                return Err(LimitFetchError::transient(format!(
+                    "ZCode credentials are sealed with an unsupported key source ({source})"
+                )));
+            }
+        };
+        if zcode_key_fingerprint(&key) != fingerprint {
+            return Err(LimitFetchError::transient(
+                "ZCode credentials were sealed with a key LLMeter cannot read.",
+            ));
+        }
+        Aes256Gcm::new_from_slice(&key).map_err(|_| {
+            LimitFetchError::transient("ZCode credential cipher could not be initialized.")
         })
     }
 
@@ -2129,26 +2171,32 @@ impl ZcodeCredentials {
             .filter_map(|(name, value)| Some((name.as_str(), value.as_str()?)))
     }
 
-    fn get(&self, name: &str) -> Result<Option<String>, String> {
+    fn get(&self, name: &str) -> Result<Option<String>, LimitFetchError> {
         let Some(value) = self.credentials.get(name).and_then(Value::as_str) else {
             return Ok(None);
         };
         Ok(Some(self.decrypt(value)?).filter(|value| !value.is_empty()))
     }
 
-    fn decrypt(&self, value: &str) -> Result<String, String> {
+    fn decrypt(&self, value: &str) -> Result<String, LimitFetchError> {
+        let malformed = |error| {
+            LimitFetchError::auth(format!(
+                "ZCode credentials could not be decrypted: {error}. Sign in again in ZCode."
+            ))
+        };
         match zcode_v2_envelope(value) {
-            Some((_, fingerprint, payload)) => {
-                let (cipher, expected) = self
-                    .v2
+            Some((source, fingerprint, payload)) => {
+                let mut ciphers = self.v2.borrow_mut();
+                let cipher = ciphers
+                    .entry((source.to_string(), fingerprint.to_string()))
+                    .or_insert_with(|| self.v2_cipher(source, fingerprint))
                     .as_ref()
-                    .ok_or_else(|| "value is sealed with an unknown key".to_string())?;
-                if fingerprint != expected.as_str() {
-                    return Err("value was encrypted with a different key".into());
-                }
-                decrypt_zcode_envelope(cipher, payload)
+                    .map_err(Clone::clone)?;
+                decrypt_zcode_envelope(cipher, payload).map_err(malformed)
             }
-            None if value.starts_with("enc:") => decrypt_zcode_credential(&self.legacy, value),
+            None if value.starts_with("enc:") => {
+                decrypt_zcode_credential(&self.legacy, value).map_err(malformed)
+            }
             None => Ok(value.to_string()),
         }
     }
@@ -2156,7 +2204,7 @@ impl ZcodeCredentials {
     /// The API key of the first coding-plan sign-in that decrypts, as stored
     /// by ZCode 3 and earlier. Falls through with the decryption error when
     /// every candidate fails.
-    fn coding_plan_api_key(&self) -> Result<Option<String>, String> {
+    fn coding_plan_api_key(&self) -> Result<Option<String>, LimitFetchError> {
         let mut decrypt_error = None;
         for (name, value) in self.entries() {
             if !name.starts_with("account-provider:coding-plan:") || !name.ends_with(":api-key") {
@@ -2180,13 +2228,27 @@ impl ZcodeCredentials {
     /// The OAuth login token of the account family `oauth:active_provider`
     /// names, with the usage endpoint that serves it. Without an active
     /// provider, the first family that has a token wins.
-    fn oauth_access_token(&self) -> Result<Option<(&'static str, String)>, String> {
+    fn oauth_access_token(&self) -> Result<Option<(&'static str, String)>, LimitFetchError> {
+        let candidates = ZCODE_USAGE_URLS
+            .into_iter()
+            .filter_map(|(family, usage_url)| {
+                let value = self
+                    .credentials
+                    .get(format!("oauth:{family}:access_token"))?
+                    .as_str()?;
+                (!value.is_empty()).then_some((family, usage_url, value))
+            });
+        let mut candidates = candidates.peekable();
+        if candidates.peek().is_none() {
+            return Ok(None);
+        }
         let active = self.get("oauth:active_provider")?;
-        for (family, usage_url) in ZCODE_USAGE_URLS {
+        for (family, usage_url, value) in candidates {
             if active.as_deref().is_some_and(|active| active != family) {
                 continue;
             }
-            if let Some(token) = self.get(&format!("oauth:{family}:access_token"))? {
+            let token = self.decrypt(value)?;
+            if !token.is_empty() {
                 return Ok(Some((usage_url, token)));
             }
         }
@@ -2242,7 +2304,7 @@ fn zcode_os_key_for(
     credentials_path: &Path,
     fingerprint: &str,
     os_key: &ZcodeOsKey<'_>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, LimitFetchError> {
     let account = zcode_keychain_account(credentials_path);
     if let Ok(cache) = ZCODE_OS_KEYS.lock()
         && let Some((_, key)) = cache.iter().find(|(cached, _)| cached == &account)
@@ -2257,12 +2319,13 @@ fn zcode_os_key_for(
         URL_SAFE_NO_PAD
             .decode(key)
             .or_else(|_| URL_SAFE.decode(key))
-            .map_err(|_| "ZCode's keychain entry has an unexpected format".to_string())
+            .map_err(|_| {
+                LimitFetchError::transient("ZCode's keychain entry has an unexpected format")
+            })
     })?;
-    let decoded: [u8; 32] = key
-        .clone()
-        .try_into()
-        .map_err(|_| "ZCode's keychain entry has an unexpected format".to_string())?;
+    let decoded: [u8; 32] = key.as_slice().try_into().map_err(|_| {
+        LimitFetchError::transient("ZCode's keychain entry has an unexpected format")
+    })?;
     // Only a key that opens the envelope is worth remembering.
     if let Ok(mut cache) = ZCODE_OS_KEYS.lock()
         && zcode_key_fingerprint(&decoded) == fingerprint
@@ -2273,27 +2336,58 @@ fn zcode_os_key_for(
     Ok(key)
 }
 
-/// Reads a generic keychain item's password. The first read of another app's
-/// item makes macOS ask the user for permission.
 #[cfg(target_os = "macos")]
-fn zcode_os_key(service: &str, account: &str) -> Result<Vec<u8>, String> {
-    security_framework::passwords::get_generic_password(service, account).map_err(|error| {
-        if error.code() == -25300 {
+fn zcode_os_key(
+    service: &str,
+    account: &str,
+    access: ZcodeKeychainAccess,
+) -> Result<Vec<u8>, LimitFetchError> {
+    use security_framework::os::macos::{keychain::SecKeychain, passwords::find_generic_password};
+
+    // The legacy interaction setting is process-wide. Scope it to the
+    // lookup and serialize silent and interactive ZCode keychain reads.
+    static ACCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _access = ACCESS.lock().unwrap_or_else(|error| error.into_inner());
+    let _no_interaction = match access {
+        ZcodeKeychainAccess::Silent => (|| {
+            if SecKeychain::user_interaction_allowed()? {
+                SecKeychain::disable_user_interaction().map(Some)
+            } else {
+                Ok(None)
+            }
+        })()
+        .map_err(|error| {
+            LimitFetchError::transient(format!(
+                "ZCode's Keychain could not be checked without prompting ({error})."
+            ))
+        })?,
+        ZcodeKeychainAccess::Interactive => None,
+    };
+    find_generic_password(None, service, account)
+        .map(|(password, _)| password.to_vec())
+        .map_err(|error| match error.code() {
+            // errSecInteractionNotAllowed, errSecInteractionRequired,
+            // errSecAuthFailed, errSecUserCanceled
+            -25308 | -25315 | -25293 | -128 => LimitFetchError::zcode_authorization_required(),
             // errSecItemNotFound
-            "ZCode's credential key is missing from the Keychain. Sign in again in ZCode."
-                .to_string()
-        } else {
-            format!(
-                "ZCode's credential key could not be read from the Keychain ({error}); \
-                 allow LLMeter when macOS asks, then refresh."
-            )
-        }
-    })
+            -25300 => LimitFetchError::transient(
+                "ZCode's credential key is missing from the Keychain. Sign in again in ZCode.",
+            ),
+            _ => LimitFetchError::transient(format!(
+                "ZCode's credential key could not be read from the Keychain ({error})."
+            )),
+        })
 }
 
 #[cfg(not(target_os = "macos"))]
-fn zcode_os_key(_service: &str, _account: &str) -> Result<Vec<u8>, String> {
-    Err("ZCode's credential key is only reachable through the macOS Keychain.".into())
+fn zcode_os_key(
+    _service: &str,
+    _account: &str,
+    _access: ZcodeKeychainAccess,
+) -> Result<Vec<u8>, LimitFetchError> {
+    Err(LimitFetchError::transient(
+        "ZCode's credential key is only reachable through the macOS Keychain.",
+    ))
 }
 
 /// ZCode's managed secret for `enc:v2:env:` envelopes: the
@@ -2323,6 +2417,7 @@ fn ready_limits(
         captured_at,
         source: LimitSource::ProviderApi,
         stale: false,
+        authorization_required: false,
         error: None,
         last_error: None,
     }
@@ -2387,13 +2482,14 @@ mod tests {
         let home = std::env::home_dir().unwrap_or_else(std::env::temp_dir);
         let credentials_path = home.join(".zcode").join("v2").join("credentials.json");
         let credentials = read_json_file(&credentials_path).expect("credentials.json");
+        let managed_secret = zcode_managed_secret();
         let store = ZcodeCredentials::open(
             credentials,
             &credentials_path,
             &home,
             std::env::consts::OS,
-            &zcode_os_key,
-            zcode_managed_secret().as_deref(),
+            &|service, account| zcode_os_key(service, account, ZcodeKeychainAccess::Interactive),
+            managed_secret.as_deref(),
         )
         .expect("credential store");
         let authorization = match store.coding_plan_api_key().expect("api key") {
@@ -2917,6 +3013,7 @@ mod tests {
         );
         let legacy = Aes256Gcm::new_from_slice(&Sha256::digest(secret.as_bytes())).unwrap();
         let key = [3_u8; 32];
+        let read_key = |_: &str, _: &str| Ok(URL_SAFE_NO_PAD.encode(key).into_bytes());
         let store = ZcodeCredentials::open(
             json!({
                 "plain": "as-is",
@@ -2926,7 +3023,7 @@ mod tests {
             Path::new("/Users/test/.zcode/v2/credentials.json"),
             home,
             "macos",
-            &|_, _| Ok(URL_SAFE_NO_PAD.encode(key).into_bytes()),
+            &read_key,
             None,
         )
         .unwrap();
@@ -3078,10 +3175,12 @@ mod tests {
     }
 
     #[test]
-    fn zcode_without_sign_in_is_not_configured() {
+    fn zcode_without_sign_in_does_not_read_the_keychain() {
         let key = [3_u8; 32];
-        let home =
-            zcode_test_home(&json!({"zcodejwttoken": seal_zcode_v2("os", &key, "zcode-jwt")}));
+        let home = zcode_test_home(&json!({
+            "oauth:active_provider": seal_zcode_v2("os", &key, "bigmodel"),
+            "zcodejwttoken": seal_zcode_v2("os", &key, "zcode-jwt")
+        }));
         let http = FakeLimitHttp::default();
 
         let fetch = fetch_zcode_from(
@@ -3089,13 +3188,57 @@ mod tests {
             &home,
             "macos",
             &http,
-            &|_, _| Ok(URL_SAFE_NO_PAD.encode(key).into_bytes()),
+            &|_, _| panic!("quota has no usable credential"),
             None,
         );
 
         assert!(matches!(fetch, ProviderFetch::NotConfigured));
         assert!(http.requests.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn zcode_quota_ignores_unused_os_sealed_entries() {
+        let home = zcode_test_home(&json!({
+            "oauth:active_provider": "bigmodel",
+            "oauth:bigmodel:access_token": "login-token",
+            "oauth:zai:access_token": seal_zcode_v2("os", &[3_u8; 32], "other-token")
+        }));
+        let http = FakeLimitHttp {
+            responses: vec![(ZCODE_BIGMODEL_USAGE_URL, zcode_usage_body())],
+            ..Default::default()
+        };
+        let fetch = fetch_zcode_from(
+            &home.join(".zcode"),
+            &home,
+            "macos",
+            &http,
+            &|_, _| panic!("the active quota credential is not OS-sealed"),
+            None,
+        );
+        assert!(matches!(fetch, ProviderFetch::Ready(_)));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn zcode_authorization_required_preserves_cached_limits() {
+        let collector = LimitCollector::new(Database::open_in_memory().unwrap());
+        let now = Utc::now();
+        let blocked = || ProviderFetch::Failed(LimitFetchError::zcode_authorization_required());
+        let empty = collector.finish(Provider::ZCode, blocked(), now);
+        assert!(empty.authorization_required);
+        assert!(empty.windows.is_empty());
+        let saved = normalize_zcode(&zcode_usage_body(), now).unwrap();
+        collector.repository.save(&saved).unwrap();
+        let cached = collector.finish(Provider::ZCode, blocked(), now);
+        assert!(cached.authorization_required);
+        assert!(cached.stale);
+        assert!(!cached.windows.is_empty());
+        assert_eq!(cached.captured_at, saved.captured_at);
+        assert_eq!(
+            collector.repository.load(Provider::ZCode).unwrap(),
+            Some(saved)
+        );
     }
 
     #[test]
@@ -3111,7 +3254,7 @@ mod tests {
             &home,
             "macos",
             &http,
-            &|_, _| Err("keychain locked".to_string()),
+            &|_, _| Err(LimitFetchError::zcode_authorization_required()),
             None,
         );
 
@@ -3119,11 +3262,7 @@ mod tests {
             ProviderFetch::Failed(error) => {
                 // Transient, so a cached card stays visible with the reason.
                 assert!(error.transient);
-                assert!(
-                    error.message.contains("keychain locked"),
-                    "{}",
-                    error.message
-                );
+                assert!(error.authorization_required, "{}", error.message);
             }
             ProviderFetch::Ready(_) => panic!("quota fetched without the credential key"),
             ProviderFetch::NotConfigured => panic!("a locked keychain is not a missing sign-in"),
@@ -3170,7 +3309,7 @@ mod tests {
             responses: vec![(ZCODE_BIGMODEL_USAGE_URL, zcode_usage_body())],
             ..Default::default()
         };
-        let keychain = |_: &str, _: &str| -> Result<Vec<u8>, String> {
+        let keychain = |_: &str, _: &str| -> Result<Vec<u8>, LimitFetchError> {
             panic!("env-sealed credentials never reach the keychain")
         };
 
@@ -3213,7 +3352,7 @@ mod tests {
         };
         let reads = AtomicUsize::new(0);
         let keychain_item = std::cell::Cell::new(first);
-        let keychain = |_: &str, _: &str| -> Result<Vec<u8>, String> {
+        let keychain = |_: &str, _: &str| -> Result<Vec<u8>, LimitFetchError> {
             reads.fetch_add(1, Ordering::SeqCst);
             Ok(URL_SAFE_NO_PAD.encode(keychain_item.get()).into_bytes())
         };

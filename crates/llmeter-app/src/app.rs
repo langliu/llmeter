@@ -16,7 +16,7 @@ use llmeter_collector::{
     Collector, CollectorEvent, LimitCollector, load_session_transcript,
     providers::TRAE_CN_USAGE_SETTING,
 };
-use llmeter_core::{LimitsSnapshot, Provider};
+use llmeter_core::{LimitsSnapshot, Provider, ProviderLimits};
 use llmeter_storage::{SessionLoad, SessionQuery, SessionSummary, UsageRepository};
 use rust_i18n::t;
 
@@ -194,11 +194,22 @@ struct SessionDerivedCache {
     projects: std::rc::Rc<Vec<String>>,
 }
 
+#[derive(Clone, Copy)]
+enum LimitRefresh {
+    All,
+    ConnectZcode,
+}
+
+enum LimitUpdate {
+    All(LimitsSnapshot),
+    Zcode(ProviderLimits),
+}
+
 pub struct LLMeterView {
     collector: Collector,
     limit_collector: LimitCollector,
-    limit_sender: std::sync::mpsc::Sender<LimitsSnapshot>,
-    limit_receiver: std::sync::mpsc::Receiver<LimitsSnapshot>,
+    limit_sender: std::sync::mpsc::Sender<LimitUpdate>,
+    limit_receiver: std::sync::mpsc::Receiver<LimitUpdate>,
     snapshot_sender: std::sync::mpsc::Sender<SnapshotUpdate>,
     snapshot_receiver: std::sync::mpsc::Receiver<SnapshotUpdate>,
     overview_sender: std::sync::mpsc::Sender<OverviewRangeUpdate>,
@@ -552,7 +563,7 @@ impl LLMeterView {
             self.session_provider_open = false;
             self.theme_menu_open = false;
             if page == DashboardPage::Limits {
-                self.start_limit_refresh();
+                self.start_limit_refresh(LimitRefresh::All);
             }
             if page == DashboardPage::Sessions {
                 self.reload_filtered_sessions();
@@ -918,7 +929,12 @@ impl LLMeterView {
     }
 
     pub(crate) fn refresh_limits(&mut self, cx: &mut Context<Self>) {
-        self.start_limit_refresh();
+        self.start_limit_refresh(LimitRefresh::All);
+        cx.notify();
+    }
+
+    pub(crate) fn connect_zcode(&mut self, cx: &mut Context<Self>) {
+        self.start_limit_refresh(LimitRefresh::ConnectZcode);
         cx.notify();
     }
 
@@ -1112,8 +1128,22 @@ impl LLMeterView {
                 changed = true;
             }
         }
-        while let Ok(snapshot) = self.limit_receiver.try_recv() {
-            self.limits = snapshot;
+        while let Ok(update) = self.limit_receiver.try_recv() {
+            match update {
+                LimitUpdate::All(snapshot) => self.limits = snapshot,
+                LimitUpdate::Zcode(limits) => {
+                    if let Some(current) = self
+                        .limits
+                        .providers
+                        .iter_mut()
+                        .find(|item| item.provider == Provider::ZCode)
+                    {
+                        *current = limits;
+                    } else {
+                        self.limits.providers.push(limits);
+                    }
+                }
+            }
             self.limits_refreshing = false;
             changed = true;
         }
@@ -1124,24 +1154,30 @@ impl LLMeterView {
                 .limit_refresh_started_at
                 .is_none_or(|started| started.elapsed() >= Duration::from_secs(5 * 60))
         {
-            self.start_limit_refresh();
+            self.start_limit_refresh(LimitRefresh::All);
             changed = true;
         }
         changed
     }
 
-    fn start_limit_refresh(&mut self) {
+    fn start_limit_refresh(&mut self, refresh: LimitRefresh) {
         if self.limits_refreshing {
             return;
         }
         self.limits_refreshing = true;
-        self.limit_refresh_started_at = Some(Instant::now());
+        if matches!(refresh, LimitRefresh::All) {
+            self.limit_refresh_started_at = Some(Instant::now());
+        }
         let collector = self.limit_collector.clone();
         let sender = self.limit_sender.clone();
         if std::thread::Builder::new()
             .name("llmeter-limit-refresh".into())
             .spawn(move || {
-                let _ = sender.send(collector.refresh());
+                let update = match refresh {
+                    LimitRefresh::All => LimitUpdate::All(collector.refresh()),
+                    LimitRefresh::ConnectZcode => LimitUpdate::Zcode(collector.connect_zcode()),
+                };
+                let _ = sender.send(update);
             })
             .is_err()
         {
@@ -2052,6 +2088,7 @@ mod tests {
                     captured_at: now,
                     source: LimitSource::ProviderApi,
                     stale: false,
+                    authorization_required: false,
                     error: None,
                     last_error: None,
                 },
@@ -2064,12 +2101,18 @@ mod tests {
                     captured_at: now - Duration::minutes(5),
                     source: LimitSource::DiskCache,
                     stale: true,
+                    authorization_required: false,
                     error: None,
                     last_error: Some("offline".into()),
                 },
                 ProviderLimits::not_configured(Provider::Grok, now),
+                ProviderLimits {
+                    authorization_required: true,
+                    ..ProviderLimits::failed(Provider::ZCode, now, "Authorization required")
+                },
             ];
-            view.navigate(DashboardPage::Limits, cx);
+            view.active_page = DashboardPage::Limits;
+            cx.notify();
         });
 
         cx.update(|window, cx| {
@@ -2077,6 +2120,9 @@ mod tests {
         });
         assert!(cx.debug_bounds("limit-updated-claude").is_some());
         assert!(cx.debug_bounds("limit-updated-codex").is_some());
+        assert!(cx.debug_bounds("limit-card-zcode").is_some());
+        assert!(cx.debug_bounds("connect-zcode").is_some());
+        assert!(cx.debug_bounds("limit-updated-zcode").is_none());
     }
 
     fn setup_scrollable_overview(

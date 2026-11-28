@@ -92,11 +92,12 @@ safety rescan.
   project attribution
 
 The Limits page also reads account quota from the existing local login state for
-Claude Code, Codex, Cursor, Qoder/Qoder CN, and Grok. ZCode 4 seals its sign-in
-with a key it keeps in the macOS Keychain, so macOS asks for permission the
-first time LLMeter reads ZCode's quota in a session; the key then stays in
-memory until ZCode rotates it, and "Always Allow" skips the question in later
-sessions. TRAE SOLO contributes its
+Claude Code, Codex, Cursor, Qoder/Qoder CN, and Grok. ZCode 4 can seal its local
+sign-in with a key in the macOS Keychain. LLMeter checks for access without
+prompting on refresh. If permission is needed, click **Connect ZCode** on the
+Limits page to allow the macOS prompt. The key then stays in memory while the
+app runs, unless ZCode rotates it. Choosing **Always Allow** can also cover
+later launches. TRAE SOLO contributes its
 local entitlement and Fast Request allowance; its local state does not expose
 current usage, so LLMeter does not invent a percentage. Cursor's official export
 provides account-level token events but does not identify ordinary local chat

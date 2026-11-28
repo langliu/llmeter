@@ -105,6 +105,7 @@ mod tests {
             captured_at: Utc::now(),
             source: LimitSource::ProviderApi,
             stale: false,
+            authorization_required: false,
             error: None,
             last_error: None,
         };
@@ -127,6 +128,7 @@ mod tests {
             captured_at: Utc::now(),
             source: LimitSource::ProviderApi,
             stale: false,
+            authorization_required: false,
             error: None,
             last_error: None,
         };
@@ -154,6 +156,7 @@ mod tests {
             captured_at: Utc::now() - Duration::days(8),
             source: LimitSource::ProviderApi,
             stale: false,
+            authorization_required: false,
             error: None,
             last_error: None,
         };

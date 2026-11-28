@@ -26,6 +26,8 @@ pub struct ProviderLimits {
     pub captured_at: DateTime<Utc>,
     pub source: LimitSource,
     pub stale: bool,
+    #[serde(default)]
+    pub authorization_required: bool,
     pub error: Option<String>,
     pub last_error: Option<String>,
 }
@@ -71,6 +73,7 @@ impl ProviderLimits {
             captured_at,
             source: LimitSource::ProviderApi,
             stale: false,
+            authorization_required: false,
             error: None,
             last_error: None,
         }
@@ -90,6 +93,7 @@ impl ProviderLimits {
             captured_at,
             source: LimitSource::ProviderApi,
             stale: false,
+            authorization_required: false,
             error: Some(error.into()),
             last_error: None,
         }
@@ -191,6 +195,7 @@ mod tests {
             captured_at: now - Duration::minutes(5),
             source: LimitSource::ProviderApi,
             stale: false,
+            authorization_required: false,
             error: None,
             last_error: None,
         };
@@ -215,6 +220,7 @@ mod tests {
             captured_at: now - Duration::days(8),
             source: LimitSource::ProviderApi,
             stale: false,
+            authorization_required: false,
             error: None,
             last_error: None,
         };
